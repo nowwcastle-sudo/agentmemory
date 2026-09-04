@@ -215,6 +215,17 @@ describe("parseEnvFile", () => {
     const env = parseEnvFile(`A="hello"\nB='world'\nC=plain\n`);
     expect(env).toEqual({ A: "hello", B: "world", C: "plain" });
   });
+
+  it("matches runtime parsing for quoted and plain inline comments", () => {
+    const env = parseEnvFile(
+      `A="quoted value" # explanation\nB='single value' # explanation\nC=plain # explanation\n`,
+    );
+    expect(env).toEqual({
+      A: "quoted value",
+      B: "single value",
+      C: "plain",
+    });
+  });
 });
 
 describe("realProviderKeys / placeholderProviderKeys", () => {

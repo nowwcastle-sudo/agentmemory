@@ -23,6 +23,7 @@ import type {
   Insight,
   ExportPagination,
   AccessLogExport,
+  SessionProjection,
 } from "../types.js";
 import { importOrigin } from "../types.js";
 import { normalizeAccessLog } from "./access-tracker.js";
@@ -58,130 +59,162 @@ async function runChunked<T>(
   }
 }
 
+export async function collectExportData(
+  kv: StateKV,
+  data?: { maxSessions?: number; offset?: number },
+  options?: { strict?: boolean },
+): Promise<ExportData> {
+  const listCollection = <T>(scope: string): Promise<T[]> =>
+    options?.strict === true
+      ? kv.list<T>(scope)
+      : kv.list<T>(scope).catch(() => [] as T[]);
+  const rawMax = Number(data?.maxSessions);
+  const maxSessions =
+    Number.isFinite(rawMax) && rawMax > 0
+      ? Math.min(Math.floor(rawMax), 1000)
+      : undefined;
+  const rawOffset = Number(data?.offset);
+  const offset =
+    Number.isFinite(rawOffset) && rawOffset >= 0 ? Math.floor(rawOffset) : 0;
+
+  const allSessions = await kv.list<Session>(KV.sessions);
+  const paginatedSessions =
+    maxSessions !== undefined
+      ? allSessions.slice(offset, offset + maxSessions)
+      : allSessions;
+  const memories = await kv.list<Memory>(KV.memories);
+  const summaries = await kv.list<SessionSummary>(KV.summaries);
+
+  const observations: Record<string, CompressedObservation[]> = {};
+  const obsResults = await Promise.all(
+    paginatedSessions.map((session) =>
+      kv
+        .list<CompressedObservation>(KV.observations(session.id))
+        .catch((error) => {
+          if (options?.strict === true) throw error;
+          return [] as CompressedObservation[];
+        })
+        .then((obs) => ({ sessionId: session.id, obs })),
+    ),
+  );
+  for (const { sessionId, obs } of obsResults) {
+    if (obs.length > 0) observations[sessionId] = obs;
+  }
+
+  const profileCollection =
+    options?.strict === true
+      ? kv.list<ProjectProfile>(KV.profiles)
+      : Promise.all(
+          [...new Set(paginatedSessions.map((session) => session.project))].map(
+            (project) =>
+              kv.get<ProjectProfile>(KV.profiles, project).catch(() => null),
+          ),
+        ).then((profiles) =>
+          profiles.filter((profile): profile is ProjectProfile => Boolean(profile)),
+        );
+
+  const [
+    profiles,
+    graphNodes,
+    graphEdges,
+    semanticMemories,
+    proceduralMemories,
+    actions,
+    actionEdges,
+    sentinels,
+    sketches,
+    crystals,
+    facets,
+    lessons,
+    insights,
+    routines,
+    signals,
+    checkpoints,
+    accessLogs,
+    allSessionProjections,
+  ] = await Promise.all([
+    profileCollection,
+    listCollection<GraphNode>(KV.graphNodes),
+    listCollection<GraphEdge>(KV.graphEdges),
+    listCollection<SemanticMemory>(KV.semantic),
+    listCollection<ProceduralMemory>(KV.procedural),
+    listCollection<Action>(KV.actions),
+    listCollection<ActionEdge>(KV.actionEdges),
+    listCollection<Sentinel>(KV.sentinels),
+    listCollection<Sketch>(KV.sketches),
+    listCollection<Crystal>(KV.crystals),
+    listCollection<Facet>(KV.facets),
+    listCollection<Lesson>(KV.lessons),
+    listCollection<Insight>(KV.insights),
+    listCollection<Routine>(KV.routines),
+    listCollection<Signal>(KV.signals),
+    listCollection<Checkpoint>(KV.checkpoints),
+    listCollection<AccessLogExport>(KV.accessLog),
+    listCollection<SessionProjection>(KV.sessionProjections),
+  ]);
+  const exportedSessionIds = new Set(
+    paginatedSessions.map((session) => session.id),
+  );
+  const sessionProjections = allSessionProjections.filter((projection) =>
+    exportedSessionIds.has(projection.sessionId),
+  );
+
+  const exportData: ExportData = {
+    version: VERSION,
+    exportedAt: new Date().toISOString(),
+    sessions: paginatedSessions,
+    observations,
+    memories,
+    summaries,
+    sessionProjections:
+      sessionProjections.length > 0 ? sessionProjections : undefined,
+    profiles: profiles.length > 0 ? profiles : undefined,
+    graphNodes: graphNodes.length > 0 ? graphNodes : undefined,
+    graphEdges: graphEdges.length > 0 ? graphEdges : undefined,
+    semanticMemories:
+      semanticMemories.length > 0 ? semanticMemories : undefined,
+    proceduralMemories:
+      proceduralMemories.length > 0 ? proceduralMemories : undefined,
+    actions: actions.length > 0 ? actions : undefined,
+    actionEdges: actionEdges.length > 0 ? actionEdges : undefined,
+    sentinels: sentinels.length > 0 ? sentinels : undefined,
+    sketches: sketches.length > 0 ? sketches : undefined,
+    crystals: crystals.length > 0 ? crystals : undefined,
+    facets: facets.length > 0 ? facets : undefined,
+    lessons: lessons.length > 0 ? lessons : undefined,
+    insights: insights.length > 0 ? insights : undefined,
+    routines: routines.length > 0 ? routines : undefined,
+    signals: signals.length > 0 ? signals : undefined,
+    checkpoints: checkpoints.length > 0 ? checkpoints : undefined,
+    accessLogs: accessLogs.length > 0 ? accessLogs : undefined,
+  };
+
+  if (maxSessions !== undefined) {
+    exportData.pagination = {
+      offset,
+      limit: maxSessions,
+      total: allSessions.length,
+      hasMore: offset + maxSessions < allSessions.length,
+    };
+  }
+  return exportData;
+}
+
 export function registerExportImportFunction(sdk: ISdk, kv: StateKV): void {
-  sdk.registerFunction("mem::export", 
+  sdk.registerFunction("mem::export",
     async (data?: { maxSessions?: number; offset?: number }) => {
-      const rawMax = Number(data?.maxSessions);
-      const maxSessions = Number.isFinite(rawMax) && rawMax > 0 ? Math.min(Math.floor(rawMax), 1000) : undefined;
-      const rawOffset = Number(data?.offset);
-      const offset = Number.isFinite(rawOffset) && rawOffset >= 0 ? Math.floor(rawOffset) : 0;
-
-      const allSessions = await kv.list<Session>(KV.sessions);
-      const paginatedSessions = maxSessions !== undefined
-        ? allSessions.slice(offset, offset + maxSessions)
-        : allSessions;
-      const memories = await kv.list<Memory>(KV.memories);
-      const summaries = await kv.list<SessionSummary>(KV.summaries);
-
-      const observations: Record<string, CompressedObservation[]> = {};
-      const obsResults = await Promise.all(
-        paginatedSessions.map((session) =>
-          kv
-            .list<CompressedObservation>(KV.observations(session.id))
-            .catch(() => [] as CompressedObservation[])
-            .then((obs) => ({ sessionId: session.id, obs })),
-        ),
-      );
-      for (const { sessionId, obs } of obsResults) {
-        if (obs.length > 0) {
-          observations[sessionId] = obs;
-        }
-      }
-
-      const profiles: ProjectProfile[] = [];
-      const uniqueProjects = [...new Set(paginatedSessions.map((s) => s.project))];
-      const profileResults = await Promise.all(
-        uniqueProjects.map((project) =>
-          kv.get<ProjectProfile>(KV.profiles, project).catch(() => null),
-        ),
-      );
-      for (const profile of profileResults) {
-        if (profile) profiles.push(profile);
-      }
-
-      const [
-        graphNodes,
-        graphEdges,
-        semanticMemories,
-        proceduralMemories,
-        actions,
-        actionEdges,
-        sentinels,
-        sketches,
-        crystals,
-        facets,
-        lessons,
-        insights,
-        routines,
-        signals,
-        checkpoints,
-        accessLogs,
-      ] = await Promise.all([
-        kv.list<GraphNode>(KV.graphNodes).catch(() => []),
-        kv.list<GraphEdge>(KV.graphEdges).catch(() => []),
-        kv.list<SemanticMemory>(KV.semantic).catch(() => []),
-        kv.list<ProceduralMemory>(KV.procedural).catch(() => []),
-        kv.list<Action>(KV.actions).catch(() => []),
-        kv.list<ActionEdge>(KV.actionEdges).catch(() => []),
-        kv.list<Sentinel>(KV.sentinels).catch(() => []),
-        kv.list<Sketch>(KV.sketches).catch(() => []),
-        kv.list<Crystal>(KV.crystals).catch(() => []),
-        kv.list<Facet>(KV.facets).catch(() => []),
-        kv.list<Lesson>(KV.lessons).catch(() => []),
-        kv.list<Insight>(KV.insights).catch(() => []),
-        kv.list<Routine>(KV.routines).catch(() => []),
-        kv.list<Signal>(KV.signals).catch(() => []),
-        kv.list<Checkpoint>(KV.checkpoints).catch(() => []),
-        kv.list<AccessLogExport>(KV.accessLog).catch(() => []),
-      ]);
-
-      const exportData: ExportData = {
-        version: VERSION,
-        exportedAt: new Date().toISOString(),
-        sessions: paginatedSessions,
-        observations,
-        memories,
-        summaries,
-        profiles: profiles.length > 0 ? profiles : undefined,
-        graphNodes: graphNodes.length > 0 ? graphNodes : undefined,
-        graphEdges: graphEdges.length > 0 ? graphEdges : undefined,
-        semanticMemories:
-          semanticMemories.length > 0 ? semanticMemories : undefined,
-        proceduralMemories:
-          proceduralMemories.length > 0 ? proceduralMemories : undefined,
-        actions: actions.length > 0 ? actions : undefined,
-        actionEdges: actionEdges.length > 0 ? actionEdges : undefined,
-        sentinels: sentinels.length > 0 ? sentinels : undefined,
-        sketches: sketches.length > 0 ? sketches : undefined,
-        crystals: crystals.length > 0 ? crystals : undefined,
-        facets: facets.length > 0 ? facets : undefined,
-        lessons: lessons.length > 0 ? lessons : undefined,
-        insights: insights.length > 0 ? insights : undefined,
-        routines: routines.length > 0 ? routines : undefined,
-        signals: signals.length > 0 ? signals : undefined,
-        checkpoints: checkpoints.length > 0 ? checkpoints : undefined,
-        accessLogs: accessLogs.length > 0 ? accessLogs : undefined,
-      };
-
-      if (maxSessions !== undefined) {
-        exportData.pagination = {
-          offset,
-          limit: maxSessions,
-          total: allSessions.length,
-          hasMore: offset + maxSessions < allSessions.length,
-        };
-      }
-
-      const totalObs = Object.values(observations).reduce(
+      const exportData = await collectExportData(kv, data);
+      const totalObs = Object.values(exportData.observations).reduce(
         (sum, arr) => sum + arr.length,
         0,
       );
       logger.info("Export complete", {
-        sessions: paginatedSessions.length,
-        totalSessions: allSessions.length,
+        sessions: exportData.sessions.length,
+        totalSessions:
+          exportData.pagination?.total ?? exportData.sessions.length,
         observations: totalObs,
-        memories: memories.length,
-        summaries: summaries.length,
+        memories: exportData.memories.length,
+        summaries: exportData.summaries.length,
       });
 
       // Only session collections page on ?maxSessions/?offset, so a large
@@ -241,6 +274,12 @@ export function registerExportImportFunction(sdk: ISdk, kv: StateKV): void {
         return { success: false, error: "summaries must be an array" };
       }
       if (
+        importData.sessionProjections !== undefined &&
+        !Array.isArray(importData.sessionProjections)
+      ) {
+        return { success: false, error: "sessionProjections must be an array" };
+      }
+      if (
         typeof importData.observations !== "object" ||
         importData.observations === null ||
         Array.isArray(importData.observations)
@@ -265,6 +304,25 @@ export function registerExportImportFunction(sdk: ISdk, kv: StateKV): void {
           success: false,
           error: `Too many summaries (max ${MAX_SUMMARIES})`,
         };
+      }
+      if ((importData.sessionProjections?.length ?? 0) > MAX_SESSIONS) {
+        return {
+          success: false,
+          error: `Too many session projections (max ${MAX_SESSIONS})`,
+        };
+      }
+      for (const projection of importData.sessionProjections ?? []) {
+        if (
+          !projection ||
+          typeof projection !== "object" ||
+          typeof projection.sessionId !== "string" ||
+          !projection.sessionId
+        ) {
+          return {
+            success: false,
+            error: "sessionProjections entries require sessionId",
+          };
+        }
       }
       const MAX_OBS_BUCKETS = 10_000;
       const obsBuckets = Object.keys(importData.observations);
@@ -300,6 +358,7 @@ export function registerExportImportFunction(sdk: ISdk, kv: StateKV): void {
         observations: 0,
         memories: 0,
         summaries: 0,
+        sessionProjections: 0,
         skipped: 0,
       };
 
@@ -327,6 +386,11 @@ export function registerExportImportFunction(sdk: ISdk, kv: StateKV): void {
         await runChunked(
           await kv.list<SessionSummary>(KV.summaries),
           (s) => kv.delete(KV.summaries, s.sessionId),
+        );
+        await runChunked(
+          await kv.list<SessionProjection>(KV.sessionProjections).catch(() => []),
+          (projection) =>
+            kv.delete(KV.sessionProjections, projection.sessionId),
         );
         await runChunked(await kv.list<Action>(KV.actions).catch(() => []), (a) =>
           kv.delete(KV.actions, a.id),
@@ -471,6 +535,30 @@ export function registerExportImportFunction(sdk: ISdk, kv: StateKV): void {
         await kv.set(KV.summaries, summary.sessionId, summary);
         stats.summaries++;
       });
+
+      await runChunked(
+        importData.sessionProjections ?? [],
+        async (projection) => {
+          if (strategy === "skip") {
+            const existing = await kv
+              .get<SessionProjection>(
+                KV.sessionProjections,
+                projection.sessionId,
+              )
+              .catch(() => null);
+            if (existing) {
+              stats.skipped++;
+              return;
+            }
+          }
+          await kv.set(
+            KV.sessionProjections,
+            projection.sessionId,
+            projection,
+          );
+          stats.sessionProjections++;
+        },
+      );
 
       if (importData.graphNodes) {
         await runChunked(importData.graphNodes, async (node) => {

@@ -10,6 +10,7 @@ import { StateKV } from "../state/kv.js";
 import {
   SUMMARY_SYSTEM,
   buildSummaryPrompt,
+  buildBoundedIncrementalSummaryPrompt,
   REDUCE_SYSTEM,
   buildReducePrompt,
 } from "../prompts/summary.js";
@@ -20,6 +21,22 @@ import { scoreSummary } from "../eval/quality.js";
 import type { MetricsStore } from "../eval/metrics-store.js";
 import { safeAudit } from "./audit.js";
 import { logger } from "../logger.js";
+import { withKeyedLock } from "../state/keyed-mutex.js";
+import { summarySourceFingerprint } from "../state/source-fingerprint.js";
+import { ProjectionCoordinator } from "./projection-coordinator.js";
+
+export type SummarizeSessionResult = {
+  success: boolean;
+  error?: string;
+  reason?: string;
+  summary?: SessionSummary;
+  qualityScore?: number;
+  deduplicated?: boolean;
+};
+
+export type SummarizeSessionCore = (
+  data: { sessionId: string },
+) => Promise<SummarizeSessionResult>;
 
 // Per-chunk observation budget when a session is too large to fit in one
 // LLM call. Default ≈ 50k input tokens per chunk at ~110 tok/obs — fits
@@ -48,6 +65,13 @@ function getChunkConcurrency(): number {
   if (!raw) return CHUNK_CONCURRENCY_DEFAULT;
   const n = parseInt(raw, 10);
   return Number.isFinite(n) && n > 0 ? n : CHUNK_CONCURRENCY_DEFAULT;
+}
+
+function isLegacyChunkModeConfigured(): boolean {
+  return Boolean(
+    process.env.SUMMARIZE_CHUNK_SIZE?.trim() ||
+      process.env.SUMMARIZE_CHUNK_CONCURRENCY?.trim(),
+  );
 }
 
 // One chunk call with retry-once. Returns null when both attempts fail —
@@ -100,12 +124,30 @@ async function produceSummaryXml(
   compressed: CompressedObservation[],
   sessionId: string,
   project: string,
+  options: {
+    previous?: SessionSummary;
+    delta: CompressedObservation[];
+    mode: "initial" | "incremental" | "rebuild";
+  },
 ): Promise<{
   response: string;
   mode: "single" | "chunked";
   chunks: number;
   skipped?: number;
 }> {
+  if (!isLegacyChunkModeConfigured()) {
+    const response = await provider.summarize(
+      SUMMARY_SYSTEM,
+      buildBoundedIncrementalSummaryPrompt({
+        previous: options.previous,
+        observations: compressed,
+        delta: options.delta,
+        mode: options.mode,
+      }),
+    );
+    return { response, mode: "single", chunks: 1 };
+  }
+
   const chunkSize = getChunkSize();
   if (compressed.length <= chunkSize) {
     const response = await provider.summarize(
@@ -231,15 +273,16 @@ export function registerSummarizeFunction(
   kv: StateKV,
   provider: MemoryProvider,
   metricsStore?: MetricsStore,
-): void {
-  sdk.registerFunction("mem::summarize", 
-    async (data: { sessionId: string } | undefined) => {
+  coordinator = new ProjectionCoordinator(),
+): SummarizeSessionCore {
+  const core: SummarizeSessionCore = async (data) => {
       const startMs = Date.now();
       if (!data || typeof data.sessionId !== "string" || !data.sessionId.trim()) {
         return { success: false, error: "sessionId is required" };
       }
       const sessionId = data.sessionId.trim();
 
+      return withKeyedLock(`summarize:${sessionId}`, async () => {
       const session = await kv.get<Session>(KV.sessions, sessionId);
       if (!session) {
         logger.warn("Session not found for summarize", {
@@ -260,7 +303,36 @@ export function registerSummarizeFunction(
         return { success: false, error: "no_observations" };
       }
 
-      if (provider.name === "noop") {
+      const sourceFingerprint = summarySourceFingerprint(compressed);
+      const existing = await kv.get<SessionSummary>(KV.summaries, sessionId);
+      if (existing?.sourceFingerprint === sourceFingerprint) {
+        return {
+          success: true,
+          summary: existing,
+          deduplicated: true,
+        };
+      }
+
+      const coveredIds = existing?.coveredObservationIds;
+      const coveredIdSet = new Set(coveredIds ?? []);
+      const coveredObservations = coveredIds
+        ? compressed.filter((observation) => coveredIdSet.has(observation.id))
+        : [];
+      const coverageIsComplete =
+        coveredIds !== undefined && coveredObservations.length === coveredIds.length;
+      const coverageIsUnchanged =
+        coverageIsComplete &&
+        existing?.sourceFingerprint === summarySourceFingerprint(coveredObservations);
+      const summaryMode: "initial" | "incremental" | "rebuild" = !existing
+        ? "initial"
+        : coverageIsUnchanged
+          ? "incremental"
+          : "rebuild";
+      const delta = summaryMode === "incremental"
+        ? compressed.filter((observation) => !coveredIdSet.has(observation.id))
+        : compressed;
+
+      if (provider.isNoop === true) {
         logger.info("Summarize skipped — no LLM provider configured", {
           sessionId,
         });
@@ -288,6 +360,7 @@ export function registerSummarizeFunction(
             compressed,
             sessionId,
             session.project,
+            { previous: existing ?? undefined, delta, mode: summaryMode },
           );
           response = produced.response;
           mode = produced.mode;
@@ -356,6 +429,11 @@ export function registerSummarizeFunction(
 
         const qualityScore = scoreSummary(summaryForValidation);
 
+        if (session.projectName) summary.projectName = session.projectName;
+        summary.sourceFingerprint = sourceFingerprint;
+        summary.coveredObservationIds = compressed
+          .map((observation) => observation.id)
+          .sort();
         await kv.set(KV.summaries, sessionId, summary);
         await safeAudit(kv, "compress", "mem::summarize", [sessionId], {
           title: summary.title,
@@ -393,6 +471,24 @@ export function registerSummarizeFunction(
         });
         return { success: false, error: msg };
       }
+      });
+  };
+
+  sdk.registerFunction(
+    "mem::summarize",
+    async (data: { sessionId: string } | undefined) => {
+      const sourceId =
+        typeof data?.sessionId === "string" && data.sessionId.trim()
+          ? data.sessionId.trim()
+          : "invalid-session";
+      const run = await coordinator.run(
+        { stage: "summary", sourceId },
+        () => core(data as { sessionId: string }),
+      );
+      return run.accepted
+        ? run.value
+        : { success: false, deferred: true, error: run.error };
     },
   );
+  return core;
 }

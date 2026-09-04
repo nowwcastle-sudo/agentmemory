@@ -36,7 +36,7 @@ describe("renderEngineConfig", () => {
         viewerPort: 3213,
         enginePort: 49234,
       },
-    });
+    }).replace(/\r\n/g, "\n");
 
     expect(rendered).toMatch(
       /- name: iii-http\n\s+config:\n\s+port: 3211/,

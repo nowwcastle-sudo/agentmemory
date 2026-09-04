@@ -146,14 +146,14 @@ Restart OpenCode or open a new session. The plugin auto-captures everything.
 
 `experimental.chat.system.transform` fires before every LLM call and injects two layers of context:
 
-1. **Memory context** (once per session): calls `/agentmemory/context` and injects project profile, recent session summaries, and important past observations into the system prompt. This is the OpenCode equivalent of Claude's MEMORY.md bridge — instead of syncing to a markdown file, context is injected directly into the system prompt.
+1. **Memory context** (every system transform, one cached fetch per session): injects project profile, recent session summaries, and important past observations into the system prompt. OpenCode does not expose whether a transform belongs to an internal title request or the main agent request, so the plugin reuses the cached context on every transform instead of letting the first internal request consume the only injection.
 
 2. **File enrichment** (every turn with stashed files): calls `/agentmemory/enrich` with files stashed by `tool.execute.before`, `file.edited`, and `message.part.updated` (file parts). File-specific context (past observations, related bugs, semantic search) is injected into the system prompt.
 
 ```text
 System prompt = [OpenCode instructions] + [memory context] + [file enrichment] + [user message]
                                         ^                 ^
-                               first turn only         every file-touching turn
+                                every transform      every file-touching turn
 ```
 
 **Differences from Claude's PreToolUse:**
@@ -163,7 +163,7 @@ System prompt = [OpenCode instructions] + [memory context] + [file enrichment] +
 | Injection mechanism | stdout → context window | `output.system[]` → system prompt |
 | Timing | Same turn (parallel with tool) | Next turn (before next LLM call) |
 | File set | Per-tool (immediate) | Batched (all files since last enrichment) |
-| Coverage | Edit/Write/Read/Glob/Grep only | Edit/Write/Read/Glob/Grep only |
+| Coverage | Edit/Write/Read/Glob/Grep only | Edit/Write/Read/Glob/Grep/ApplyPatch |
 | What gets injected | `<agentmemory-file-context>` + bug memories | Identical `/enrich` response |
 
 ## MEMORY.md vs AGENTS.md: how context flows
@@ -188,7 +188,7 @@ agentmemory  ──push──▶  OpenCode system prompt
 ```
 
 - `experimental.chat.system.transform` calls `/context` at runtime and pushes the response directly into `output.system[]`
-- **Always current** — context is fetched at session start (once) and before file-touching turns (per-batch)
+- **Always available** — context is fetched at session start, cached, and injected into every system transform; file-specific enrichment remains per batch
 - **No file intermediary** — no stale copies, no merge conflicts, no disk I/O
 - `AGENTS.md` is a static instruction file for project conventions, coding standards, and tool guidance — agentmemory does not read or write it
 
@@ -213,7 +213,21 @@ agentmemory already persists everything in SQLite (`data/state_store.db`). Addin
 
 ## Session instruction injection
 
-Agentmemory usage instructions are injected into the system prompt on the first turn of every session via `experimental.chat.system.transform` (alongside memory context from `/context`). This is functionally equivalent to Claude Code's skills mechanism — the agent learns which `agentmemory_memory_*` tools to use and when, without needing separate skill invocations.
+Agentmemory usage instructions and cached memory context are injected on every `experimental.chat.system.transform`. This guarantees that OpenCode's internal auto-title request cannot consume a one-shot injection before the main agent call.
+
+## Durable capture delivery
+
+Observation and terminal-session capture uses a local write-ahead outbox at
+`~/.agentmemory/outbox/opencode` (or the exact directory in
+`AGENTMEMORY_OUTBOX_DIR`). Structured tool input, output, and session status stay
+as JSON while they fit the capture limit. HTTP non-2xx, timeout, and connection
+failure leave the request envelope on disk; the next capture replays oldest-first
+and only a confirmed 2xx deletes it. The bearer secret is reconstructed from the
+environment and is never written into the envelope.
+
+When OpenCode supplies the runtime `agent` field on an assistant message, the plugin
+threads it through that message's tool parts as `agentId`, preserving actor attribution
+even on plugin SDK versions whose TypeScript declaration omits the runtime field.
 
 ## What's not covered (vs Claude Code plugin)
 

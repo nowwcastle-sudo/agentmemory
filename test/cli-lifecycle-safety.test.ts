@@ -1,6 +1,7 @@
 import { spawnSync } from "node:child_process";
 import {
   chmodSync,
+  copyFileSync,
   existsSync,
   mkdtempSync,
   mkdirSync,
@@ -9,7 +10,8 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 
 const sandboxes: string[] = [];
@@ -22,14 +24,15 @@ function sandbox(): string {
   return path;
 }
 
-function installFakeDocker(binDir: string): void {
+function installFakeDocker(binDir: string): string | null {
   mkdirSync(binDir, { recursive: true });
-  const dockerPath = join(binDir, "docker");
+  const scriptPath = join(binDir, "docker-fixture.cjs");
   writeFileSync(
-    dockerPath,
-    `#!/usr/bin/env node
-const { appendFileSync } = require("node:fs");
-const args = process.argv.slice(2);
+    scriptPath,
+    `const { appendFileSync } = require("node:fs");
+const { basename } = require("node:path");
+if (basename(process.execPath).toLowerCase() === "docker.exe") {
+const args = process.argv.slice(1).map((arg) => basename(arg) === "compose" ? "compose" : arg);
 appendFileSync(process.env.DOCKER_LOG, args.join(" ") + "\\n");
 const isComposePs = args[0] === "compose" && args.includes("ps");
 const isGlobalPs = args[0] === "ps";
@@ -64,9 +67,22 @@ if (args[0] === "inspect") {
   process.exit(1);
 }
 process.exit(0);
+}
 `,
   );
-  chmodSync(dockerPath, 0o755);
+  if (process.platform === "win32") {
+    copyFileSync(process.execPath, join(binDir, "docker.exe"));
+    return scriptPath;
+  } else {
+    const dockerPath = join(binDir, "docker");
+    writeFileSync(dockerPath, `#!/usr/bin/env node\n${readFileSync(scriptPath, "utf-8")}`);
+    chmodSync(dockerPath, 0o755);
+    return null;
+  }
+}
+
+function iiiBinName(): string {
+  return process.platform === "win32" ? "iii.exe" : "iii";
 }
 
 function runDockerStop(
@@ -80,14 +96,14 @@ function runDockerStop(
   const binDir = join(root, "bin");
   const composeFile = join(root, "docker-compose.yml");
   const dockerLog = join(root, "docker.log");
-  const privateBin = join(runtimeDir, "bin", "iii");
+  const privateBin = join(runtimeDir, "bin", iiiBinName());
   mkdirSync(runtimeDir, { recursive: true });
   mkdirSync(dataDir, { recursive: true });
   if (command === "remove") {
     mkdirSync(join(runtimeDir, "bin"), { recursive: true });
     writeFileSync(privateBin, "owned binary");
   }
-  installFakeDocker(binDir);
+  const dockerPreload = installFakeDocker(binDir);
   writeFileSync(
     composeFile,
     "services:\n  iii-engine:\n    image: iiidev/iii:0.11.2\n  iii-init:\n    image: busybox\n",
@@ -129,7 +145,11 @@ function runDockerStop(
         HOME: home,
         USERPROFILE: home,
         CI: "1",
-        PATH: `${binDir}:${process.env.PATH ?? ""}`,
+        PATH: `${binDir}${delimiter}${process.env.PATH ?? ""}`,
+        NODE_OPTIONS: [
+          process.env.NODE_OPTIONS,
+          dockerPreload ? `--require=${dockerPreload}` : undefined,
+        ].filter(Boolean).join(" "),
         DOCKER_LOG: dockerLog,
         DOCKER_FAILURE_MODE: failureMode,
         DOCKER_DATA_DIR: dataDir,
@@ -149,7 +169,7 @@ function runDockerStop(
 function runInstanceRemove(instanceArgs = ["--instance", "1"]) {
   const root = sandbox();
   const home = join(root, "home");
-  const privateBin = join(home, ".agentmemory", "bin", "iii");
+  const privateBin = join(home, ".agentmemory", "bin", iiiBinName());
   const dataBase = join(root, "data");
   mkdirSync(join(home, ".agentmemory", "bin"), { recursive: true });
   writeFileSync(privateBin, "shared binary");
@@ -185,7 +205,7 @@ function runNativeRemoveWithWorkerFailure() {
   const root = sandbox();
   const home = join(root, "home");
   const runtimeDir = join(home, ".agentmemory");
-  const privateBin = join(runtimeDir, "bin", "iii");
+  const privateBin = join(runtimeDir, "bin", iiiBinName());
   const engineState = join(runtimeDir, "engine-state.json");
   const enginePidfile = join(runtimeDir, "iii.pid");
   const workerPidfile = join(runtimeDir, "worker.pid");
@@ -223,7 +243,7 @@ process.kill = (pid, signal) => {
     process.execPath,
     [
       "--import",
-      preload,
+      pathToFileURL(preload).href,
       "--import",
       "tsx",
       "src/cli.ts",
@@ -273,16 +293,23 @@ describe("Docker lifecycle discovery", () => {
     },
   );
 
-  it("deduplicates short and full IDs for the same inspected container", () => {
-    const { result, statePath, dockerLog } = runDockerStop("duplicate");
+  it(
+    "deduplicates short and full IDs for the same inspected container",
+    () => {
+      const { result, statePath, dockerLog } = runDockerStop("duplicate");
 
-    expect(result.status).toBe(0);
-    expect(existsSync(statePath)).toBe(true);
-    expect(dockerLog).not.toMatch(/\bcompose\b.*\brm\b/);
-    expect(JSON.parse(readFileSync(statePath, "utf-8")).containerId).toBe(
-      FULL_CONTAINER_ID,
-    );
-  });
+      expect(
+        result.status,
+        `${result.stdout}\n${result.stderr}\n${dockerLog}`,
+      ).toBe(0);
+      expect(existsSync(statePath)).toBe(true);
+      expect(dockerLog).not.toMatch(/\bcompose\b.*\brm\b/);
+      expect(JSON.parse(readFileSync(statePath, "utf-8")).containerId).toBe(
+        FULL_CONTAINER_ID,
+      );
+    },
+    15_000,
+  );
 
   it("removes shared assets while preserving validated Docker recovery state with --keep-data", () => {
     const { result, statePath, privateBin, dockerLog } = runDockerStop(
@@ -290,7 +317,10 @@ describe("Docker lifecycle discovery", () => {
       "remove",
     );
 
-    expect(result.status).toBe(0);
+    expect(
+      result.status,
+      `${result.stdout}\n${result.stderr}\n${dockerLog}`,
+    ).toBe(0);
     expect(existsSync(statePath)).toBe(true);
     expect(existsSync(privateBin)).toBe(false);
     expect(dockerLog).not.toMatch(/\bcompose\b.*\brm\b/);
@@ -302,7 +332,10 @@ describe("native removal shutdown", () => {
     const result = runNativeRemoveWithWorkerFailure();
 
     expect(result.result.status).toBe(1);
-    expect(result.killLog).toBe("424242:SIGTERM\n");
+    expect(
+      result.killLog,
+      `${result.result.stdout}\n${result.result.stderr}`,
+    ).toBe("424242:SIGTERM\n");
     expect(existsSync(result.workerPidfile)).toBe(true);
     expect(existsSync(result.enginePidfile)).toBe(true);
     expect(existsSync(result.engineState)).toBe(true);

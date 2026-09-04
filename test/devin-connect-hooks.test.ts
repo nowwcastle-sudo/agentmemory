@@ -94,12 +94,17 @@ describe("buildMergedHooks (Devin manifest)", () => {
 
 describe("hook payload compatibility with Devin CLI", () => {
   it("resolves the project from DEVIN_PROJECT_DIR when the payload carries no cwd", async () => {
-    const { resolveProject, hookCwd } = await import("../src/hooks/_project.js");
+    const { resolveProject, resolveProjectIdentity, hookCwd } = await import("../src/hooks/_project.js");
     const before = process.env["DEVIN_PROJECT_DIR"];
     process.env["DEVIN_PROJECT_DIR"] = "/tmp";
     try {
       expect(hookCwd({ session_id: "s1" })).toBe("/tmp");
-      expect(resolveProject(hookCwd({ session_id: "s1" }))).toBe("tmp");
+      expect(resolveProject(hookCwd({ session_id: "s1" }))).toMatch(
+        /^path:[0-9a-f]{32}$/,
+      );
+      expect(resolveProjectIdentity(hookCwd({ session_id: "s1" })).projectName).toBe(
+        "tmp",
+      );
     } finally {
       if (before === undefined) delete process.env["DEVIN_PROJECT_DIR"];
       else process.env["DEVIN_PROJECT_DIR"] = before;

@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { loadSnapshotConfig, __resetEnvFileCache } from "../src/config.js";
 
 // loadSnapshotConfig reads getMergedEnv(), which merges the on-disk
@@ -92,5 +92,10 @@ describe("loadSnapshotConfig interval validation", () => {
     expect(loadSnapshotConfig().enabled).toBe(true);
     process.env["SNAPSHOT_ENABLED"] = "false";
     expect(loadSnapshotConfig().enabled).toBe(false);
+  });
+
+  it("resolves SNAPSHOT_DIR through the shared path layout", () => {
+    process.env["SNAPSHOT_DIR"] = "relative-snapshots";
+    expect(loadSnapshotConfig().dir).toBe(resolve("relative-snapshots"));
   });
 });

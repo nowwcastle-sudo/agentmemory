@@ -11,7 +11,8 @@ describe("parseJsonlText", () => {
   it("parses basic user/assistant exchange", () => {
     const out = parseJsonlText(fx("basic.jsonl"));
     expect(out.sessionId).toBe("sess-basic");
-    expect(out.project).toBe("project");
+    expect(out.project).toMatch(/^path:[0-9a-f]{32}$/);
+    expect(out.projectName).toBe("project");
     expect(out.cwd).toBe("/Users/alice/project");
     expect(out.observations).toHaveLength(2);
     expect(out.observations[0].hookType).toBe("prompt_submit");

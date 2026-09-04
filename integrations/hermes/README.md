@@ -93,7 +93,7 @@ npx @agentmemory/agentmemory
 The plugin auto-detects the running server and hooks into the Hermes agent loop. Make sure `memory.provider` is set to `agentmemory` in `~/.hermes/config.yaml`:
 
 - `prefetch()` injects relevant memories before each LLM call
-- `sync_turn()` captures every conversation turn in the background
+- `sync_turn()` captures up to the ten newest per-tool calls/results from `turn_messages`; when a turn has no tool result it preserves the full conversation turn
 - `on_session_end()` marks sessions complete for summarization
 - `on_pre_compress()` re-injects context before compaction
 - `on_memory_write()` mirrors MEMORY.md writes to agentmemory
@@ -106,8 +106,19 @@ The plugin auto-detects the running server and hooks into the Hermes agent loop.
 | `AGENTMEMORY_URL` | `http://localhost:3111` | agentmemory server URL |
 | `AGENTMEMORY_SECRET` | (none) | Auth token for protected instances |
 | `AGENTMEMORY_REQUIRE_HTTPS` | (off) | When set to `1`, refuse to send the bearer token over plaintext HTTP to a non-loopback host. Sends only when `AGENTMEMORY_URL` is `https://...` or points at `localhost`/`127.0.0.1`/`::1`. With this off, the plugin warns once on stderr but still sends. |
+| `AGENTMEMORY_OUTBOX_DIR` | `~/.agentmemory/outbox/hermes` | Optional exact directory for failed capture envelopes. Envelopes omit the bearer secret and replay oldest-first on the next capture or shutdown. |
 
 The plugin reads `~/.agentmemory/.env` (or `$XDG_CONFIG_HOME/agentmemory/.env`) at import time and populates any missing values into the process environment via `os.environ.setdefault`. Anything you set in the shell takes precedence; the file is only used to fill gaps. This means `hermes memory status` reports the plugin as available even when the agentmemory service is launched by systemd or another process manager that loads `~/.agentmemory/.env` directly without exporting it to the Hermes CLI shell (#250).
+
+Capture requires Hermes to provide a non-empty session ID. The plugin never merges
+missing identities into a shared `unknown` session. HTTP non-2xx, timeout, and
+connection failures keep the request payload in the local outbox; only a confirmed
+2xx removes it.
+
+`on_memory_write()` remains best-effort rather than outbox-backed because the current
+`/remember` API creates a new version and has no capture ID idempotency key. Queuing
+and replaying that write could create duplicate memory versions after an ambiguous
+network failure; session, turn, tool, checkpoint, and terminal capture are durable.
 
 ## What Hermes gets
 

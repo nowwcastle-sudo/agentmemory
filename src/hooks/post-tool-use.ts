@@ -1,19 +1,11 @@
 #!/usr/bin/env node
-import { resolveProject, hookCwd } from "./_project.js";
+import { resolveProjectPayload, hookCwd } from "./_project.js";
+import { defaultHookDelivery, hookSessionId, stableHookCaptureId } from "./_delivery.js";
 
 function isSdkChildContext(payload: unknown): boolean {
   if (process.env["AGENTMEMORY_SDK_CHILD"] === "1") return true;
   if (!payload || typeof payload !== "object") return false;
   return (payload as { entrypoint?: unknown }).entrypoint === "sdk-ts";
-}
-
-const REST_URL = process.env["AGENTMEMORY_URL"] || "http://localhost:3111";
-const SECRET = process.env["AGENTMEMORY_SECRET"] || "";
-
-function authHeaders(): Record<string, string> {
-  const h: Record<string, string> = { "Content-Type": "application/json" };
-  if (SECRET) h["Authorization"] = `Bearer ${SECRET}`;
-  return h;
 }
 
 async function main() {
@@ -32,32 +24,35 @@ async function main() {
   if (!data || typeof data !== "object") return;
   if (isSdkChildContext(data)) return;
 
-  const sessionId = ((data.session_id || data.sessionId || data.conversation_id) as string) || "unknown";
+  const sessionId = hookSessionId(data);
+  if (!sessionId) return;
   const toolName = data.tool_name ?? data.toolName;
   const toolInput = data.tool_input ?? data.toolArgs;
 
   const { imageData, cleanOutput } = extractImageData(toolOutput(data));
   const cwd = hookCwd(data) || process.cwd();
 
-  fetch(`${REST_URL}/agentmemory/observe`, {
-    method: "POST",
-    headers: authHeaders(),
-    body: JSON.stringify({
-      hookType: "post_tool_use",
-      sessionId,
-      project: resolveProject(cwd),
-      cwd,
-      timestamp: new Date().toISOString(),
-      data: {
-        tool_name: toolName,
-        tool_input: toolInput,
-        tool_output: truncate(cleanOutput, 8000),
-        ...(imageData ? { image_data: imageData } : {}),
-      },
-    }),
-    signal: AbortSignal.timeout(3000),
-  }).catch(() => {});
-  setTimeout(() => process.exit(0), 500).unref();
+  const outputRecord = typeof cleanOutput === "object" && cleanOutput !== null
+    ? cleanOutput as Record<string, unknown>
+    : null;
+  const hookType = outputRecord?.success === false ? "post_tool_failure" : "post_tool_use";
+  const toolUseId = data.tool_use_id ?? data.toolUseId ?? data.call_id ?? data.turn_id ?? toolName;
+  await defaultHookDelivery().deliver("/agentmemory/observe", {
+    captureId: stableHookCaptureId(sessionId, "tool", toolUseId),
+    hookType,
+    sessionId,
+    ...resolveProjectPayload(cwd),
+    cwd,
+    ...(typeof data.agent_id === "string" ? { agentId: data.agent_id } : {}),
+    timestamp: new Date().toISOString(),
+    data: {
+      tool_name: toolName,
+      tool_input: toolInput,
+      tool_output: truncate(cleanOutput, 8000),
+      call_id: toolUseId,
+      ...(imageData ? { image_data: imageData } : {}),
+    },
+  });
 }
 
 function toolOutput(data: Record<string, unknown>): unknown {

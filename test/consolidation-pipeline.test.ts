@@ -167,6 +167,61 @@ describe("Consolidation Pipeline", () => {
     expect(stored[0].confidence).toBe(0.9);
   });
 
+  it("skips an unchanged semantic source fingerprint without another provider call", async () => {
+    const provider = {
+      name: "test",
+      compress: vi.fn(),
+      summarize: vi.fn().mockResolvedValue(
+        `<facts><fact confidence="0.9">TypeScript is the primary language</fact></facts>`,
+      ),
+    };
+    registerConsolidationPipelineFunction(sdk as never, kv as never, provider as never);
+    for (let i = 0; i < 6; i++) {
+      await kv.set("mem:summaries", `ses_${i}`, makeSummary(i));
+    }
+
+    const first = (await sdk.trigger("mem::consolidate-pipeline", {
+      tier: "semantic",
+      strict: true,
+    })) as { success: boolean; sourceFingerprint?: string };
+    expect(first.success).toBe(true);
+    expect(first.sourceFingerprint).toMatch(/^maintenance-semantic_/);
+
+    const second = (await sdk.trigger("mem::consolidate-pipeline", {
+      tier: "semantic",
+      strict: true,
+      previousSourceFingerprint: first.sourceFingerprint,
+    })) as {
+      success: boolean;
+      sourceFingerprint?: string;
+      results: { semantic: { skipped?: boolean } };
+    };
+    expect(second.success).toBe(true);
+    expect(second.sourceFingerprint).toBe(first.sourceFingerprint);
+    expect(second.results.semantic.skipped).toBe(true);
+    expect(provider.summarize).toHaveBeenCalledTimes(1);
+  });
+
+  it("reports a semantic provider error to strict maintenance callers", async () => {
+    const provider = {
+      name: "test",
+      compress: vi.fn(),
+      summarize: vi.fn().mockRejectedValue(new Error("provider rejected request")),
+    };
+    registerConsolidationPipelineFunction(sdk as never, kv as never, provider as never);
+    for (let i = 0; i < 6; i++) {
+      await kv.set("mem:summaries", `ses_${i}`, makeSummary(i));
+    }
+
+    const result = (await sdk.trigger("mem::consolidate-pipeline", {
+      tier: "semantic",
+      strict: true,
+    })) as { success: boolean; error?: string };
+
+    expect(result.success).toBe(false);
+    expect(result.error).toBe("provider rejected request");
+  });
+
   it("with enough patterns, creates procedural memories from provider response", async () => {
     const provider = {
       name: "test",

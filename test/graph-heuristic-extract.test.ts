@@ -88,22 +88,23 @@ describe("extractGraphHeuristics", () => {
   });
 });
 
-// The structural pass must run keyless: session end always fires
-// mem::graph-extract, and the function itself gates only the LLM pass
-// on the flag plus a real provider.
+// The structural pass must run keyless on the observation hot path. Session
+// terminal work requests semantic mode separately after a summary succeeds.
 describe("keyless graph extraction wiring", () => {
-  it("event::session::stopped fires graph-extract without the flag gate", () => {
-    const events = readFileSync("src/triggers/events.ts", "utf-8");
-    const stopped = events.slice(events.indexOf("event::session::stopped"));
-    const gate = stopped.indexOf("isGraphExtractionEnabled()");
-    const fire = stopped.indexOf('fireVoid("mem::graph-extract"');
-    expect(fire).toBeGreaterThan(-1);
-    expect(gate === -1 || gate > fire).toBe(true);
+  it("observation projection requests structural graph mode without a flag gate", () => {
+    const projection = readFileSync(
+      "src/functions/observation-projection.ts",
+      "utf-8",
+    );
+    expect(projection).toMatch(
+      /mode:\s*"structural"[\s\S]*?await projectGraphSourcesCore\(request\)/,
+    );
+    expect(projection).not.toContain("isGraphExtractionEnabled");
   });
 
   it("graph functions register unconditionally so the trigger always resolves", () => {
     const index = readFileSync("src/index.ts", "utf-8");
-    const reg = index.indexOf("registerGraphFunction(sdk, kv, provider)");
+    const reg = index.search(/registerGraphFunction\(\s*sdk,\s*kv,\s*provider,/);
     expect(reg).toBeGreaterThan(-1);
     const before = index.slice(Math.max(0, reg - 200), reg);
     expect(before).not.toContain("isGraphExtractionEnabled()");
@@ -112,8 +113,9 @@ describe("keyless graph extraction wiring", () => {
   it("mem::graph-extract gates the LLM pass, not the heuristic pass", () => {
     const graph = readFileSync("src/functions/graph.ts", "utf-8");
     expect(graph).toMatch(/extractGraphHeuristics\(data\.observations\)/);
+    expect(graph).toMatch(/providerAvailable = !provider\.name\.includes\("noop"\)/);
     expect(graph).toMatch(
-      /isGraphExtractionEnabled\(\) && !provider\.name\.includes\("noop"\)/,
+      /mode !== "structural"[\s\S]*?isGraphExtractionEnabled\(\)[\s\S]*?providerAvailable/,
     );
   });
 });

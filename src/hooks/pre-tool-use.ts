@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { hookSessionId } from "./_delivery.js";
 
 function isSdkChildContext(payload: unknown): boolean {
   if (process.env["AGENTMEMORY_SDK_CHILD"] === "1") return true;
@@ -89,11 +90,8 @@ async function main() {
     }
   }
 
-  const rawSessionId = data.session_id || data.sessionId || data.conversation_id;
-  const sessionId =
-    typeof rawSessionId === "string" && rawSessionId.length > 0
-      ? rawSessionId
-      : "unknown";
+  const sessionId = hookSessionId(data);
+  if (!sessionId) return;
   const project =
     typeof data.project === "string" && data.project.trim().length > 0
       ? data.project.trim()

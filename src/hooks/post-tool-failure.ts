@@ -1,19 +1,11 @@
 #!/usr/bin/env node
-import { resolveProject, hookCwd } from "./_project.js";
+import { resolveProjectPayload, hookCwd } from "./_project.js";
+import { defaultHookDelivery, hookSessionId, stableHookCaptureId } from "./_delivery.js";
 
 function isSdkChildContext(payload: unknown): boolean {
   if (process.env["AGENTMEMORY_SDK_CHILD"] === "1") return true;
   if (!payload || typeof payload !== "object") return false;
   return (payload as { entrypoint?: unknown }).entrypoint === "sdk-ts";
-}
-
-const REST_URL = process.env["AGENTMEMORY_URL"] || "http://localhost:3111";
-const SECRET = process.env["AGENTMEMORY_SECRET"] || "";
-
-function authHeaders(): Record<string, string> {
-  const h: Record<string, string> = { "Content-Type": "application/json" };
-  if (SECRET) h["Authorization"] = `Bearer ${SECRET}`;
-  return h;
 }
 
 async function main() {
@@ -33,37 +25,41 @@ async function main() {
   if (isSdkChildContext(data)) return;
   if (data.is_interrupt || data.isInterrupt) return;
 
-  const sessionId = ((data.session_id || data.sessionId || data.conversation_id) as string) || "unknown";
+  const sessionId = hookSessionId(data);
+  if (!sessionId) return;
   const toolName = data.tool_name ?? data.toolName;
   const toolInput = data.tool_input ?? data.toolArgs;
   const error = data.error ?? data.errorMessage;
 
   const cwd = hookCwd(data) || process.cwd();
 
-  fetch(`${REST_URL}/agentmemory/observe`, {
-    method: "POST",
-    headers: authHeaders(),
-    body: JSON.stringify({
-      hookType: "post_tool_failure",
-      sessionId,
-      project: resolveProject(cwd),
-      cwd,
-      timestamp: new Date().toISOString(),
-      data: {
-        tool_name: toolName,
-        tool_input:
-          typeof toolInput === "string"
-            ? toolInput.slice(0, 4000)
-            : JSON.stringify(toolInput ?? "").slice(0, 4000),
-        error:
-          typeof error === "string"
-            ? error.slice(0, 4000)
-            : JSON.stringify(error ?? "").slice(0, 4000),
-      },
-    }),
-    signal: AbortSignal.timeout(3000),
-  }).catch(() => {});
-  setTimeout(() => process.exit(0), 500).unref();
+  const toolUseId = data.tool_use_id ?? data.toolUseId ?? data.call_id ?? data.turn_id ?? toolName;
+  await defaultHookDelivery().deliver("/agentmemory/observe", {
+    captureId: stableHookCaptureId(sessionId, "tool", toolUseId),
+    hookType: "post_tool_failure",
+    sessionId,
+    ...resolveProjectPayload(cwd),
+    cwd,
+    ...(typeof data.agent_id === "string" ? { agentId: data.agent_id } : {}),
+    timestamp: new Date().toISOString(),
+    data: {
+      tool_name: toolName,
+      tool_input: truncate(toolInput, 4000),
+      error: truncate(error, 4000),
+      call_id: toolUseId,
+    },
+  });
+}
+
+function truncate(value: unknown, max: number): unknown {
+  if (typeof value === "string") {
+    return value.length > max ? `${value.slice(0, max)}...[truncated]` : value;
+  }
+  if (value && typeof value === "object") {
+    const serialized = JSON.stringify(value);
+    return serialized.length > max ? `${serialized.slice(0, max)}...[truncated]` : value;
+  }
+  return value;
 }
 
 main().catch(() => process.exit(0));

@@ -119,14 +119,27 @@ export function registerClaudeBridgeFunction(
 
       try {
         const memories = await kv.list<Memory>(KV.memories);
-        const latestMemories = memories.filter((m) => m.isLatest);
+        const acceptedProjects = new Set(
+          [config.projectId, config.projectPath, ...config.legacyProjectIds]
+            .map((project) => project.trim())
+            .filter(Boolean),
+        );
+        const latestMemories = memories.filter(
+          (memory) =>
+            memory.isLatest &&
+            Boolean(memory.project) &&
+            acceptedProjects.has(memory.project!),
+        );
 
         let projectSummary = "";
-        if (config.projectPath) {
+        for (const project of acceptedProjects) {
           const profile = await kv
-            .get<{ summary?: string }>(KV.profiles, config.projectPath)
+            .get<{ summary?: string }>(KV.profiles, project)
             .catch(() => null);
-          projectSummary = profile?.summary || "";
+          if (profile?.summary) {
+            projectSummary = profile.summary;
+            break;
+          }
         }
 
         const md = serializeToMemoryMd(

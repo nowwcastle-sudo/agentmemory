@@ -1,19 +1,21 @@
 import { readFile } from "node:fs/promises";
 import type { RawImage } from "@huggingface/transformers";
 import type { EmbeddingProvider } from "../../types.js";
+import { loadTransformers } from "./_transformers.js";
 
 type TransformersModule = typeof import("@huggingface/transformers");
 type ClipPipeline = (
   input: string[] | RawImage | RawImage[],
   options?: { pooling?: string; normalize?: boolean },
 ) => Promise<{ tolist: () => number[][]; data: Float32Array }>;
+type ClipTextEncoder = (texts: string[]) => Promise<Float32Array[]>;
 
 const DEFAULT_MODEL = "Xenova/clip-vit-base-patch32";
 
 export class ClipEmbeddingProvider implements EmbeddingProvider {
   readonly name = "clip";
   readonly dimensions = 512;
-  private textExtractor: ClipPipeline | null = null;
+  private textExtractor: ClipTextEncoder | null = null;
   private imageExtractor: ClipPipeline | null = null;
   private readonly modelId: string;
 
@@ -27,13 +29,12 @@ export class ClipEmbeddingProvider implements EmbeddingProvider {
   }
 
   async embedBatch(texts: string[]): Promise<Float32Array[]> {
-    const extractor = await this.getTextExtractor();
-    const output = await extractor(texts, { pooling: "mean", normalize: true });
-    return output.tolist().map((v) => new Float32Array(v));
+    const encode = await this.getTextExtractor();
+    return encode(texts);
   }
 
   async embedImage(src: string): Promise<Float32Array> {
-    const t = await loadTransformers();
+    const t = await loadTransformers("CLIP embeddings");
     const image = await loadImage(t, src);
     const extractor = await this.getImageExtractor();
     const output = await extractor(image);
@@ -41,31 +42,29 @@ export class ClipEmbeddingProvider implements EmbeddingProvider {
     return normalize(vec);
   }
 
-  private async getTextExtractor(): Promise<ClipPipeline> {
+  private async getTextExtractor(): Promise<ClipTextEncoder> {
     if (this.textExtractor) return this.textExtractor;
-    const t = await loadTransformers();
-    this.textExtractor = (await t.pipeline("feature-extraction", this.modelId, { dtype: "q8" })) as ClipPipeline;
+    const t = await loadTransformers("CLIP embeddings");
+    // The generic "feature-extraction" pipeline loads the full dual-encoder,
+    // which demands pixel_values and breaks text-only calls (#1249). The
+    // projection head is also what puts text in the image vectors' 512-d space.
+    const tokenizer = await t.AutoTokenizer.from_pretrained(this.modelId);
+    const model = await t.CLIPTextModelWithProjection.from_pretrained(this.modelId, {
+      dtype: "q8",
+    });
+    this.textExtractor = async (texts: string[]) => {
+      const inputs = tokenizer(texts, { padding: true, truncation: true });
+      const { text_embeds } = await model(inputs);
+      return text_embeds.tolist().map((v: number[]) => normalize(new Float32Array(v)));
+    };
     return this.textExtractor;
   }
 
   private async getImageExtractor(): Promise<ClipPipeline> {
     if (this.imageExtractor) return this.imageExtractor;
-    const t = await loadTransformers();
+    const t = await loadTransformers("CLIP embeddings");
     this.imageExtractor = (await t.pipeline("image-feature-extraction", this.modelId, { dtype: "q8" })) as ClipPipeline;
     return this.imageExtractor;
-  }
-}
-
-async function loadTransformers(): Promise<TransformersModule> {
-  try {
-    return await import("@huggingface/transformers");
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === "ERR_MODULE_NOT_FOUND") {
-      throw new Error(
-        "Install @huggingface/transformers for CLIP embeddings: npm install @huggingface/transformers",
-      );
-    }
-    throw err;
   }
 }
 

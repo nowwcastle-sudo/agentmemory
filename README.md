@@ -156,7 +156,7 @@ agentmemory works with any agent that supports hooks, MCP, or REST API. All agen
 <td align="center" width="12.5%">
 <a href="https://github.com/openai/codex"><img src="https://github.com/openai.png?size=120" alt="Codex CLI" width="48" height="48" /></a><br/>
 <strong>Codex CLI</strong><br/>
-<sub>native plugin + 6 hooks + MCP</sub>
+<sub>native plugin + 12 hooks + MCP</sub>
 </td>
 <td align="center" width="12.5%">
 <a href="https://github.com/features/copilot"><img src="https://github.githubassets.com/images/modules/site/copilot/copilot.png" alt="GitHub Copilot CLI" width="48" height="48" /></a><br/>
@@ -629,6 +629,13 @@ agentmemory connect codex --with-hooks
 
 This adds an idempotent block to `~/.codex/hooks.json` referencing absolute paths to the bundled scripts (no `${CLAUDE_PLUGIN_ROOT}` expansion needed at user-scope). Re-run the same command after upgrading agentmemory to refresh paths. User entries in the same file are preserved; only previous agentmemory entries are replaced.
 
+Codex capture uses stable event IDs and a local write-ahead outbox at
+`~/.agentmemory/outbox/codex`. HTTP non-2xx, timeouts, and connection failures
+remain queued without the bearer secret and replay oldest-first. The `SessionEnd`
+hook also scans a bounded tail of the official rollout JSONL to reconcile prompt,
+assistant, and tool events that a live hook missed; matching live/archive events use
+the same capture ID, so server-side deduplication keeps one observation.
+
 ### GitHub Copilot CLI
 
 ```bash
@@ -739,7 +746,7 @@ The agentmemory entry is the **same MCP server block** across every host that us
 | **GitHub Copilot CLI (full plugin)** | Copilot plugin install | `copilot plugin install rohitg00/agentmemory:plugin` for the plugin from the GitHub subdir. |
 | **OpenClaw** | OpenClaw MCP config | Same `mcpServers` block. Deeper: `openclaw plugins install ./integrations/openclaw` claims OpenClaw's memory slot (auto-switches from `memory-core`); set `plugins.entries.agentmemory.hooks.allowConversationAccess=true` or turn capture is silently blocked. See [`integrations/openclaw`](integrations/openclaw/). |
 | **Codex CLI (MCP only)** | `.codex/config.toml` | TOML shape: `codex mcp add agentmemory -- npx -y @agentmemory/mcp`, or add `[mcp_servers.agentmemory]` manually. |
-| **Codex CLI (full plugin)** | Codex plugin marketplace | `codex plugin marketplace add rohitg00/agentmemory` then `codex plugin add agentmemory@agentmemory`. Registers MCP + 6 lifecycle hooks (SessionStart, UserPromptSubmit, PreToolUse, PostToolUse, PreCompact, Stop) + 17 skills. On Codex Desktop, also run `agentmemory connect codex --with-hooks` until [openai/codex#16430](https://github.com/openai/codex/issues/16430) lands; plugin hooks are currently silent there. |
+| **Codex CLI (full plugin)** | Codex plugin marketplace | `codex plugin marketplace add rohitg00/agentmemory` then `codex plugin add agentmemory@agentmemory`. Registers MCP + 12 lifecycle hooks (including permission, compaction, subagent, interrupt, and terminal events) + 17 skills. On Codex Desktop, also run `agentmemory connect codex --with-hooks` until [openai/codex#16430](https://github.com/openai/codex/issues/16430) lands; plugin hooks are currently silent there. |
 | **OpenCode (MCP only)** | `opencode.json` | Different shape: top-level `mcp` key, command as array: `{"mcp": {"agentmemory": {"type": "local", "command": ["npx", "-y", "@agentmemory/mcp"], "enabled": true}}}`. |
 | **OpenCode (full plugin)** | `plugin/opencode/` | 22 auto-capture hooks covering session lifecycle, messages, tools, errors. Project attribution is per-session, so one OpenCode process spanning several repositories files each session under its own project. Two slash commands (`/recall`, `/remember`). Copy `plugin/opencode/` into your OpenCode workspace and add the plugin entry to `opencode.json`. See [`plugin/opencode/README.md`](plugin/opencode/README.md) for the full hook table + gap analysis. |
 | **pi** | `~/.pi/agent/extensions/agentmemory` | `agentmemory connect pi` installs the bundled extension into pi's auto-discovery directory (recall on agent start, capture on agent end, `memory_search` / `memory_save` / `memory_health` tools, `/agentmemory-status`). `/reload` in a running pi picks it up. [`integrations/pi`](integrations/pi/) is also a pi package (`pi install ./integrations/pi` from a checkout). |
@@ -1001,7 +1008,15 @@ Memories decay over time (Ebbinghaus curve). Frequently accessed memories streng
 | **Knowledge graph** | Entity extraction + BFS traversal |
 | **Team memory** | Namespaced shared + private across team members |
 | **Citation provenance** | Trace any memory back to source observations |
-| **Git snapshots** | Version, rollback, and diff memory state |
+| **Git snapshots** | Integrity-checked version 2 backups of canonical memory state |
+
+Snapshot restore is deliberately fail-closed. Restore only into a fresh,
+isolated, empty state directory; the endpoint rejects non-empty canonical
+state, verifies the payload digest before writing, rebuilds graph and search
+indexes, and verifies the restored canonical digest before returning success.
+If a failed response reports `targetState: "discard_required"`, discard that
+isolated target directory and retry from a new empty one. Pre-version-2
+snapshots do not have an integrity digest and are not accepted by restore.
 
 ---
 
@@ -1534,6 +1549,9 @@ Create `~/.agentmemory/.env`:
                                           # with v0.9.17.
                                           # Increase for slow networks or large batch calls;
                                           # decrease to fail-fast on rate-limit holds.
+# AGENTMEMORY_LLM_MAX_CONCURRENCY=6      # Global cap shared by compression, graph extraction,
+                                          # and summarisation. Set to 1 for single-flight
+                                          # proxies or strict cost control.
 
 # Search tuning
 # BM25_WEIGHT=0.4
@@ -1609,7 +1627,7 @@ Create `~/.agentmemory/.env`:
 
 <h2 id="api"><picture><source media="(prefers-color-scheme: dark)" srcset="assets/tags/light/section-api.svg"><img src="assets/tags/section-api.svg" alt="API" height="32" /></picture></h2>
 
-130 endpoints on port `3111`. The REST API binds to `127.0.0.1` by default. Protected endpoints require `Authorization: Bearer <secret>` when `AGENTMEMORY_SECRET` is set, and mesh sync endpoints require `AGENTMEMORY_SECRET` on both peers.
+134 endpoints on port `3111`. The REST API binds to `127.0.0.1` by default. Protected endpoints require `Authorization: Bearer <secret>` when `AGENTMEMORY_SECRET` is set, and mesh sync endpoints require `AGENTMEMORY_SECRET` on both peers.
 
 <details>
 <summary>Key endpoints</summary>
@@ -1618,6 +1636,7 @@ Create `~/.agentmemory/.env`:
 |--------|------|-------------|
 | `GET` | `/agentmemory/health` | Health check (always public) |
 | `POST` | `/agentmemory/session/start` | Start session + get context |
+| `POST` | `/agentmemory/session/checkpoint` | Project the latest active-session state without ending it |
 | `POST` | `/agentmemory/session/end` | End session |
 | `POST` | `/agentmemory/observe` | Capture observation |
 | `POST` | `/agentmemory/smart-search` | Hybrid search |
@@ -1629,6 +1648,8 @@ Create `~/.agentmemory/.env`:
 | `GET` | `/agentmemory/export` | Export all data |
 | `POST` | `/agentmemory/import` | Import from JSON |
 | `POST` | `/agentmemory/graph/query` | Knowledge graph query |
+| `POST` | `/agentmemory/pipeline/reconcile` | Retry unfinished projections and rebuild health markers from canonical state |
+| `POST` | `/agentmemory/index/reconcile` | Rebuild and persist the runtime search index |
 | `POST` | `/agentmemory/team/share` | Share with team |
 | `GET` | `/agentmemory/audit` | Audit trail |
 

@@ -5,6 +5,7 @@ const CLEANUP_INTERVAL_MS = 60_000;
 
 interface DedupEntry {
   hash: string;
+  observationId: string;
   expiresAt: number;
 }
 
@@ -27,17 +28,25 @@ export class DedupMap {
   }
 
   isDuplicate(hash: string): boolean {
-    const entry = this.entries.get(hash);
-    if (!entry) return false;
-    if (Date.now() > entry.expiresAt) {
-      this.entries.delete(hash);
-      return false;
-    }
-    return true;
+    return this.getObservationId(hash) !== undefined;
   }
 
-  record(hash: string): void {
-    this.entries.set(hash, { hash, expiresAt: Date.now() + TTL_MS });
+  getObservationId(hash: string): string | undefined {
+    const entry = this.entries.get(hash);
+    if (!entry) return undefined;
+    if (Date.now() > entry.expiresAt) {
+      this.entries.delete(hash);
+      return undefined;
+    }
+    return entry.observationId;
+  }
+
+  record(hash: string, observationId: string): void {
+    this.entries.set(hash, {
+      hash,
+      observationId,
+      expiresAt: Date.now() + TTL_MS,
+    });
   }
 
   private cleanup(): void {

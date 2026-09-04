@@ -130,6 +130,52 @@ describe("@agentmemory/mcp standalone — server proxy (issue #159)", () => {
     expect(recallBody).not.toHaveProperty("token_budget");
   });
 
+  it("forwards project, actor, and explicit privacy through core proxy tools", async () => {
+    const calls: Array<{ url: string; body: Record<string, unknown> }> = [];
+    installFetch((url, init) => {
+      if (url.endsWith("/agentmemory/livez")) {
+        return new Response("ok", { status: 200 });
+      }
+      calls.push({
+        url,
+        body: JSON.parse((init?.body as string) || "{}"),
+      });
+      return new Response(JSON.stringify({ mode: "compact", results: [] }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    });
+
+    await handleToolCall("memory_save", {
+      content: "private decision",
+      project: "project-local",
+      agentId: "agent-a",
+      visibility: "agent_private",
+    });
+    await handleToolCall("memory_recall", {
+      query: "decision",
+      project: "project-local",
+      agentId: "agent-a",
+    });
+    await handleToolCall("memory_smart_search", {
+      query: "decision",
+      project: "project-local",
+      agentId: "agent-a",
+    });
+
+    expect(calls.find((call) => call.url.endsWith("/remember"))?.body).toMatchObject({
+      project: "project-local",
+      agentId: "agent-a",
+      visibility: "agent_private",
+    });
+    for (const path of ["/search", "/smart-search"]) {
+      expect(calls.find((call) => call.url.endsWith(path))?.body).toMatchObject({
+        project: "project-local",
+        agentId: "agent-a",
+      });
+    }
+  });
+
   it("proxies memory_governance_delete to the DELETE REST endpoint", async () => {
     const calls: Array<{ url: string; method: string; body?: unknown }> = [];
     installFetch((url, init) => {
@@ -178,6 +224,53 @@ describe("@agentmemory/mcp standalone — server proxy (issue #159)", () => {
     expect(body).toHaveProperty("mode", "compact");
     expect(Array.isArray(body.results)).toBe(true);
     expect(body.results[0].content).toBe("shape-check entry");
+  });
+
+  it("local fallback applies project and explicit privacy scope before limiting", async () => {
+    installFetch(() => {
+      throw new Error("ECONNREFUSED");
+    });
+    const localKv = new InMemoryKV(undefined);
+
+    await expect(handleToolCall("memory_save", {
+      content: "ownerless private decision",
+      project: "project-local",
+      visibility: "agent_private",
+    }, localKv)).rejects.toThrow("agent_private visibility requires agentId");
+
+    await handleToolCall("memory_save", {
+      content: "shared decision",
+      project: "project-local",
+      agentId: "agent-a",
+    }, localKv);
+    await handleToolCall("memory_save", {
+      content: "private decision",
+      project: "project-local",
+      agentId: "agent-a",
+      visibility: "agent_private",
+    }, localKv);
+    await handleToolCall("memory_save", {
+      content: "foreign decision",
+      project: "project-foreign",
+      agentId: "agent-b",
+    }, localKv);
+
+    const local = await handleToolCall("memory_recall", {
+      query: "decision",
+      project: "project-local",
+      agentId: "agent-b",
+      limit: 10,
+    }, localKv);
+    const foreign = await handleToolCall("memory_recall", {
+      query: "decision",
+      project: "project-missing",
+      agentId: "agent-b",
+    }, localKv);
+
+    expect(JSON.parse(local.content[0].text).results.map(
+      (memory: { content: string }) => memory.content,
+    )).toEqual(["shared decision"]);
+    expect(JSON.parse(foreign.content[0].text).results).toEqual([]);
   });
 
   it("attaches Bearer token on the proxied tool request, not just the probe", async () => {

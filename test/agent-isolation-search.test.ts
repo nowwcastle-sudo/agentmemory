@@ -107,6 +107,8 @@ async function seedTwoAgents(kv: ReturnType<typeof makeMockKV>) {
     files: [],
     importance: 8,
     agentId: "agent_a",
+    sourceClient: "claude-code",
+    visibility: "agent_private",
   } as CompressedObservation;
   const obsB: CompressedObservation = {
     id: "obs-b-public",
@@ -120,6 +122,8 @@ async function seedTwoAgents(kv: ReturnType<typeof makeMockKV>) {
     files: [],
     importance: 6,
     agentId: "agent_b",
+    sourceClient: "codex",
+    visibility: "agent_private",
   } as CompressedObservation;
   await kv.set(KV.observations("sess-a"), obsA.id, obsA);
   await kv.set(KV.observations("sess-b"), obsB.id, obsB);
@@ -199,5 +203,8 @@ describe("mem::search agent-scope isolation (#817 follow-up)", () => {
     const ids = result.results.map((r) => r.observation.id);
     expect(ids).toContain("obs-a-secret");
     expect(ids).toContain("obs-b-public");
+    expect(result.results.map((r) => r.observation.sourceClient)).toEqual(
+      expect.arrayContaining(["claude-code", "codex"]),
+    );
   });
 });

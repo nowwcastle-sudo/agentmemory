@@ -1,23 +1,143 @@
-import { watch, promises as fsp, statSync } from "node:fs";
-import { resolve, relative, join, extname, sep, basename } from "node:path";
-import { randomBytes } from "node:crypto";
-import { execFileSync } from "node:child_process";
+import { watch, promises as fsp, readFileSync, statSync, realpathSync } from "node:fs";
+import { resolve, relative, join, extname, sep, basename, dirname } from "node:path";
+import { homedir } from "node:os";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 
-// Same resolution order as the hooks' resolveProject (git toplevel basename,
-// then directory basename) so a watched subdirectory scopes to the repository
-// name instead of the subdirectory name.
-function deriveProjectName(dir) {
+const projectIdentityCache = new Map();
+const gitProjectIdCache = new Map();
+
+function realProjectPath(value) {
   try {
-    const top = execFileSync("git", ["rev-parse", "--show-toplevel"], {
-      cwd: dir,
-      stdio: ["ignore", "pipe", "ignore"],
-      encoding: "utf8",
-    }).trim();
-    if (top) return basename(top);
+    return realpathSync.native(value);
   } catch {
-    // not a git repo
+    return resolve(value);
   }
-  return basename(dir);
+}
+
+function canonicalPath(value) {
+  let canonical = realProjectPath(value);
+  canonical = canonical.replace(/\\/g, "/").replace(/\/+$/, "");
+  return process.platform === "win32" ? canonical.toLowerCase() : canonical;
+}
+
+function projectHash(kind, value) {
+  return `${kind}:${createHash("sha256").update(value).digest("hex").slice(0, 32)}`;
+}
+
+function canonicalRemote(remote, dir) {
+  const value = remote.trim();
+  const scp = value.match(/^(?:[^@/\s]+@)?([^:/\s]+):(.+)$/);
+  if (scp && !value.includes("://") && !/^[A-Za-z]:[\\/]/.test(value)) {
+    const path = scp[2].replace(/^\/+|\/+$/g, "").replace(/\.git$/i, "");
+    return path ? `${scp[1].toLowerCase()}/${path}` : null;
+  }
+  try {
+    const url = new URL(value);
+    if (url.protocol === "file:") {
+      return `file/${canonicalPath(decodeURIComponent(url.pathname))}`;
+    }
+    const path = decodeURIComponent(url.pathname)
+      .replace(/^\/+|\/+$/g, "")
+      .replace(/\.git$/i, "");
+    return url.hostname && path
+      ? `${url.hostname.toLowerCase()}${url.port ? `:${url.port}` : ""}/${path}`
+      : null;
+  } catch {
+    return value ? `file/${canonicalPath(resolve(dir, value))}` : null;
+  }
+}
+
+function gitRepository(dir) {
+  let current = realProjectPath(dir);
+  try {
+    if (!statSync(current).isDirectory()) current = dirname(current);
+  } catch {
+    return null;
+  }
+  while (true) {
+    const dotGit = join(current, ".git");
+    try {
+      const metadata = statSync(dotGit);
+      if (metadata.isDirectory()) return { top: current, commonDir: realProjectPath(dotGit) };
+      if (metadata.isFile()) {
+        const pointer = readFileSync(dotGit, "utf8").match(/^gitdir:\s*(.+)\s*$/im)?.[1];
+        if (!pointer) return null;
+        const gitDir = realProjectPath(resolve(current, pointer));
+        let commonDir = gitDir;
+        try {
+          const common = readFileSync(join(gitDir, "commondir"), "utf8").trim();
+          if (common) commonDir = realProjectPath(resolve(gitDir, common));
+        } catch {}
+        return { top: current, commonDir };
+      }
+    } catch {}
+    const parent = dirname(current);
+    if (parent === current) return null;
+    current = parent;
+  }
+}
+
+function gitRemoteIdentity(commonDir, dir) {
+  const remotes = new Map();
+  try {
+    const configured = readFileSync(join(commonDir, "config"), "utf8");
+    let remoteName = null;
+    for (const line of configured.split(/\r?\n/)) {
+      const section = line.match(/^\s*\[remote\s+"([^"]+)"\]\s*$/i);
+      if (section) {
+        remoteName = section[1];
+        continue;
+      }
+      if (/^\s*\[/.test(line)) {
+        remoteName = null;
+        continue;
+      }
+      const url = remoteName ? line.match(/^\s*url\s*=\s*(.+?)\s*$/i) : null;
+      if (url) remotes.set(remoteName, url[1]);
+    }
+  } catch {}
+  const names = ["upstream", "origin"];
+  for (const name of [...remotes.keys()].sort()) {
+    if (!names.includes(name)) names.push(name);
+  }
+  for (const name of names) {
+    const remote = remotes.get(name);
+    if (!remote) continue;
+    const canonical = canonicalRemote(remote, dir);
+    if (canonical) return canonical;
+  }
+  return null;
+}
+
+export function resolveProjectIdentity(dir, explicitProject) {
+  if (typeof explicitProject === "string" && explicitProject.trim()) {
+    const project = explicitProject.trim();
+    return { project, projectName: project };
+  }
+  const cacheKey = canonicalPath(dir);
+  const cached = projectIdentityCache.get(cacheKey);
+  if (cached) return cached;
+  const repository = gitRepository(dir);
+  let identity;
+  if (repository) {
+    const canonicalCommonDir = canonicalPath(repository.commonDir);
+    const projectName = basename(
+      canonicalCommonDir.endsWith("/.git") ? dirname(canonicalCommonDir) : repository.top,
+    );
+    let project = gitProjectIdCache.get(canonicalCommonDir);
+    if (!project) {
+      const remote = gitRemoteIdentity(repository.commonDir, dir);
+      project = remote
+        ? projectHash("git", remote)
+        : projectHash("path", canonicalCommonDir);
+      gitProjectIdCache.set(canonicalCommonDir, project);
+    }
+    identity = { project, projectName };
+  } else {
+    identity = { project: projectHash("path", cacheKey), projectName: basename(cacheKey) };
+  }
+  projectIdentityCache.set(cacheKey, identity);
+  return identity;
 }
 
 const TEXT_EXTENSIONS = new Set([
@@ -46,6 +166,7 @@ const DEFAULT_IGNORE = [
 
 const MAX_PREVIEW_BYTES = 4096;
 const DEBOUNCE_MS = 500;
+const REPLAY_INTERVAL_MS = 15_000;
 const REDACTED = "[REDACTED]";
 const PEM_BEGIN_RE = /-----BEGIN [A-Z ]*PRIVATE KEY-----/;
 const PEM_END_RE = /-----END [A-Z ]*PRIVATE KEY-----/;
@@ -134,19 +255,29 @@ function redactSensitivePreview(preview) {
   return redactPemBlocks(preview).split("\n").map(redactSensitiveLine).join("\n");
 }
 
+function defaultOutboxDir() {
+  return process.env.AGENTMEMORY_OUTBOX_DIR ||
+    join(homedir(), ".agentmemory", "outbox", "filesystem-watcher");
+}
+
+let envelopeSequence = 0;
+
 export class FilesystemWatcher {
   constructor(config = {}) {
     this.roots = (config.roots || []).map((r) => resolve(r));
     this.baseUrl = (config.baseUrl || "http://localhost:3111").replace(/\/+$/, "");
     this.secret = config.secret;
-    this.project =
-      config.project ||
-      (this.roots[0] ? deriveProjectName(this.roots[0]) : "filesystem-watcher");
+    this.outboxDir = config.outboxDir || defaultOutboxDir();
+    const defaultIdentity = this.roots[0]
+      ? resolveProjectIdentity(this.roots[0], config.project)
+      : resolveProjectIdentity(process.cwd(), config.project || "filesystem-watcher");
+    this.project = defaultIdentity.project;
+    this.projectName = defaultIdentity.projectName;
     // Per-root scope: a multi-root watcher must stamp each event with the
     // project of the root that produced it, not the first root's project.
     // An explicit config.project overrides for every root.
     this.projectByRoot = new Map(
-      this.roots.map((r) => [r, config.project || deriveProjectName(r)]),
+      this.roots.map((r) => [r, resolveProjectIdentity(r, config.project)]),
     );
     this.sessionId =
       config.sessionId ||
@@ -156,6 +287,9 @@ export class FilesystemWatcher {
     this.logger = config.logger || console;
     this.watchers = [];
     this.pendingByPath = new Map();
+    this.deliveryQueue = Promise.resolve();
+    this.replayTimer = null;
+    this.automaticReplayRunning = false;
   }
 
   isIgnored(path) {
@@ -183,24 +317,123 @@ export class FilesystemWatcher {
     }
   }
 
-  async emit(event) {
+  async transmit(path, body) {
     const headers = { "content-type": "application/json" };
     if (this.secret) headers.authorization = `Bearer ${this.secret}`;
-    try {
-      const res = await fetch(`${this.baseUrl}/agentmemory/observe`, {
-        method: "POST",
-        headers,
-        body: JSON.stringify(event),
-        signal: AbortSignal.timeout(5000),
-      });
-      if (!res.ok) {
-        this.logger.warn?.(
-          `[fs-watcher] observe ${res.status}: ${await res.text().catch(() => "")}`,
-        );
-      }
-    } catch (err) {
-      this.logger.warn?.(`[fs-watcher] observe failed: ${err?.message || err}`);
+    const res = await fetch(`${this.baseUrl}${path}`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!res.ok) {
+      throw new Error(`observe ${res.status}: ${await res.text().catch(() => "")}`);
     }
+  }
+
+  async persist(path, body) {
+    await fsp.mkdir(this.outboxDir, { recursive: true, mode: 0o700 });
+    const key = createHash("sha256")
+      .update(JSON.stringify({ path, captureId: body.captureId }))
+      .digest("hex");
+    const target = join(this.outboxDir, `${key}.json`);
+    try {
+      await fsp.access(target);
+      return;
+    } catch {}
+    const temporary = `${target}.${process.pid}.${randomUUID()}.tmp`;
+    await fsp.writeFile(
+      temporary,
+      JSON.stringify({
+        path,
+        body,
+        createdAt: new Date().toISOString(),
+        sequence: ++envelopeSequence,
+      }),
+      { encoding: "utf8", mode: 0o600 },
+    );
+    try {
+      await fsp.rename(temporary, target);
+    } catch (error) {
+      try {
+        await fsp.access(target);
+        await fsp.rm(temporary, { force: true });
+      } catch {
+        await fsp.rm(temporary, { force: true });
+        throw error;
+      }
+    }
+  }
+
+  async envelopes() {
+    let names;
+    try {
+      names = await fsp.readdir(this.outboxDir);
+    } catch {
+      return [];
+    }
+    const result = [];
+    for (const name of names.filter((entry) => entry.endsWith(".json"))) {
+      const file = join(this.outboxDir, name);
+      try {
+        const value = JSON.parse(await fsp.readFile(file, "utf8"));
+        if (typeof value?.path === "string" && value.body && typeof value.body === "object") {
+          result.push({ file, value });
+        }
+      } catch {}
+    }
+    result.sort((a, b) =>
+      String(a.value.createdAt || "").localeCompare(String(b.value.createdAt || "")) ||
+      Number(a.value.sequence || 0) - Number(b.value.sequence || 0) ||
+      a.file.localeCompare(b.file),
+    );
+    return result;
+  }
+
+  async replayUnlocked() {
+    let delivered = 0;
+    for (const { file, value } of await this.envelopes()) {
+      try {
+        await this.transmit(value.path, value.body);
+        await fsp.rm(file);
+        delivered++;
+      } catch (error) {
+        this.logger.warn?.(
+          `[fs-watcher] capture remains queued: ${error?.message || error}`,
+        );
+        break;
+      }
+    }
+    return delivered;
+  }
+
+  serialized(task) {
+    const run = this.deliveryQueue.then(task, task);
+    this.deliveryQueue = run.then(() => undefined, () => undefined);
+    return run;
+  }
+
+  emit(event) {
+    return this.serialized(async () => {
+      await this.persist("/agentmemory/observe", event);
+      return this.replayUnlocked();
+    });
+  }
+
+  replay() {
+    return this.serialized(() => this.replayUnlocked());
+  }
+
+  automaticReplay() {
+    if (this.automaticReplayRunning) return;
+    this.automaticReplayRunning = true;
+    this.replay()
+      .catch((error) =>
+        this.logger.warn?.(`[fs-watcher] replay failed: ${error?.message || error}`),
+      )
+      .finally(() => {
+        this.automaticReplayRunning = false;
+      });
   }
 
   schedule(rootDir, relPath) {
@@ -235,20 +468,29 @@ export class FilesystemWatcher {
       if (preview !== null) preview = redactSensitivePreview(preview);
     }
     const truncated = exists && size > MAX_PREVIEW_BYTES;
+    const projectIdentity = this.projectByRoot.get(rootDir) ?? {
+      project: this.project,
+      projectName: this.projectName,
+    };
+    const content = this.formatContent(relPath, changeKind, preview, {
+      size,
+      truncated,
+    });
     const payload = {
+      captureId: `filesystem-watcher:${randomUUID()}`,
       hookType: "post_tool_use",
       sessionId: this.sessionId,
-      project: this.projectByRoot.get(rootDir) ?? this.project,
+      ...projectIdentity,
       cwd: rootDir,
       timestamp: new Date().toISOString(),
       data: {
         source: "filesystem-watcher",
         changeKind,
         files: [relPath],
-        content: this.formatContent(relPath, changeKind, preview, {
-          size,
-          truncated,
-        }),
+        content,
+        tool_name: changeKind === "file_delete" ? "Delete" : "Write",
+        tool_input: { file_path: relPath },
+        tool_output: content,
         rootDir,
         absPath,
         size,
@@ -312,9 +554,14 @@ export class FilesystemWatcher {
           `Failures: ${failures.join("; ")}`,
       );
     }
+    this.automaticReplay();
+    this.replayTimer = setInterval(() => this.automaticReplay(), REPLAY_INTERVAL_MS);
+    this.replayTimer.unref?.();
   }
 
   stop() {
+    if (this.replayTimer) clearInterval(this.replayTimer);
+    this.replayTimer = null;
     for (const w of this.watchers) {
       try {
         w.close();
@@ -353,6 +600,7 @@ export function configFromEnv(env = process.env) {
     sessionId: env.AGENTMEMORY_SESSION_ID || null,
     ignorePatterns: extraIgnore,
     allowBinary: env.AGENTMEMORY_FS_WATCH_ALLOW_BINARY === "1",
+    outboxDir: env.AGENTMEMORY_OUTBOX_DIR || null,
   };
 }
 

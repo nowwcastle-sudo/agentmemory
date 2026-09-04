@@ -2,8 +2,8 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import path from "node:path";
 import crypto from "node:crypto";
-import { execFileSync } from "node:child_process";
 import { createPlaintextBearerAuthGuard } from "./security.js";
+import { resolveProjectIdentity } from "./project-identity.js";
 
 type TextBlock = { type?: string; text?: string };
 type AssistantMessage = { role?: string; content?: unknown };
@@ -123,31 +123,8 @@ export default function agentmemoryExtension(pi: ExtensionAPI) {
     );
   }
   let sessionId = `ephemeral-${crypto.randomUUID().slice(0, 8)}`;
-  // Canonical project scope, matching the hooks' resolveProject order (env
-  // override, git toplevel basename, cwd basename) so Pi sessions share a
-  // project bucket with every other agent instead of scoping on a raw path.
-  const projectCache = new Map<string, string>();
-  function resolveProjectName(dir: string): string {
-    const explicit = process.env["AGENTMEMORY_PROJECT_NAME"]?.trim();
-    if (explicit) return explicit;
-    const cached = projectCache.get(dir);
-    if (cached) return cached;
-    let name = path.basename(dir) || dir;
-    try {
-      const top = execFileSync("git", ["rev-parse", "--show-toplevel"], {
-        cwd: dir,
-        stdio: ["ignore", "pipe", "ignore"],
-        encoding: "utf8",
-      }).trim();
-      if (top) name = path.basename(top);
-    } catch {
-      // not a git repo
-    }
-    projectCache.set(dir, name);
-    return name;
-  }
   let currentCwd = process.cwd();
-  let currentProject = resolveProjectName(currentCwd);
+  let currentProjectIdentity = resolveProjectIdentity(currentCwd);
   let lastPrompt = "";
   let lastHealthOk = false;
 
@@ -246,7 +223,11 @@ export default function agentmemoryExtension(pi: ExtensionAPI) {
     }),
     async execute(_toolCallId, params) {
       const result = await callAgentMemory<{ results?: SmartSearchResult[] }>("smart-search", {
-        body: { query: params.query, limit: params.limit ?? 5, project: currentProject },
+        body: {
+          query: params.query,
+          limit: params.limit ?? 5,
+          project: currentProjectIdentity.project,
+        },
       });
       const results = result?.results || [];
       return {
@@ -271,7 +252,11 @@ export default function agentmemoryExtension(pi: ExtensionAPI) {
     }),
     async execute(_toolCallId, params) {
       const result = await callAgentMemory<Record<string, unknown>>("remember", {
-        body: { content: params.content, type: params.type || "fact", project: currentProject },
+        body: {
+          content: params.content,
+          type: params.type || "fact",
+          ...currentProjectIdentity,
+        },
       });
       if (!result) {
         return {
@@ -290,19 +275,19 @@ export default function agentmemoryExtension(pi: ExtensionAPI) {
     const sessionFile = ctx.sessionManager.getSessionFile();
     sessionId = sessionFile ? path.basename(sessionFile).replace(/\.[^.]+$/, "") : `ephemeral-${crypto.randomUUID().slice(0, 8)}`;
     currentCwd = process.cwd();
-    currentProject = resolveProjectName(currentCwd);
+    currentProjectIdentity = resolveProjectIdentity(currentCwd);
     await refreshStatus(ctx);
     // After refreshStatus: that is where lastHealthOk is first populated.
     if (lastHealthOk) {
       await callAgentMemory("session/start", {
-        body: { sessionId, project: currentProject, cwd: currentCwd },
+        body: { sessionId, ...currentProjectIdentity, cwd: currentCwd },
       });
     }
   });
 
   pi.on("before_agent_start", async (event, ctx) => {
     currentCwd = event.systemPromptOptions.cwd || process.cwd();
-    currentProject = resolveProjectName(currentCwd);
+    currentProjectIdentity = resolveProjectIdentity(currentCwd);
     lastPrompt = event.prompt?.trim() || "";
     if (!lastPrompt) return;
 
@@ -311,7 +296,7 @@ export default function agentmemoryExtension(pi: ExtensionAPI) {
         body: {
           hookType: "prompt_submit",
           sessionId,
-          project: currentProject,
+          ...currentProjectIdentity,
           cwd: currentCwd,
           timestamp: new Date().toISOString(),
           data: { prompt: lastPrompt },
@@ -320,7 +305,7 @@ export default function agentmemoryExtension(pi: ExtensionAPI) {
     }
 
     const result = await callAgentMemory<{ results?: SmartSearchResult[] }>("smart-search", {
-      body: { query: lastPrompt, limit: 5, project: currentProject },
+      body: { query: lastPrompt, limit: 5, project: currentProjectIdentity.project },
     });
     const results = result?.results || [];
     const recallBlock = results.length
@@ -356,7 +341,7 @@ export default function agentmemoryExtension(pi: ExtensionAPI) {
       body: {
         hookType: "post_tool_use",
         sessionId,
-        project: currentProject,
+        ...currentProjectIdentity,
         cwd: currentCwd,
         timestamp: new Date().toISOString(),
         data: {
@@ -377,7 +362,7 @@ export default function agentmemoryExtension(pi: ExtensionAPI) {
       body: {
         hookType: "post_tool_use",
         sessionId,
-        project: currentProject,
+        ...currentProjectIdentity,
         cwd: currentCwd,
         timestamp: new Date().toISOString(),
         data: {

@@ -26,7 +26,9 @@ describe("Plugin hook manifests", () => {
       expect(commands.length, `${manifest} should contain hook commands`).toBeGreaterThan(0);
 
       for (const command of commands) {
-        expect(command).toMatch(/^node "\$\{CLAUDE_PLUGIN_ROOT\}\/scripts\/[^\s"]+\.mjs"$/);
+        expect(command).toMatch(
+          /^node "\$\{CLAUDE_PLUGIN_ROOT\}\/scripts\/[^\s"]+\.mjs" --source-client (?:claude-code|codex)$/,
+        );
       }
     }
   });
@@ -92,7 +94,7 @@ describe("Codex plugin manifest (developers.openai.com/codex/plugins)", () => {
     );
   });
 
-  it("hooks.codex.json contains only events Codex supports (no Subagent / SessionEnd / Notification / TaskCompleted / PostToolUseFailure)", () => {
+  it("hooks.codex.json covers every current Codex command hook event", () => {
     const hooksPath = join(pluginRoot, "hooks/hooks.codex.json");
     const hooks = readJson<{ hooks: Record<string, unknown> }>(hooksPath);
     const events = Object.keys(hooks.hooks);
@@ -104,7 +106,11 @@ describe("Codex plugin manifest (developers.openai.com/codex/plugins)", () => {
       "PermissionRequest",
       "PreCompact",
       "PostCompact",
+      "SessionEnd",
+      "SubagentStart",
+      "SubagentStop",
       "Stop",
+      "Interrupt",
     ]);
     for (const event of events) {
       expect(codexSupported.has(event), `unexpected event "${event}" in hooks.codex.json`).toBe(true);
@@ -114,7 +120,14 @@ describe("Codex plugin manifest (developers.openai.com/codex/plugins)", () => {
     expect(events).toContain("PreToolUse");
     expect(events).toContain("PostToolUse");
     expect(events).toContain("PreCompact");
+    expect(events).toContain("PostCompact");
+    expect(events).toContain("PermissionRequest");
+    expect(events).toContain("SessionEnd");
+    expect(events).toContain("SubagentStart");
+    expect(events).toContain("SubagentStop");
     expect(events).toContain("Stop");
+    expect(events).toContain("Interrupt");
+    expect(new Set(events)).toEqual(codexSupported);
   });
 
   it("hook command scripts referenced in hooks.codex.json exist on disk", () => {

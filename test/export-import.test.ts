@@ -13,6 +13,7 @@ import type {
   Memory,
   SessionSummary,
   ExportData,
+  SessionProjection,
 } from "../src/types.js";
 
 function mockKV() {
@@ -261,7 +262,25 @@ describe("Export/Import Functions", () => {
   });
 
   it("export then import round-trip preserves data", async () => {
+    const sessionProjection: SessionProjection = {
+      sessionId: "ses_1",
+      status: "failed",
+      attempts: 2,
+      observationCount: 1,
+      sourceFingerprint: "summary-fingerprint",
+      updatedAt: "2026-02-01T00:05:00Z",
+      lastError: "provider_unavailable",
+    };
+    await kv.set(
+      "mem:session:projections",
+      sessionProjection.sessionId,
+      sessionProjection,
+    );
     const exported = (await sdk.trigger("mem::export", {})) as ExportData;
+    expect(
+      (exported as ExportData & { sessionProjections?: SessionProjection[] })
+        .sessionProjections,
+    ).toEqual([sessionProjection]);
 
     const freshKv = mockKV();
     const freshSdk = mockSdk();
@@ -288,6 +307,11 @@ describe("Export/Import Functions", () => {
     )) as ExportData;
     expect(reExported.sessions.length).toBe(exported.sessions.length);
     expect(reExported.memories.length).toBe(exported.memories.length);
+    expect(
+      (reExported as ExportData & {
+        sessionProjections?: SessionProjection[];
+      }).sessionProjections,
+    ).toEqual([sessionProjection]);
   });
 
   it("import rejects unsupported version", async () => {

@@ -41,6 +41,62 @@ describe("SearchIndex", () => {
     expect(results[0].obsId).toBe("obs_1");
   });
 
+  it("persists compact document rows and restores the same search results", () => {
+    index.add(makeObs({
+      id: "obs_project",
+      projectId: "project-a",
+      visibility: "project",
+    }));
+    index.add(makeObs({
+      id: "obs_private",
+      title: "Private authentication note",
+      projectId: "project-b",
+      actorAgentId: "agent-b",
+      visibility: "private",
+    }));
+    const before = index.search("authentication", 20, {
+      projectId: "project-a",
+      actorAgentId: "agent-a",
+    });
+
+    const serialized = index.serialize();
+    const persisted = JSON.parse(serialized) as Record<string, unknown>;
+    const restored = SearchIndex.deserialize(serialized);
+
+    expect(persisted).toMatchObject({
+      v: 3,
+      documents: expect.arrayContaining([
+        expect.arrayContaining(["obs_project"]),
+        expect.arrayContaining(["obs_private"]),
+      ]),
+    });
+    expect(persisted).not.toHaveProperty("inverted");
+    expect(persisted).not.toHaveProperty("docTerms");
+    expect(restored.search("authentication", 20, {
+      projectId: "project-a",
+      actorAgentId: "agent-a",
+    })).toEqual(before);
+  });
+
+  it("loads a literal legacy v2 index snapshot", () => {
+    const restored = SearchIndex.deserialize(JSON.stringify({
+      v: 2,
+      entries: [["obs_legacy", {
+        obsId: "obs_legacy",
+        sessionId: "ses_legacy",
+        termCount: 2,
+      }]],
+      inverted: [["auth", ["obs_legacy"]]],
+      docTerms: [["obs_legacy", [["auth", 2]]]],
+      totalDocLength: 2,
+    }));
+
+    expect(restored.search("auth")[0]).toMatchObject({
+      obsId: "obs_legacy",
+      sessionId: "ses_legacy",
+    });
+  });
+
   it("returns empty for no matches", () => {
     index.add(makeObs());
     expect(index.search("database")).toEqual([]);

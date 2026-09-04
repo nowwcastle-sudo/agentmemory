@@ -10,6 +10,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { execFileSync } from "node:child_process";
 
 // pi adapter: copies the bundled integrations/pi extension into
 // ~/.pi/agent/extensions/agentmemory/, which pi auto-discovers via its
@@ -45,7 +46,7 @@ describe("connect: pi", () => {
     expect(adapter.detect()).toBe(false);
   });
 
-  it("copies index.ts and security.ts into the auto-discovered extension dir", async () => {
+  it("copies the extension and its local modules into the auto-discovered directory", async () => {
     mkdirSync(join(home, ".pi"), { recursive: true });
     const { adapter } = await import("../src/cli/connect/pi.js");
     expect(adapter.detect()).toBe(true);
@@ -54,9 +55,14 @@ describe("connect: pi", () => {
 
     const index = readFileSync(join(extDir(), "index.ts"), "utf-8");
     const security = readFileSync(join(extDir(), "security.ts"), "utf-8");
+    const projectIdentity = readFileSync(
+      join(extDir(), "project-identity.ts"),
+      "utf-8",
+    );
     expect(index).toContain("@earendil-works/pi-coding-agent");
     expect(index).toContain("./security.js");
     expect(security.length).toBeGreaterThan(0);
+    expect(projectIdentity).toContain("resolveProjectIdentity");
     expect(index).toBe(readFileSync("integrations/pi/index.ts", "utf-8"));
   });
 
@@ -110,6 +116,51 @@ describe("connect: pi", () => {
 });
 
 describe("integrations/pi is a valid pi package", () => {
+  it("uses one stable ID for a repository and linked worktree", async () => {
+    const root = mkdtempSync(join(tmpdir(), "am-pi-identity-"));
+    const repo = join(root, "canonical");
+    const worktree = join(root, "linked");
+    const foreignA = join(root, "foreign-a", "same-name");
+    const foreignB = join(root, "foreign-b", "same-name");
+    mkdirSync(repo, { recursive: true });
+    mkdirSync(foreignA, { recursive: true });
+    mkdirSync(foreignB, { recursive: true });
+    execFileSync("git", ["init", "--quiet"], { cwd: repo, stdio: "ignore" });
+    execFileSync(
+      "git",
+      [
+        "-c",
+        "user.name=AgentMemory Test",
+        "-c",
+        "user.email=agentmemory-test@example.invalid",
+        "commit",
+        "--quiet",
+        "--allow-empty",
+        "-m",
+        "fixture",
+      ],
+      { cwd: repo, stdio: "ignore" },
+    );
+    execFileSync("git", ["worktree", "add", "--quiet", "--detach", worktree], {
+      cwd: repo,
+      stdio: "ignore",
+    });
+    try {
+      const { resolveProjectIdentity } = await import(
+        "../integrations/pi/project-identity.ts"
+      );
+      const canonical = resolveProjectIdentity(repo);
+      const linked = resolveProjectIdentity(worktree);
+      expect(linked.project).toBe(canonical.project);
+      expect(linked.projectName).toBe("canonical");
+      expect(resolveProjectIdentity(foreignA).project).not.toBe(
+        resolveProjectIdentity(foreignB).project,
+      );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 15_000);
+
   it("package.json declares the pi manifest, keyword, and peer deps", () => {
     const pkg = JSON.parse(readFileSync("integrations/pi/package.json", "utf-8"));
     expect(pkg.keywords).toContain("pi-package");

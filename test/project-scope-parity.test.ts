@@ -25,19 +25,29 @@ function transcriptLine(cwd: string): string {
 }
 
 describe("replay deriveProject (via parseJsonlText)", () => {
-  it("uses the basename of a posix cwd", () => {
+  it("separates a stable path ID from the display name for a posix cwd", () => {
     const parsed = parseJsonlText(transcriptLine("/home/dev/myrepo"));
-    expect(parsed.project).toBe("myrepo");
+    expect(parsed.project).toMatch(/^path:[0-9a-f]{32}$/);
+    expect(parsed.projectName).toBe("myrepo");
   });
 
-  it("uses the basename of a Windows cwd instead of the whole raw path", () => {
+  it("keeps a Windows cwd display name without using it as the scope ID", () => {
     const parsed = parseJsonlText(transcriptLine("C:\\Users\\dev\\myrepo"));
-    expect(parsed.project).toBe("myrepo");
+    expect(parsed.project).toMatch(/^path:[0-9a-f]{32}$/);
+    expect(parsed.projectName).toBe("myrepo");
   });
 
   it("handles mixed separators", () => {
     const parsed = parseJsonlText(transcriptLine("C:\\Users\\dev/myrepo"));
-    expect(parsed.project).toBe("myrepo");
+    expect(parsed.projectName).toBe("myrepo");
+  });
+
+  it("separates unavailable paths that share a basename", () => {
+    const first = parseJsonlText(transcriptLine("C:\\archive-a\\same-name"));
+    const second = parseJsonlText(transcriptLine("C:\\archive-b\\same-name"));
+    expect(first.projectName).toBe("same-name");
+    expect(second.projectName).toBe("same-name");
+    expect(first.project).not.toBe(second.project);
   });
 });
 
@@ -45,27 +55,54 @@ describe("git-toplevel resolution parity", () => {
   let tmpRoot: string;
   let repoDir: string;
   let nestedDir: string;
+  let worktreeDir: string;
 
   beforeAll(() => {
     tmpRoot = mkdtempSync(join(tmpdir(), "amem-parity-"));
     repoDir = join(tmpRoot, "parity-fixture-repo");
     nestedDir = join(repoDir, "packages", "core");
+    worktreeDir = join(tmpRoot, "parity-linked-worktree");
     mkdirSync(nestedDir, { recursive: true });
     execFileSync("git", ["init", "--quiet"], { cwd: repoDir, stdio: "ignore" });
+    execFileSync(
+      "git",
+      [
+        "-c",
+        "user.name=AgentMemory Test",
+        "-c",
+        "user.email=agentmemory-test@example.invalid",
+        "commit",
+        "--quiet",
+        "--allow-empty",
+        "-m",
+        "fixture",
+      ],
+      { cwd: repoDir, stdio: "ignore" },
+    );
+    execFileSync("git", ["worktree", "add", "--quiet", "--detach", worktreeDir], {
+      cwd: repoDir,
+      stdio: "ignore",
+    });
   });
 
   afterAll(() => {
     rmSync(tmpRoot, { recursive: true, force: true });
   });
 
-  it("replay resolves a locally-present subdirectory cwd to the repo basename", () => {
+  it("replay merges a repository, nested directory, and linked worktree", () => {
+    const canonical = parseJsonlText(transcriptLine(repoDir));
     const parsed = parseJsonlText(transcriptLine(nestedDir));
-    expect(parsed.project).toBe("parity-fixture-repo");
+    const linked = parseJsonlText(transcriptLine(worktreeDir));
+    expect(parsed.project).toBe(canonical.project);
+    expect(linked.project).toBe(canonical.project);
+    expect(parsed.projectName).toBe("parity-fixture-repo");
+    expect(linked.projectName).toBe("parity-fixture-repo");
   });
 
   it("replay falls back to the basename for a cwd that no longer exists", () => {
     const parsed = parseJsonlText(transcriptLine(join(tmpRoot, "gone", "old-checkout")));
-    expect(parsed.project).toBe("old-checkout");
+    expect(parsed.project).toMatch(/^path:[0-9a-f]{32}$/);
+    expect(parsed.projectName).toBe("old-checkout");
   });
 
   it("watcher derives the repo basename when watching a subdirectory", () => {
@@ -74,7 +111,8 @@ describe("git-toplevel resolution parity", () => {
       baseUrl: "http://localhost:3111",
       logger: {},
     });
-    expect(w.project).toBe("parity-fixture-repo");
+    expect(w.project).toMatch(/^(?:git|path):[0-9a-f]{32}$/);
+    expect(w.projectName).toBe("parity-fixture-repo");
   });
 
   it("multi-root watcher stamps each event with its own root's project", async () => {
@@ -85,11 +123,11 @@ describe("git-toplevel resolution parity", () => {
     writeFileSync(join(repoDir, "a.txt"), "alpha", "utf8");
     writeFileSync(join(repoB, "b.txt"), "beta", "utf8");
 
-    const calls: Array<{ project: unknown; cwd: unknown }> = [];
+    const calls: Array<{ project: unknown; projectName: unknown; cwd: unknown }> = [];
     const realFetch = globalThis.fetch;
     globalThis.fetch = (async (_url: unknown, init?: { body?: string }) => {
       const body = JSON.parse(init?.body ?? "{}");
-      calls.push({ project: body.project, cwd: body.cwd });
+      calls.push({ project: body.project, projectName: body.projectName, cwd: body.cwd });
       return { ok: true, json: async () => ({}) } as Response;
     }) as typeof fetch;
     try {
@@ -106,9 +144,12 @@ describe("git-toplevel resolution parity", () => {
     }
 
     expect(calls).toHaveLength(2);
-    expect(calls[0].project).toBe("parity-fixture-repo");
-    expect(calls[1].project).toBe("second-fixture-repo");
-  });
+    expect(calls[0].project).toMatch(/^(?:git|path):[0-9a-f]{32}$/);
+    expect(calls[1].project).toMatch(/^(?:git|path):[0-9a-f]{32}$/);
+    expect(calls[0].project).not.toBe(calls[1].project);
+    expect(calls[0].projectName).toBe("parity-fixture-repo");
+    expect(calls[1].projectName).toBe("second-fixture-repo");
+  }, 15_000);
 
   it("watcher falls back to the root basename outside a repository", () => {
     const plain = join(tmpRoot, "plain-dir");
@@ -118,7 +159,8 @@ describe("git-toplevel resolution parity", () => {
       baseUrl: "http://localhost:3111",
       logger: {},
     });
-    expect(w.project).toBe("plain-dir");
+    expect(w.project).toMatch(/^path:[0-9a-f]{32}$/);
+    expect(w.projectName).toBe("plain-dir");
   });
 });
 

@@ -177,6 +177,62 @@ describe("Reflect", () => {
       expect(insights[0].sourceConceptCluster.length).toBeGreaterThan(0);
     });
 
+
+    it("ignores stale graph nodes when forming concept clusters", async () => {
+      await kv.set("mem:graph:nodes", "node_security", makeConceptNode("security"));
+      await kv.set("mem:graph:nodes", "node_validation", makeConceptNode("validation"));
+      await kv.set("mem:graph:nodes", "node_testing", { ...makeConceptNode("testing"), stale: true, mergedInto: "node_validation" });
+      await kv.set("mem:graph:edges", "edge_1", makeEdge("security", "validation"));
+      await kv.set("mem:graph:edges", "edge_2", makeEdge("security", "testing"));
+      await kv.set("mem:semantic", "sem_1", makeSemantic("Always validate security inputs"));
+      await kv.set("mem:semantic", "sem_2", makeSemantic("Testing improves security coverage"));
+      await kv.set("mem:semantic", "sem_3", makeSemantic("Validation prevents injection attacks"));
+      await kv.set("mem:lessons", "lsn_1", makeLesson("Use execFile for security", ["security"]));
+      const result = (await sdk.trigger("mem::reflect", {})) as { success: boolean };
+      expect(result.success).toBe(true);
+      const insights = await kv.list<Insight>("mem:insights");
+      for (const ins of insights) expect(ins.sourceConceptCluster).not.toContain("testing");
+      const prompt = String(provider.summarize.mock.calls.map((c) => JSON.stringify(c)).join(" "));
+      expect(prompt.toLowerCase()).not.toContain("\"testing\"");
+    });
+
+    it("processes one deterministic cluster page at a time", async () => {
+      for (const name of ["alpha", "beta", "gamma", "delta"]) {
+        await kv.set("mem:graph:nodes", `node_${name}`, makeConceptNode(name));
+      }
+      await kv.set("mem:graph:edges", "edge_alpha_beta", makeEdge("alpha", "beta"));
+      await kv.set("mem:graph:edges", "edge_gamma_delta", makeEdge("gamma", "delta"));
+      for (const [index, fact] of [
+        "alpha beta fact one",
+        "alpha beta fact two",
+        "alpha beta fact three",
+        "gamma delta fact one",
+        "gamma delta fact two",
+        "gamma delta fact three",
+      ].entries()) {
+        await kv.set("mem:semantic", `sem_page_${index}`, makeSemantic(fact, `sem_page_${index}`));
+      }
+
+      const first = (await sdk.trigger("mem::reflect", {
+        maxClusters: 1,
+        offset: 0,
+        strict: true,
+      })) as { success: boolean; nextOffset?: number; sourceFingerprint?: string };
+      expect(first.success).toBe(true);
+      expect(first.nextOffset).toBe(1);
+      expect(first.sourceFingerprint).toMatch(/^maintenance-reflect_/);
+      expect(provider.summarize).toHaveBeenCalledTimes(1);
+
+      const second = (await sdk.trigger("mem::reflect", {
+        maxClusters: 1,
+        offset: first.nextOffset,
+        strict: true,
+      })) as { success: boolean; nextOffset?: number };
+      expect(second.success).toBe(true);
+      expect(second.nextOffset).toBeUndefined();
+      expect(provider.summarize).toHaveBeenCalledTimes(2);
+    });
+
     it("skips clusters with fewer than 3 supporting items", async () => {
       await kv.set("mem:graph:nodes", "node_sparse", makeConceptNode("sparse"));
       await kv.set("mem:graph:nodes", "node_topic", makeConceptNode("topic"));

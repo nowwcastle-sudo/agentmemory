@@ -1,32 +1,35 @@
 import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
 
-// #666: api::session::end must publish the session-stopped lifecycle so
-// summarize + slot-reflect + graph extraction actually fire. Before this
-// fix the `event::session::stopped` handler in events.ts was a dead
-// subscriber — no code published `agentmemory.session.stopped`, so graph
-// nodes / lessons / crystals never materialized despite the handler
-// existing. Direct fire-and-forget trigger keeps the HTTP response fast
-// (kv.update runs synchronously, downstream pipeline fan-outs without
-// blocking).
-describe("api::session::end → event::session::stopped (#666)", () => {
+// A per-turn Stop is a checkpoint. Only a guarded true end may publish the
+// terminal lifecycle that queues bounded summary and semantic graph work.
+describe("api::session::end → event::session::ended", () => {
   const api = readFileSync("src/triggers/api.ts", "utf-8");
 
-  it("api::session::end fires event::session::stopped after kv.update", () => {
+  it("api::session::end fires event::session::ended after guarded completion", () => {
     expect(api).toMatch(
-      /api::session::end[\s\S]*?kv\.update\(KV\.sessions[\s\S]*?function_id:\s*"event::session::stopped"/,
+      /api::session::end[\s\S]*?completeActiveSession\(kv, sessionId\)[\s\S]*?completion\.transitioned[\s\S]*?fanOutSessionEnded\(sessionId\)/,
+    );
+    expect(api).toMatch(
+      /fanOutSessionEnded[\s\S]*?function_id:\s*"event::session::ended"/,
     );
   });
 
-  it("event::session::stopped trigger payload includes sessionId", () => {
+  it("event::session::ended payload confirms the completed transition", () => {
     expect(api).toMatch(
-      /function_id:\s*"event::session::stopped",\s*payload:\s*\{\s*sessionId\s*\}/,
+      /function_id:\s*"event::session::ended",\s*payload:\s*\{\s*sessionId,\s*transitionConfirmed:\s*true\s*\}/,
     );
   });
 
-  it("event::session::stopped uses TriggerAction.Void for fire-and-forget", () => {
+  it("event::session::ended uses TriggerAction.Void for fire-and-forget", () => {
     expect(api).toMatch(
-      /function_id:\s*"event::session::stopped"[\s\S]*?action:\s*TriggerAction\.Void\(\)/,
+      /function_id:\s*"event::session::ended"[\s\S]*?action:\s*TriggerAction\.Void\(\)/,
+    );
+  });
+
+  it("keeps checkpoint fan-out on event::session::stopped", () => {
+    expect(api).toMatch(
+      /api::session::checkpoint[\s\S]*?checkpoint\.checkpointed[\s\S]*?fanOutSessionStopped\(sessionId\)/,
     );
   });
 });
@@ -66,6 +69,15 @@ describe("api::graph-build endpoint (#666)", () => {
 
   it("response shape matches what the viewer expects (success + nodes)", () => {
     expect(api).toMatch(/success:\s*true,\s*sessions:[\s\S]*?nodes:\s*totalNodes/);
+  });
+
+  // graph-schema: the viewer's Rejected tab reads this route.
+  it("registers api::graph-rejected at GET /agentmemory/graph/rejected", () => {
+    expect(api).toMatch(/registerFunction\("api::graph-rejected"/);
+    expect(api).toMatch(
+      /api_path:\s*"\/agentmemory\/graph\/rejected",\s*http_method:\s*"GET"/,
+    );
+    expect(api).toMatch(/function_id:\s*"mem::graph-rejected"/);
   });
 });
 

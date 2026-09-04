@@ -6,12 +6,158 @@ import { StateKV } from "../state/kv.js";
 import type {
   Memory,
   Session,
+  RawObservation,
   CompressedObservation,
   SessionSummary,
 } from "../types.js";
 import { logger } from "../logger.js";
 
 const ALLOWED_DIRS = [resolve(homedir(), ".agentmemory")];
+
+interface ProjectIdentityMigrationInput {
+  fromProject: string;
+  toProjectId: string;
+  toProjectName: string;
+  dryRun?: boolean;
+  snapshotConfirmed?: boolean;
+}
+
+interface ProjectIdentityMigrationCounts {
+  sessions: number;
+  rawObservations: number;
+  observations: number;
+  memories: number;
+  summaries: number;
+}
+
+export async function migrateProjectIdentity(
+  kv: StateKV,
+  input: ProjectIdentityMigrationInput,
+): Promise<{
+  success: true;
+  dryRun: boolean;
+  matched: ProjectIdentityMigrationCounts;
+  updated: ProjectIdentityMigrationCounts;
+  requiresGraphRebuild: true;
+  requiresIndexRebuild: true;
+}> {
+  const fromProject = input.fromProject?.trim();
+  const toProjectId = input.toProjectId?.trim();
+  const toProjectName = input.toProjectName?.trim();
+  if (!fromProject || !toProjectId || !toProjectName) {
+    throw new Error("fromProject, toProjectId, and toProjectName are required");
+  }
+  if (fromProject === toProjectId) {
+    throw new Error("fromProject and toProjectId must be different");
+  }
+  const dryRun = input.dryRun ?? true;
+  if (!dryRun && input.snapshotConfirmed !== true) {
+    throw new Error("snapshotConfirmed=true is required before applying migration");
+  }
+
+  const sessions = await kv.list<Session>(KV.sessions);
+  const memories = await kv.list<Memory>(KV.memories);
+  const summaries = await kv.list<SessionSummary>(KV.summaries);
+  const sessionUpdates: Session[] = [];
+  const rawUpdates: RawObservation[] = [];
+  const observationUpdates: CompressedObservation[] = [];
+  const memoryUpdates: Memory[] = [];
+  const summaryUpdates: SessionSummary[] = [];
+
+  for (const session of sessions) {
+    const [rawRows, observations] = await Promise.all([
+      kv.list<RawObservation>(KV.rawObservations(session.id)),
+      kv.list<CompressedObservation>(KV.observations(session.id)),
+    ]);
+    for (const row of rawRows) {
+      if (row.projectId === fromProject) {
+        rawUpdates.push({
+          ...row,
+          projectId: toProjectId,
+          projectName: toProjectName,
+        });
+      }
+    }
+    for (const row of observations) {
+      if (row.projectId === fromProject) {
+        observationUpdates.push({
+          ...row,
+          projectId: toProjectId,
+          projectName: toProjectName,
+        });
+      }
+    }
+    if (session.project === fromProject) {
+      sessionUpdates.push({
+        ...session,
+        project: toProjectId,
+        projectName: toProjectName,
+      });
+    }
+  }
+  for (const memory of memories) {
+    if (memory.project === fromProject) {
+      memoryUpdates.push({
+        ...memory,
+        project: toProjectId,
+        projectName: toProjectName,
+      });
+    }
+  }
+  for (const summary of summaries) {
+    if (summary.project === fromProject) {
+      summaryUpdates.push({
+        ...summary,
+        project: toProjectId,
+        projectName: toProjectName,
+      });
+    }
+  }
+
+  const matched: ProjectIdentityMigrationCounts = {
+    sessions: sessionUpdates.length,
+    rawObservations: rawUpdates.length,
+    observations: observationUpdates.length,
+    memories: memoryUpdates.length,
+    summaries: summaryUpdates.length,
+  };
+  const updated: ProjectIdentityMigrationCounts = dryRun
+    ? { sessions: 0, rawObservations: 0, observations: 0, memories: 0, summaries: 0 }
+    : { ...matched };
+
+  if (!dryRun) {
+    for (const row of rawUpdates) {
+      await kv.set(KV.rawObservations(row.sessionId), row.id, row);
+    }
+    for (const row of observationUpdates) {
+      await kv.set(KV.observations(row.sessionId), row.id, row);
+    }
+    for (const row of memoryUpdates) {
+      await kv.set(KV.memories, row.id, row);
+    }
+    for (const row of summaryUpdates) {
+      await kv.set(KV.summaries, row.sessionId, row);
+    }
+    for (const row of sessionUpdates) {
+      await kv.set(KV.sessions, row.id, row);
+    }
+  }
+
+  logger.info("project identity migration complete", {
+    dryRun,
+    fromProject,
+    toProjectId,
+    matched,
+  });
+  return {
+    success: true,
+    dryRun,
+    matched,
+    updated,
+    requiresGraphRebuild: true,
+    requiresIndexRebuild: true,
+  };
+}
 
 function isAllowedPath(dbPath: string): boolean {
   const resolved = resolve(dbPath);
@@ -87,13 +233,39 @@ export async function inferMemoryProjects(
 
 export function registerMigrateFunction(sdk: ISdk, kv: StateKV): void {
   sdk.registerFunction("mem::migrate",
-    async (data: { dbPath?: string; step?: string; dryRun?: boolean }) => {
+    async (data: {
+      dbPath?: string;
+      step?: string;
+      dryRun?: boolean;
+      fromProject?: string;
+      toProjectId?: string;
+      toProjectName?: string;
+      snapshotConfirmed?: boolean;
+    }) => {
       // In-place KV migration steps (no SQLite dependency).
       if (data.step === "infer-memory-projects") {
         const dryRun = data.dryRun ?? false;
         logger.info("Migration step: infer-memory-projects", { dryRun });
         const result = await inferMemoryProjects(kv, dryRun);
         return { success: true, step: "infer-memory-projects", ...result };
+      }
+
+      if (data.step === "project-identity") {
+        try {
+          return await migrateProjectIdentity(kv, {
+            fromProject: data.fromProject ?? "",
+            toProjectId: data.toProjectId ?? "",
+            toProjectName: data.toProjectName ?? "",
+            dryRun: data.dryRun,
+            snapshotConfirmed: data.snapshotConfirmed,
+          });
+        } catch (error) {
+          return {
+            success: false,
+            step: "project-identity",
+            error: error instanceof Error ? error.message : String(error),
+          };
+        }
       }
 
       if (!data.dbPath) {

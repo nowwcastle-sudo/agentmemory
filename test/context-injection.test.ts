@@ -1,5 +1,8 @@
 import { describe, it, expect } from "vitest";
 import { spawn } from "node:child_process";
+import { createServer } from "node:http";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 const HOOKS_DIR = join(import.meta.dirname, "..", "plugin", "scripts");
@@ -119,10 +122,78 @@ describe("session-start hook — context injection gate (#143)", () => {
       session_id: "ses_test",
       cwd: "/tmp/fake-project",
     });
-    const result = await runHook("session-start.mjs", payload, {
-      AGENTMEMORY_URL: "http://127.0.0.1:1",
+    const outboxDir = await mkdtemp(join(tmpdir(), "agentmemory-session-start-offline-"));
+    try {
+      const result = await runHook("session-start.mjs", payload, {
+        AGENTMEMORY_URL: "http://127.0.0.1:1",
+        AGENTMEMORY_OUTBOX_DIR: outboxDir,
+      });
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toBe("");
+    } finally {
+      await rm(outboxDir, { recursive: true, force: true });
+    }
+  });
+
+  it("durably registers without context before reading optional context separately", async () => {
+    const outboxDir = await mkdtemp(join(tmpdir(), "agentmemory-session-start-"));
+    const requests: Array<{ path: string; body: Record<string, unknown> }> = [];
+    const server = createServer((req, res) => {
+      let raw = "";
+      req.setEncoding("utf8");
+      req.on("data", (chunk) => {
+        raw += chunk;
+      });
+      req.on("end", () => {
+        const path = req.url || "";
+        const body = JSON.parse(raw || "{}") as Record<string, unknown>;
+        requests.push({ path, body });
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({
+          context: path === "/agentmemory/context" ? "remembered context" : "",
+        }));
+      });
     });
-    expect(result.exitCode).toBe(0);
-    expect(result.stdout).toBe("");
+
+    try {
+      await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+      const address = server.address();
+      if (!address || typeof address === "string") {
+        throw new Error("test server did not bind to a TCP port");
+      }
+      const result = await runHook(
+        "session-start.mjs",
+        JSON.stringify({
+          session_id: "ses_separate_context",
+          cwd: "/tmp/fake-project",
+        }),
+        {
+          AGENTMEMORY_INJECT_CONTEXT: "true",
+          AGENTMEMORY_URL: `http://127.0.0.1:${address.port}`,
+          AGENTMEMORY_OUTBOX_DIR: outboxDir,
+        },
+      );
+
+      expect(result).toMatchObject({
+        exitCode: 0,
+        stdout: "remembered context",
+      });
+      expect(requests.map(({ path }) => path)).toEqual([
+        "/agentmemory/session/start",
+        "/agentmemory/context",
+      ]);
+      expect(requests[0].body).toMatchObject({
+        sessionId: "ses_separate_context",
+        includeContext: false,
+      });
+      expect(requests[1].body).toMatchObject({
+        sessionId: "ses_separate_context",
+      });
+    } finally {
+      await new Promise<void>((resolve, reject) =>
+        server.close((error) => error ? reject(error) : resolve()),
+      );
+      await rm(outboxDir, { recursive: true, force: true });
+    }
   });
 });

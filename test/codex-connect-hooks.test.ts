@@ -1,5 +1,5 @@
-import { describe, it, expect } from "vitest";
-import { writeFileSync, readFileSync, mkdirSync, rmSync } from "node:fs";
+import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
+import { existsSync, writeFileSync, readFileSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import {
@@ -30,6 +30,17 @@ describe("buildMergedHooks", () => {
     }
   });
 
+  it("stamps every AgentMemory hook as Codex provenance", () => {
+    const merged = buildMergedHooks(null, PLUGIN_ROOT);
+    for (const entries of Object.values(merged.hooks)) {
+      for (const entry of entries) {
+        for (const handler of entry.hooks) {
+          expect(handler.command).toContain("--source-client codex");
+        }
+      }
+    }
+  });
+
   it("preserves matchers from the bundled manifest (e.g. PreToolUse)", () => {
     const merged = buildMergedHooks(null, PLUGIN_ROOT);
     const preToolUse = merged.hooks["PreToolUse"];
@@ -38,15 +49,21 @@ describe("buildMergedHooks", () => {
     expect(preToolUse![0].matcher).toBe("Edit|Write|Read|Glob|Grep");
   });
 
-  it("includes all six expected lifecycle events", () => {
+  it("includes the complete current Codex hook event set", () => {
     const merged = buildMergedHooks(null, PLUGIN_ROOT);
     for (const event of [
       "SessionStart",
       "UserPromptSubmit",
       "PreToolUse",
       "PostToolUse",
+      "PermissionRequest",
       "PreCompact",
+      "PostCompact",
+      "SessionEnd",
+      "SubagentStart",
+      "SubagentStop",
       "Stop",
+      "Interrupt",
     ]) {
       expect(Object.keys(merged.hooks)).toContain(event);
     }
@@ -133,5 +150,67 @@ describe("buildMergedHooks file round-trip", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe("Codex adapter stable hook fallback", () => {
+  let home: string;
+  let originalHome: string | undefined;
+  let originalUserprofile: string | undefined;
+
+  beforeEach(() => {
+    home = mkdtempSync(join(tmpdir(), "agentmemory-codex-stable-"));
+    originalHome = process.env["HOME"];
+    originalUserprofile = process.env["USERPROFILE"];
+    process.env["HOME"] = home;
+    process.env["USERPROFILE"] = home;
+    vi.resetModules();
+  });
+
+  afterEach(() => {
+    if (originalHome === undefined) delete process.env["HOME"];
+    else process.env["HOME"] = originalHome;
+    if (originalUserprofile === undefined) delete process.env["USERPROFILE"];
+    else process.env["USERPROFILE"] = originalUserprofile;
+    rmSync(home, { recursive: true, force: true });
+    vi.resetModules();
+  });
+
+  it("writes only stable user-scope paths and refreshes them when MCP is already wired", async () => {
+    const { adapter } = await import("../src/cli/connect/codex.js?stable=" + Date.now());
+    const first = await adapter.install({
+      dryRun: false,
+      force: false,
+      withHooks: true,
+      guidelines: false,
+    });
+    expect(first.kind).toBe("installed");
+
+    const stableRoot = join(home, ".agentmemory", "hooks", "current");
+    const hooksPath = join(home, ".codex", "hooks.json");
+    const hooks = JSON.parse(readFileSync(hooksPath, "utf-8")) as HookManifest;
+    const commands = Object.values(hooks.hooks)
+      .flatMap((entries) => entries)
+      .flatMap((entry) => entry.hooks)
+      .map((handler) => handler.command);
+    expect(commands.length).toBeGreaterThan(0);
+    for (const command of commands) {
+      expect(command).toContain(stableRoot);
+      expect(command).not.toContain(PLUGIN_ROOT);
+      const referenced = command.match(/node "([^"]+)"/)?.[1];
+      expect(referenced).toBeDefined();
+      expect(existsSync(referenced!)).toBe(true);
+    }
+
+    const removed = commands[0]!.match(/node "([^"]+)"/)![1]!;
+    rmSync(removed, { force: true });
+    const second = await adapter.install({
+      dryRun: false,
+      force: false,
+      withHooks: true,
+      guidelines: false,
+    });
+    expect(second.kind).toBe("already-wired");
+    expect(existsSync(removed)).toBe(true);
   });
 });

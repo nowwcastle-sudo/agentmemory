@@ -1,8 +1,14 @@
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { join } from "node:path";
 import * as p from "@clack/prompts";
-import type { ConnectAdapter, ConnectOptions, ConnectResult } from "./types.js";
+import type {
+  AgentProbe,
+  AgentProbeOptions,
+  ConnectAdapter,
+  ConnectOptions,
+  ConnectResult,
+} from "./types.js";
+import { probeExecutable } from "./probe.js";
 import {
   AGENTMEMORY_MCP_BLOCK,
   backupFile,
@@ -17,9 +23,15 @@ import {
   findPluginRoot,
   type HookManifest,
 } from "./codex-hooks.js";
+import { resolvePathLayout } from "../../runtime-paths.js";
+import { installStableHookBundle } from "./stable-hooks.js";
+import {
+  resolveClaudeConfigDir,
+  resolveClaudeStateFile,
+} from "../../claude-paths.js";
 
-const CLAUDE_DIR = join(homedir(), ".claude");
-const CLAUDE_JSON = join(homedir(), ".claude.json");
+const CLAUDE_DIR = resolveClaudeConfigDir();
+const CLAUDE_JSON = resolveClaudeStateFile();
 const CLAUDE_SETTINGS = join(CLAUDE_DIR, "settings.json");
 
 type ClaudeMcpEntry = typeof AGENTMEMORY_MCP_BLOCK;
@@ -36,6 +48,47 @@ function entryMatches(entry: unknown): boolean {
   return args.includes("@agentmemory/mcp");
 }
 
+function hasAgentMemoryHooks(settings: unknown): boolean {
+  if (!settings || typeof settings !== "object") return false;
+  const hooks = (settings as { hooks?: HookManifest["hooks"] }).hooks;
+  if (!hooks || typeof hooks !== "object") return false;
+  return Object.values(hooks).some((entries) =>
+    Array.isArray(entries) && entries.some((entry) =>
+      Array.isArray(entry.hooks) && entry.hooks.some((handler) =>
+        typeof handler.command === "string" &&
+        handler.command.replace(/\\/g, "/").toLowerCase().includes("agentmemory")
+      )
+    )
+  );
+}
+
+function probeClaude(options: AgentProbeOptions = {}): AgentProbe {
+  const executable = probeExecutable(["claude"], options);
+  const configExists = existsSync(CLAUDE_DIR) || existsSync(CLAUDE_JSON);
+  const config = readJsonSafe<ClaudeConfig>(CLAUDE_JSON);
+  const settings = readJsonSafe<unknown>(CLAUDE_SETTINGS);
+  const mcpWired = entryMatches(config?.mcpServers?.["agentmemory"]);
+  const hooksWired = hasAgentMemoryHooks(settings);
+  const wiring = mcpWired && hooksWired
+    ? "wired"
+    : mcpWired || hooksWired
+      ? "partial"
+      : "unwired";
+
+  return {
+    ...executable,
+    presence: executable.presence === "executable"
+      ? "executable"
+      : configExists
+        ? "config-only"
+        : "absent",
+    configPath: CLAUDE_JSON,
+    wiring,
+    activation: wiring === "unwired" ? "not-checked" : "restart-required",
+    durability: hooksWired ? "outbox-capable" : "not-checked",
+  };
+}
+
 export const adapter: ConnectAdapter = {
   name: "claude-code",
   displayName: "Claude Code",
@@ -45,7 +98,11 @@ export const adapter: ConnectAdapter = {
     "→ Using MCP. Hooks are also available — see https://github.com/rohitg00/agentmemory#claude-code-one-block-paste-it.",
 
   detect(): boolean {
-    return existsSync(CLAUDE_DIR);
+    return probeClaude().usable;
+  },
+
+  probe(options): AgentProbe {
+    return probeClaude(options);
   },
 
   async install(opts: ConnectOptions): Promise<ConnectResult> {
@@ -140,12 +197,30 @@ function installClaudeHooks(opts: ConnectOptions): ConnectResult {
     };
   }
 
+  const stableRoot = resolvePathLayout().hooksDir;
+  try {
+    installStableHookBundle(pluginRoot, stableRoot, ["hooks.json"], {
+      dryRun: opts.dryRun,
+    });
+  } catch (err) {
+    return {
+      kind: "skipped",
+      reason: err instanceof Error ? err.message : String(err),
+    };
+  }
+
   type ClaudeSettings = { hooks?: HookManifest["hooks"]; [key: string]: unknown };
   const existing = readJsonSafe<ClaudeSettings>(CLAUDE_SETTINGS) ?? {};
   const existingHooks: HookManifest | null = existing.hooks
     ? { hooks: existing.hooks }
     : null;
-  const merged = buildMergedHooks(existingHooks, pluginRoot, "hooks.json");
+  const merged = buildMergedHooks(
+    existingHooks,
+    pluginRoot,
+    "hooks.json",
+    [join(pluginRoot, "scripts"), stableRoot],
+    stableRoot,
+  );
 
   if (opts.dryRun) {
     p.log.info(
@@ -167,7 +242,7 @@ function installClaudeHooks(opts: ConnectOptions): ConnectResult {
 
   logInstalled("Claude Code hooks (workaround for #508)", CLAUDE_SETTINGS);
   p.log.info(
-    "User-scope hook entries reference absolute paths under the bundled plugin/ dir. Re-run `agentmemory connect claude-code --with-hooks` after upgrading agentmemory to refresh them.",
+    `User-scope hook entries reference the verified stable bundle at ${stableRoot}. Re-run \`agentmemory connect claude-code --with-hooks\` after upgrading agentmemory to refresh it.`,
   );
 
   return {

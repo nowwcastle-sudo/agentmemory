@@ -5,6 +5,9 @@ import type {
   CompressedObservation,
   HybridSearchResult,
   Lesson,
+  Memory,
+  RetrievalScope,
+  Session,
 } from "../types.js";
 import { KV } from "../state/schema.js";
 import { StateKV } from "../state/kv.js";
@@ -17,6 +20,11 @@ import {
 } from "../config.js";
 import { logger } from "../logger.js";
 import { getCounters } from "../telemetry/setup.js";
+import { memoryToObservation } from "../state/memory-utils.js";
+import {
+  matchesRetrievalScope,
+  observationRetrievalMetadata,
+} from "../state/retrieval-scope.js";
 
 // #771: smart-search followup-rate diagnostic. Stored per session as
 // the most recent search payload, used to detect whether the next
@@ -75,7 +83,11 @@ const LESSON_CONTENT_PREVIEW_CHARS = 240;
 export function registerSmartSearchFunction(
   sdk: ISdk,
   kv: StateKV,
-  searchFn: (query: string, limit: number) => Promise<HybridSearchResult[]>,
+  searchFn: (
+    query: string,
+    limit: number,
+    scope?: RetrievalScope,
+  ) => Promise<HybridSearchResult[]>,
 ): void {
   sdk.registerFunction("mem::smart-search",
     async (data: {
@@ -128,6 +140,18 @@ export function registerSmartSearchFunction(
             'Pass agentId: "*" to opt in to a wildcard read.',
         );
       }
+      const projectId =
+        typeof data.project === "string" && data.project.trim()
+          ? data.project.trim()
+          : undefined;
+      const retrievalScope: RetrievalScope | undefined =
+        projectId || explicitAgentId || envAgentId || wildcardAgent
+          ? {
+              ...(projectId ? { projectId } : {}),
+              ...(filterAgentId ? { actorAgentId: filterAgentId } : {}),
+              wildcardAgent,
+            }
+          : undefined;
 
       if (data.expandIds && data.expandIds.length > 0) {
         const raw = data.expandIds.slice(0, 20);
@@ -156,8 +180,13 @@ export function registerSmartSearchFunction(
           if (r) expanded.push(r);
         }
 
-        const scoped = filterAgentId
-          ? expanded.filter((e) => e.observation.agentId === filterAgentId)
+        const scoped = retrievalScope
+          ? expanded.filter((entry) =>
+              matchesRetrievalScope(
+                observationRetrievalMetadata(entry.observation),
+                retrievalScope,
+              ),
+            )
           : expanded;
 
         void recordAccessBatch(
@@ -186,26 +215,21 @@ export function registerSmartSearchFunction(
       const lessonLimit = Math.min(limit, 10);
       const includeLessons = data.includeLessons !== false;
 
-      // Over-fetch when filtering. Hybrid search can't filter on
-      // agentId (BM25/vector indexes don't carry it), so we ask the
-      // searcher for more hits than we need and trim post-filter. 3×
-      // is a defensible middle ground: enough headroom for a small
-      // workload, capped at 300 so a 100-limit request never asks for
-      // thousands of hits.
-      const overFetchLimit = filterAgentId
-        ? Math.min(limit * 3, 300)
-        : limit;
-
       const [hybridResults, lessons] = await Promise.all([
-        searchFn(data.query, overFetchLimit),
+        searchFn(data.query, limit, retrievalScope),
         includeLessons
           ? recallLessons(sdk, data.query, lessonLimit, data.project)
           : Promise.resolve([]),
       ]);
 
-      const filteredHybrid = filterAgentId
+      const filteredHybrid = retrievalScope
         ? hybridResults
-            .filter((r) => r.observation.agentId === filterAgentId)
+            .filter((result) =>
+              matchesRetrievalScope(
+                observationRetrievalMetadata(result.observation),
+                retrievalScope,
+              ),
+            )
             .slice(0, limit)
         : hybridResults.slice(0, limit);
 
@@ -364,14 +388,32 @@ async function findObservation(
   obsId: string,
   sessionIdHint?: string,
 ): Promise<CompressedObservation | null> {
+  const inheritSessionScope = async (
+    observation: CompressedObservation,
+    sessionId: string,
+  ): Promise<CompressedObservation> => {
+    if (observation.projectId) return observation;
+    const session = await kv.get<Session>(KV.sessions, sessionId).catch(() => null);
+    if (!session?.project) return observation;
+    return {
+      ...observation,
+      projectId: session.project,
+      visibility: observation.visibility ?? "project",
+      sourceKind: observation.sourceKind ?? "observation",
+    };
+  };
+
   if (sessionIdHint) {
     const obs = await kv
       .get<CompressedObservation>(KV.observations(sessionIdHint), obsId)
       .catch(() => null);
-    if (obs) return obs;
+    if (obs) return inheritSessionScope(obs, sessionIdHint);
   }
 
-  const sessions = await kv.list<{ id: string }>(KV.sessions);
+  const memory = await kv.get<Memory>(KV.memories, obsId).catch(() => null);
+  if (memory) return memoryToObservation(memory);
+
+  const sessions = await kv.list<Session>(KV.sessions);
   for (let i = 0; i < sessions.length; i += 5) {
     const batch = sessions.slice(i, i + 5);
     const results = await Promise.all(
@@ -379,8 +421,10 @@ async function findObservation(
         kv.get<CompressedObservation>(KV.observations(s.id), obsId).catch(() => null),
       ),
     );
-    const found = results.find((r) => r !== null);
-    if (found) return found;
+    const foundIndex = results.findIndex((result) => result !== null);
+    if (foundIndex !== -1) {
+      return inheritSessionScope(results[foundIndex]!, batch[foundIndex].id);
+    }
   }
   return null;
 }

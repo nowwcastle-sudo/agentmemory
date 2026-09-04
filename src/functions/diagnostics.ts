@@ -22,6 +22,11 @@ import type {
   Session,
   Memory,
 } from "../types.js";
+import {
+  collectPipelineHealth,
+  reconcilePipelineWork,
+} from "../health/pipeline.js";
+import type { ProjectionCoordinator } from "./projection-coordinator.js";
 
 const ALL_CATEGORIES = [
   "actions",
@@ -38,12 +43,25 @@ const ALL_CATEGORIES = [
   "crystals",
   "insights",
   "mesh",
+  "pipeline",
 ];
 
 const TWENTY_FOUR_HOURS_MS = 24 * 60 * 60 * 1000;
 const ONE_HOUR_MS = 60 * 60 * 1000;
 
-export function registerDiagnosticsFunction(sdk: ISdk, kv: StateKV): void {
+export function registerDiagnosticsFunction(
+  sdk: ISdk,
+  kv: StateKV,
+  coordinator?: ProjectionCoordinator,
+): void {
+  sdk.registerFunction(
+    "mem::pipeline-reconcile",
+    async (data?: { automatic?: boolean }) =>
+      reconcilePipelineWork(sdk, kv, {
+        automatic: data?.automatic === true,
+      }),
+  );
+
   sdk.registerFunction("mem::diagnose", 
     async (data: { categories?: string[] }) => {
       const categories = data.categories && data.categories.length > 0
@@ -618,6 +636,67 @@ export function registerDiagnosticsFunction(sdk: ISdk, kv: StateKV): void {
             fixable: false,
           });
         }
+      }
+
+      if (categories.includes("pipeline")) {
+        const pipeline = await collectPipelineHealth(kv, undefined, coordinator);
+        for (const stage of ["compression", "summary", "graph"] as const) {
+          const backlog = pipeline[stage];
+          if (backlog.failed > 0) {
+            checks.push({
+              name: `${stage}-projection-failed`,
+              category: "pipeline",
+              status: "fail",
+              message: `${backlog.failed} ${stage} projections are failed`,
+              fixable: false,
+            });
+          }
+          if (backlog.pending > 0) {
+            checks.push({
+              name: `${stage}-projection-pending`,
+              category: "pipeline",
+              status:
+                (backlog.oldestPendingAgeMs ?? 0) > 5 * 60 * 1000
+                  ? "warn"
+                  : "pass",
+              message: `${backlog.pending} ${stage} projections are pending; oldest age ${backlog.oldestPendingAgeMs ?? 0}ms`,
+              fixable: false,
+            });
+          }
+          if (backlog.pending === 0 && backlog.failed === 0) {
+            checks.push({
+              name: `${stage}-projection-clear`,
+              category: "pipeline",
+              status: "pass",
+              message: `${stage} projection backlog is clear`,
+              fixable: false,
+            });
+          }
+        }
+        checks.push({
+          name: "graph-snapshot-state",
+          category: "pipeline",
+          status: pipeline.graphSnapshot.dirty ? "warn" : "pass",
+          message: pipeline.graphSnapshot.present
+            ? `Graph snapshot is ${pipeline.graphSnapshot.dirty ? "dirty" : "clean"}`
+            : "Graph snapshot has not been created",
+          fixable: pipeline.graphSnapshot.dirty,
+        });
+        checks.push({
+          name: "index-snapshot-state",
+          category: "pipeline",
+          status: pipeline.index.dirty
+            ? pipeline.index.lastFailureAt
+              ? "fail"
+              : "warn"
+            : "pass",
+          message: pipeline.index.dirty
+            ? `Search index snapshot is dirty since ${pipeline.index.dirtySince ?? "unknown"}`
+            : pipeline.index.lastSuccessAt
+              ? `Search index snapshot last succeeded at ${pipeline.index.lastSuccessAt}`
+              : "Search index snapshot has not been created",
+          fixable: pipeline.index.dirty,
+        });
       }
 
       const summary = {

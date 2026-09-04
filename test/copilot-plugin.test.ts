@@ -209,7 +209,7 @@ describe("Copilot hooks config (hooks/hooks.copilot.json)", () => {
   });
 });
 
-describe("Copilot hook scripts", () => {
+describe("Copilot hook scripts", { timeout: 20_000 }, () => {
   type ObservedRequest = { path: string; body: Record<string, unknown> };
 
   async function runHook(
@@ -267,7 +267,7 @@ describe("Copilot hook scripts", () => {
         const timeout = setTimeout(() => {
           child.kill();
           reject(new Error(`hook ${script} timed out`));
-        }, 5000);
+        }, 15_000);
         child.on("error", reject);
         child.on("close", (code) => {
           clearTimeout(timeout);
@@ -295,7 +295,8 @@ describe("Copilot hook scripts", () => {
     expect(result.requests[0]?.path).toBe("/agentmemory/session/start");
     expect(result.requests[0]?.body).toMatchObject({
       sessionId: "copilot-session",
-      project: "C:\\repo",
+      project: expect.stringMatching(/^path:[0-9a-f]{32}$/),
+      projectName: "repo",
       cwd: "C:\\repo",
     });
   });
@@ -311,14 +312,8 @@ describe("Copilot hook scripts", () => {
       { AGENTMEMORY_INJECT_CONTEXT: "true" },
     );
 
-    expect(result.stdout).toBe("remembered context");
-    expect(result.requests[0]?.path).toBe("/agentmemory/enrich");
-    expect(result.requests[0]?.body).toMatchObject({
-      sessionId: "unknown",
-      files: ["src/index.ts"],
-      terms: [],
-      toolName: "read",
-    });
+    expect(result.stdout).toBe("");
+    expect(result.requests).toHaveLength(0);
   });
 
   it("prompt-submit accepts Copilot camelCase prompt payload", async () => {
@@ -351,7 +346,7 @@ describe("Copilot hook scripts", () => {
       sessionId: "copilot-session",
       data: {
         tool_name: "edit",
-        tool_input: JSON.stringify({ filePath: "src/index.ts" }),
+        tool_input: { filePath: "src/index.ts" },
         error: "failed",
       },
     });

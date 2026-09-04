@@ -1,12 +1,15 @@
 import type { Plugin } from "@opencode-ai/plugin";
-import { execFileSync } from "node:child_process";
-import { basename } from "node:path";
+import { createHash, randomUUID } from "node:crypto";
+import { readFileSync, realpathSync, statSync } from "node:fs";
+import { access, mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
+import { basename, dirname, join, resolve } from "node:path";
 
 const API = process.env.AGENTMEMORY_URL || "http://localhost:3111";
 // OpenCode reports tool names in lowercase ("read", "edit", ...); matching is
 // case-insensitive at the call site so a future casing change cannot silently
 // kill file enrichment again.
-const FILE_TOOLS = new Set(["read", "write", "edit", "glob", "grep"]);
+const FILE_TOOLS = new Set(["read", "write", "edit", "glob", "grep", "apply_patch"]);
 const FILE_KEYS = ["filePath", "file_path", "path", "file", "pattern"];
 const MAX_STASHED_FILES = 20;
 
@@ -21,15 +24,190 @@ function authHeaders(): Record<string, string> {
 
 async function post(path: string, body: Record<string, unknown>, timeoutMs = 5000): Promise<void> {
   try {
-    await fetch(`${API}/agentmemory${path}`, {
+    const response = await fetch(`${API}/agentmemory${path}`, {
       method: "POST",
       headers: authHeaders(),
       body: JSON.stringify(body),
       signal: AbortSignal.timeout(timeoutMs),
     });
+    if (!response.ok && DEBUG) {
+      console.error(`[agentmemory] POST ${path} failed with HTTP ${response.status}`);
+    }
   } catch (e) {
     if (DEBUG) console.error(`[agentmemory] POST ${path} failed:`, (e as Error).message);
   }
+}
+
+function defaultOutboxDir(): string {
+  return process.env.AGENTMEMORY_OUTBOX_DIR ||
+    join(homedir(), ".agentmemory", "outbox", "opencode");
+}
+
+let envelopeSequence = 0;
+
+export function createDurableTransport(options: {
+  api: string;
+  outboxDir?: string;
+  secret?: string;
+  fetchImpl?: typeof fetch;
+  debug?: boolean;
+}) {
+  const api = options.api.replace(/\/+$/, "");
+  const outboxDir = options.outboxDir || defaultOutboxDir();
+  const secret = options.secret || "";
+  const fetchImpl = options.fetchImpl || fetch;
+  const debug = options.debug === true;
+  let queue = Promise.resolve();
+
+  function headers(): Record<string, string> {
+    const result: Record<string, string> = { "Content-Type": "application/json" };
+    if (secret) result.Authorization = `Bearer ${secret}`;
+    return result;
+  }
+
+  async function transmit(path: string, body: Record<string, unknown>): Promise<void> {
+    const response = await fetchImpl(`${api}/agentmemory${path}`, {
+      method: "POST",
+      headers: headers(),
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+  }
+
+  async function persist(path: string, body: Record<string, unknown>): Promise<void> {
+    await mkdir(outboxDir, { recursive: true, mode: 0o700 });
+    const identity = typeof body.captureId === "string" && body.captureId.trim()
+      ? { path, captureId: body.captureId.trim() }
+      : typeof body.sessionId === "string" && body.sessionId.trim()
+        ? { path, sessionId: body.sessionId.trim() }
+        : { path, body };
+    const key = createHash("sha256")
+      .update(JSON.stringify(identity))
+      .digest("hex");
+    const target = join(outboxDir, `${key}.json`);
+    try {
+      await access(target);
+      return;
+    } catch {
+      // A new envelope is needed.
+    }
+    const temporary = `${target}.${process.pid}.${randomUUID()}.tmp`;
+    await writeFile(
+      temporary,
+      JSON.stringify({
+        path,
+        body,
+        createdAt: new Date().toISOString(),
+        sequence: ++envelopeSequence,
+      }),
+      { encoding: "utf8", mode: 0o600 },
+    );
+    try {
+      await rename(temporary, target);
+    } catch (error) {
+      try {
+        await access(target);
+        await rm(temporary, { force: true });
+      } catch {
+        await rm(temporary, { force: true });
+        throw error;
+      }
+    }
+  }
+
+  async function envelopes(): Promise<Array<{
+    file: string;
+    value: { path: string; body: Record<string, unknown>; createdAt?: string; sequence?: number };
+  }>> {
+    let names: string[];
+    try {
+      names = await readdir(outboxDir);
+    } catch {
+      return [];
+    }
+    const result: Array<{
+      file: string;
+      value: { path: string; body: Record<string, unknown>; createdAt?: string; sequence?: number };
+    }> = [];
+    for (const name of names.filter((entry) => entry.endsWith(".json"))) {
+      const file = join(outboxDir, name);
+      try {
+        const value = JSON.parse(await readFile(file, "utf8"));
+        if (typeof value?.path === "string" && value.body && typeof value.body === "object") {
+          result.push({ file, value });
+        }
+      } catch {
+        // Malformed envelopes stay on disk for operator inspection.
+      }
+    }
+    result.sort((a, b) =>
+      String(a.value.createdAt || "").localeCompare(String(b.value.createdAt || "")) ||
+      Number(a.value.sequence || 0) - Number(b.value.sequence || 0) ||
+      a.file.localeCompare(b.file),
+    );
+    return result;
+  }
+
+  async function replayUnlocked(): Promise<number> {
+    let delivered = 0;
+    for (const { file, value } of await envelopes()) {
+      try {
+        await transmit(value.path, value.body);
+        await rm(file);
+        delivered++;
+      } catch (error) {
+        if (debug) console.error("[agentmemory] capture remains queued:", (error as Error).message);
+        break;
+      }
+    }
+    return delivered;
+  }
+
+  function serialized<T>(task: () => Promise<T>): Promise<T> {
+    const run = queue.then(task, task);
+    queue = run.then(() => undefined, () => undefined);
+    return run;
+  }
+
+  return {
+    enqueue(path: string, body: Record<string, unknown>): Promise<void> {
+      return serialized(() => persist(path, body));
+    },
+    deliver(path: string, body: Record<string, unknown>): Promise<number> {
+      return serialized(async () => {
+        await persist(path, body);
+        return replayUnlocked();
+      });
+    },
+    replay(): Promise<number> {
+      return serialized(replayUnlocked);
+    },
+  };
+}
+
+let durableTransport: ReturnType<typeof createDurableTransport> | null = null;
+
+function captureTransport(): ReturnType<typeof createDurableTransport> {
+  if (!durableTransport) {
+    durableTransport = createDurableTransport({
+      api: API,
+      outboxDir: defaultOutboxDir(),
+      secret: SECRET,
+      fetchImpl: fetch,
+      debug: DEBUG,
+    });
+  }
+  return durableTransport;
+}
+
+function stableCaptureId(sessionId: string, hookType: string, locator: unknown): string {
+  const hash = createHash("sha256")
+    .update(JSON.stringify([sessionId, hookType, locator]))
+    .digest("hex");
+  return `opencode:${hash.slice(0, 32)}`;
 }
 
 async function postJson(path: string, body: Record<string, unknown>): Promise<unknown | null> {
@@ -51,16 +229,49 @@ async function observe(
   sessionId: string,
   hookType: string,
   data: Record<string, unknown>,
+  agentId?: string,
 ): Promise<void> {
   const proj = projectFor(sessionId);
-  await post("/observe", {
+  const locator = data.call_id ?? data.messageID ?? data.subtask_id ??
+    data.permission_id ?? data.tool_call_id ?? data;
+  await captureTransport().deliver("/observe", {
+    captureId: stableCaptureId(sessionId, hookType, locator),
     hookType,
     sessionId,
-    project: proj.name,
+    project: proj.id,
+    projectName: proj.name,
     cwd: proj.cwd,
+    ...(agentId ? { agentId } : {}),
     timestamp: new Date().toISOString(),
     data,
   });
+}
+
+async function postJsonDurable(
+  path: string,
+  body: Record<string, unknown>,
+): Promise<unknown | null> {
+  try {
+    const res = await fetch(`${API}/agentmemory${path}`, {
+      method: "POST",
+      headers: authHeaders(),
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!res.ok) {
+      await captureTransport().enqueue(path, body);
+      return null;
+    }
+    try {
+      return await res.json();
+    } catch {
+      return null;
+    }
+  } catch (e) {
+    if (DEBUG) console.error(`[agentmemory] POST ${path} failed:`, (e as Error).message);
+    await captureTransport().enqueue(path, body);
+    return null;
+  }
 }
 
 let activeSessionId: string | null = null;
@@ -71,44 +282,164 @@ let pendingConfig: Record<string, unknown> | null = null;
 // only a fallback — attribution is per-session via sessionProjects, resolved
 // from each session's own directory at session.created. Module-level-only
 // state recorded home-directory sessions under whatever repo loaded first.
+let defaultProjectId: string | null = null;
 let defaultProjectName: string | null = null;
 let defaultProjectCwd: string | null = null;
-const sessionProjects = new Map<string, { name: string; cwd: string }>();
+const sessionProjects = new Map<string, { id: string; name: string; cwd: string }>();
+const messageAgents = new Map<string, string>();
 
-function projectFor(sessionId: string): { name: string | null; cwd: string | null } {
+function projectFor(
+  sessionId: string,
+): { id: string | null; name: string | null; cwd: string | null } {
   const p = sessionProjects.get(sessionId);
-  return p ?? { name: defaultProjectName, cwd: defaultProjectCwd };
+  return p ?? {
+    id: defaultProjectId,
+    name: defaultProjectName,
+    cwd: defaultProjectCwd,
+  };
 }
 
-const projectNameCache = new Map<string, string>();
+const projectIdentityCache = new Map<string, { id: string; name: string }>();
+const gitProjectIdCache = new Map<string, string>();
 
-function resolveProjectName(dir: string): string {
-  const explicit = process.env.AGENTMEMORY_PROJECT_NAME?.trim();
-  if (explicit) return explicit;
-  const cached = projectNameCache.get(dir);
-  if (cached !== undefined) return cached;
+function realProjectPath(path: string): string {
   try {
-    const top = execFileSync("git", ["rev-parse", "--show-toplevel"], {
-      cwd: dir,
-      stdio: ["ignore", "pipe", "ignore"],
-      encoding: "utf8",
-    }).trim();
-    if (top) {
-      const name = basename(top);
-      projectNameCache.set(dir, name);
-      return name;
-    }
+    return realpathSync.native(path);
   } catch {
-    // not a git repo, fall through
+    return resolve(path);
   }
-  const fallback = basename(dir) || dir;
-  projectNameCache.set(dir, fallback);
-  return fallback;
+}
+
+function canonicalProjectPath(path: string): string {
+  let canonical = realProjectPath(path);
+  canonical = canonical.replace(/\\/g, "/").replace(/\/+$/, "");
+  return process.platform === "win32" ? canonical.toLowerCase() : canonical;
+}
+
+function projectHash(kind: "git" | "path", value: string): string {
+  return `${kind}:${createHash("sha256").update(value).digest("hex").slice(0, 32)}`;
+}
+
+function gitRepository(dir: string): { top: string; commonDir: string } | null {
+  let current = realProjectPath(dir);
+  try {
+    if (!statSync(current).isDirectory()) current = dirname(current);
+  } catch {
+    return null;
+  }
+  while (true) {
+    const dotGit = join(current, ".git");
+    try {
+      const metadata = statSync(dotGit);
+      if (metadata.isDirectory()) return { top: current, commonDir: realProjectPath(dotGit) };
+      if (metadata.isFile()) {
+        const pointer = readFileSync(dotGit, "utf8").match(/^gitdir:\s*(.+)\s*$/im)?.[1];
+        if (!pointer) return null;
+        const gitDir = realProjectPath(resolve(current, pointer));
+        let commonDir = gitDir;
+        try {
+          const common = readFileSync(join(gitDir, "commondir"), "utf8").trim();
+          if (common) commonDir = realProjectPath(resolve(gitDir, common));
+        } catch {}
+        return { top: current, commonDir };
+      }
+    } catch {}
+    const parent = dirname(current);
+    if (parent === current) return null;
+    current = parent;
+  }
+}
+
+function canonicalRemote(remote: string, dir: string): string | null {
+  const value = remote.trim();
+  const scp = value.match(/^(?:[^@/\s]+@)?([^:/\s]+):(.+)$/);
+  if (scp && !value.includes("://") && !/^[A-Za-z]:[\\/]/.test(value)) {
+    const path = scp[2].replace(/^\/+|\/+$/g, "").replace(/\.git$/i, "");
+    return path ? `${scp[1].toLowerCase()}/${path}` : null;
+  }
+  try {
+    const url = new URL(value);
+    if (url.protocol === "file:") {
+      return `file/${canonicalProjectPath(decodeURIComponent(url.pathname))}`;
+    }
+    const path = decodeURIComponent(url.pathname)
+      .replace(/^\/+|\/+$/g, "")
+      .replace(/\.git$/i, "");
+    return url.hostname && path
+      ? `${url.hostname.toLowerCase()}${url.port ? `:${url.port}` : ""}/${path}`
+      : null;
+  } catch {
+    return value ? `file/${canonicalProjectPath(resolve(dir, value))}` : null;
+  }
+}
+
+function gitRemoteIdentity(commonDir: string, dir: string): string | null {
+  const remotes = new Map<string, string>();
+  try {
+    const configured = readFileSync(join(commonDir, "config"), "utf8");
+    let remoteName: string | null = null;
+    for (const line of configured.split(/\r?\n/)) {
+      const section = line.match(/^\s*\[remote\s+"([^"]+)"\]\s*$/i);
+      if (section) {
+        remoteName = section[1];
+        continue;
+      }
+      if (/^\s*\[/.test(line)) {
+        remoteName = null;
+        continue;
+      }
+      const url = remoteName ? line.match(/^\s*url\s*=\s*(.+?)\s*$/i) : null;
+      if (url) remotes.set(remoteName!, url[1]);
+    }
+  } catch {}
+  const names = ["upstream", "origin"];
+  for (const name of [...remotes.keys()].sort()) {
+    if (!names.includes(name)) names.push(name);
+  }
+  for (const name of names) {
+    const remote = remotes.get(name);
+    if (!remote) continue;
+    const canonical = canonicalRemote(remote, dir);
+    if (canonical) return canonical;
+  }
+  return null;
+}
+
+function resolveProjectIdentity(dir: string): { id: string; name: string } {
+  const explicit = process.env.AGENTMEMORY_PROJECT_NAME?.trim();
+  if (explicit) return { id: explicit, name: explicit };
+  const cacheKey = canonicalProjectPath(dir);
+  const cached = projectIdentityCache.get(cacheKey);
+  if (cached !== undefined) return cached;
+  const repository = gitRepository(dir);
+  const canonicalCommonDir = repository
+    ? canonicalProjectPath(repository.commonDir)
+    : null;
+  const name = repository
+    ? basename(canonicalCommonDir?.endsWith("/.git") ? dirname(canonicalCommonDir) : repository.top)
+    : basename(cacheKey) || dir;
+  let id: string;
+  if (repository && canonicalCommonDir) {
+    const cachedProjectId = gitProjectIdCache.get(canonicalCommonDir);
+    if (cachedProjectId) {
+      id = cachedProjectId;
+    } else {
+      const remote = gitRemoteIdentity(repository.commonDir, dir);
+      id = remote
+        ? projectHash("git", remote)
+        : projectHash("path", canonicalCommonDir);
+      gitProjectIdCache.set(canonicalCommonDir, id);
+    }
+  } else {
+    id = projectHash("path", cacheKey);
+  }
+  const identity = { id, name };
+  projectIdentityCache.set(cacheKey, identity);
+  return identity;
 }
 const stashedFiles = new Map<string, Set<string>>();
 const seenSubtaskIds = new Map<string, Set<string>>();
 const seenToolCallIds = new Map<string, Set<string>>();
-const contextInjectedSessions = new Set<string>();
 // cache the context returned by POST /session/start so the chat
 // system-transform hook can inject it without a second /context fetch.
 // Auto-injection now happens at session.created (immediately) AND at
@@ -139,12 +470,26 @@ function pruneSessionMaps(sid: string): void {
   seenSubtaskIds.delete(sid);
   seenToolCallIds.delete(sid);
   sessionProjects.delete(sid);
+  for (const key of messageAgents.keys()) {
+    if (key.startsWith(`${sid}:`)) messageAgents.delete(key);
+  }
 }
 
 function safeSlice(v: unknown, max: number): string {
   if (typeof v === "string") return v.slice(0, max);
   if (v == null) return "";
   try { return JSON.stringify(v).slice(0, max); } catch { return ""; }
+}
+
+export function safeJsonValue(v: unknown, max: number): unknown {
+  if (typeof v === "string") return v.slice(0, max);
+  if (v == null) return v;
+  try {
+    const serialized = JSON.stringify(v);
+    return serialized.length <= max ? v : `${serialized.slice(0, max)}...[truncated]`;
+  } catch {
+    return String(v).slice(0, max);
+  }
 }
 
 const AGENTMEMORY_INSTRUCTIONS = `<agentmemory-instructions>
@@ -215,7 +560,9 @@ function extractErrorMessage(err: unknown): string {
 
 export const AgentmemoryCapturePlugin: Plugin = async (ctx) => {
   defaultProjectCwd = ctx.worktree || ctx.project?.id || process.cwd();
-  defaultProjectName = resolveProjectName(defaultProjectCwd);
+  const defaultIdentity = resolveProjectIdentity(defaultProjectCwd);
+  defaultProjectId = defaultIdentity.id;
+  defaultProjectName = defaultIdentity.name;
 
   return {
     event: async ({ event }) => {
@@ -230,7 +577,6 @@ export const AgentmemoryCapturePlugin: Plugin = async (ctx) => {
         stashedFiles.set(activeSessionId, new Set());
         seenSubtaskIds.delete(activeSessionId);
         seenToolCallIds.delete(activeSessionId);
-        contextInjectedSessions.delete(activeSessionId);
         // Snapshot the session id locally — `activeSessionId` is mutable
         // and another `session.created` event during the await could
         // rebind it, causing context to be cached against the wrong key.
@@ -242,20 +588,22 @@ export const AgentmemoryCapturePlugin: Plugin = async (ctx) => {
           typeof info?.directory === "string" && info.directory
             ? info.directory
             : defaultProjectCwd;
-        let proj: { name: string | null; cwd: string | null };
+        let proj: { id: string | null; name: string | null; cwd: string | null };
         if (sessionDir) {
-          const entry = { cwd: sessionDir, name: resolveProjectName(sessionDir) };
+          const identity = resolveProjectIdentity(sessionDir);
+          const entry = { cwd: sessionDir, ...identity };
           sessionProjects.set(sessionId, entry);
           proj = entry;
         } else {
           proj = projectFor(sessionId);
         }
-        const startResult = await postJson("/session/start", {
+        const startResult = await postJsonDurable("/session/start", {
           sessionId,
           title: info?.title ?? null,
           parentID: info?.parentID ?? null,
           version: info?.version ?? null,
-          project: proj.name,
+          project: proj.id,
+          projectName: proj.name,
           cwd: proj.cwd,
         });
         // cache the context returned at session/start so the
@@ -284,6 +632,7 @@ export const AgentmemoryCapturePlugin: Plugin = async (ctx) => {
           status_type: status.type,
           attempt: status.attempt ?? null,
           message: safeSlice(status.message, 2000),
+          status: safeJsonValue(status, 4000),
         });
       }
 
@@ -330,13 +679,12 @@ export const AgentmemoryCapturePlugin: Plugin = async (ctx) => {
           if (DEBUG) console.error("[agentmemory] session.deleted with no session ID");
           return;
         }
-        await post("/session/end", { sessionId: sid });
+        await captureTransport().deliver("/session/end", { sessionId: sid });
         post("/crystals/auto", { olderThanDays: 7 }, 30000);
         post("/consolidate-pipeline", { tier: "all", force: true }, 30000);
         if (sid === activeSessionId) activeSessionId = null;
         pruneSessionMaps(sid);
         startContextCache.delete(sid);
-        contextInjectedSessions.delete(sid);
       }
 
       // ── session.error ──
@@ -355,9 +703,17 @@ export const AgentmemoryCapturePlugin: Plugin = async (ctx) => {
       if (type === "message.updated") {
         const info = props.info as Record<string, unknown> | undefined;
         if (!info) return;
+        const messageSessionId = props.sessionID || (info.sessionID as string) || activeSessionId;
+        const messageId = typeof info.id === "string" ? info.id : "";
+        const messageAgent = typeof info.agent === "string" && info.agent.trim()
+          ? info.agent.trim()
+          : "";
+        if (messageSessionId && messageId && messageAgent) {
+          messageAgents.set(`${messageSessionId}:${messageId}`, messageAgent);
+        }
 
         if (info.role === "assistant") {
-          const sid = props.sessionID || (info.sessionID as string) || activeSessionId;
+          const sid = messageSessionId;
           if (!sid) return;
           const tokens = info.tokens as Record<string, unknown> | undefined;
           const error = info.error ? extractErrorMessage(info.error) : null;
@@ -380,7 +736,7 @@ export const AgentmemoryCapturePlugin: Plugin = async (ctx) => {
             duration_ms: (info.time && typeof (info.time as any).completed === "number")
               ? (info.time as any).completed - ((info.time as any).created || 0)
               : null,
-          });
+          }, messageAgent || undefined);
         }
       }
 
@@ -412,7 +768,7 @@ export const AgentmemoryCapturePlugin: Plugin = async (ctx) => {
             agent: part.agent,
             prompt: safeSlice(part.prompt, 4000),
             description: safeSlice(part.description, 2000),
-          });
+          }, typeof part.agent === "string" ? part.agent : undefined);
           return;
         }
 
@@ -422,6 +778,9 @@ export const AgentmemoryCapturePlugin: Plugin = async (ctx) => {
           const callId = part.callID as string;
           if (!callId) return;
           const toolName = part.tool as string;
+          const toolAgent = typeof part.messageID === "string"
+            ? messageAgents.get(`${sid}:${part.messageID}`)
+            : undefined;
 
           if (state.status === "completed") {
             const callSet = toolCallSetFor(sid);
@@ -434,15 +793,15 @@ export const AgentmemoryCapturePlugin: Plugin = async (ctx) => {
             await observe(sid, "post_tool_use", {
               tool_name: toolName,
               call_id: callId,
-              tool_input: safeSlice(st.input, 4000),
-              tool_output: safeSlice(st.output, 8000),
+              tool_input: safeJsonValue(st.input, 4000),
+              tool_output: safeJsonValue(st.output, 8000),
               title: st.title ?? null,
               metadata: st.metadata || {},
               duration_ms: (startTime != null && endTime != null) ? endTime - startTime : null,
               attachments: Array.isArray(st.attachments)
                 ? (st.attachments as Array<Record<string, unknown>>).map(a => a.filename || a.url)
                 : [],
-            });
+            }, toolAgent);
           } else if (state.status === "error") {
             const callSet = toolCallSetFor(sid);
             if (callSet.has(callId)) return;
@@ -454,10 +813,10 @@ export const AgentmemoryCapturePlugin: Plugin = async (ctx) => {
             await observe(sid, "post_tool_failure", {
               tool_name: toolName,
               call_id: callId,
-              tool_input: safeSlice(st.input, 4000),
-              tool_output: safeSlice(st.error, 8000),
+              tool_input: safeJsonValue(st.input, 4000),
+              tool_output: safeJsonValue(st.error, 8000),
               duration_ms: (startTime != null && endTime != null) ? endTime - startTime : null,
-            });
+            }, toolAgent);
           }
           return;
         }
@@ -662,26 +1021,25 @@ export const AgentmemoryCapturePlugin: Plugin = async (ctx) => {
       const sid = input.sessionID || activeSessionId;
       if (!sid) return;
 
-      if (!contextInjectedSessions.has(sid)) {
-        if (!Array.isArray(output.system)) return;
-        output.system.push(AGENTMEMORY_INSTRUCTIONS);
-        // prefer the context already fetched at session.created;
-        // fall back to a fresh /context call if the cache missed (e.g.
-        // session resumed across plugin reloads).
-        let ctx = startContextCache.get(sid);
-        if (typeof ctx !== "string" || ctx.length === 0) {
-          const result = await postJson("/context", {
-            sessionId: sid,
-            project: projectFor(sid).name,
-          });
-          ctx = (result as any)?.context;
-        } else {
-          startContextCache.delete(sid);
-        }
+      if (!Array.isArray(output.system)) return;
+      output.system.push(AGENTMEMORY_INSTRUCTIONS);
+      // OpenCode does not expose whether this transform is for an internal
+      // title request or the main agent request. Reuse the session-start
+      // context on every transform so an internal request cannot consume the
+      // only injection. Cache a fallback fetch for resumed sessions.
+      let ctx = startContextCache.get(sid);
+      if (typeof ctx !== "string" || ctx.length === 0) {
+        const result = await postJson("/context", {
+          sessionId: sid,
+          project: projectFor(sid).id,
+        });
+        ctx = (result as any)?.context;
         if (typeof ctx === "string" && ctx.length > 0) {
-          output.system.push(ctx);
+          startContextCache.set(sid, ctx);
         }
-        contextInjectedSessions.add(sid);
+      }
+      if (typeof ctx === "string" && ctx.length > 0) {
+        output.system.push(ctx);
       }
 
       const stash = stashFor(sid);
@@ -710,7 +1068,7 @@ export const AgentmemoryCapturePlugin: Plugin = async (ctx) => {
 
       const result = await postJson("/context", {
         sessionId: sid,
-        project: projectFor(sid).name,
+        project: projectFor(sid).id,
       });
       const ctx = (result as any)?.context;
       if (typeof ctx === "string" && ctx.length > 0) {

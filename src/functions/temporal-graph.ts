@@ -186,7 +186,8 @@ export function registerTemporalGraphFunctions(
         const obsIds = data.observations.map((o) => o.id);
         const { nodes, edges } = parseTemporalGraphXml(response, obsIds);
 
-        const existingNodes = await kv.list<GraphNode>(KV.graphNodes);
+        // graph-schema: stale nodes (merged or rejected by backfill) are never merge targets
+        const existingNodes = (await kv.list<GraphNode>(KV.graphNodes)).filter((n) => !n.stale);
         const existingEdges = await kv.list<GraphEdge>(KV.graphEdges);
 
         const idRemap = new Map<string, string>();
@@ -280,7 +281,7 @@ export function registerTemporalGraphFunctions(
       asOf?: string;
       includeHistory?: boolean;
     }): Promise<TemporalState | { error: string }> => {
-      const allNodes = await kv.list<GraphNode>(KV.graphNodes);
+      const allNodes = (await kv.list<GraphNode>(KV.graphNodes)).filter((n) => !n.stale);
       const allEdges = await kv.list<GraphEdge>(KV.graphEdges);
 
       const entity = allNodes.find(
@@ -358,7 +359,7 @@ export function registerTemporalGraphFunctions(
       from?: string;
       to?: string;
     }) => {
-      const allNodes = await kv.list<GraphNode>(KV.graphNodes);
+      const allNodes = (await kv.list<GraphNode>(KV.graphNodes)).filter((n) => !n.stale);
       const allEdges = await kv.list<GraphEdge>(KV.graphEdges);
       const historicalEdges = await kv
         .list<GraphEdge>(KV.graphEdgeHistory)

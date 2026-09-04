@@ -220,11 +220,14 @@ export function registerGraphImportFunction(sdk: ISdk, kv: StateKV): void {
         }
 
         const parsed = parseGraphifyGraph(await readFile(path, "utf-8"));
+        // graphify nodes have no observation ids and relate documents ("imports");
+        // import mode skips the provenance/target-type rules at the schema seam.
         const { newNodeCount, newEdgeCount } = await persistGraphDelta(
           kv,
           parsed.nodes,
           parsed.edges,
           [],
+          { mode: "import" },
         );
 
         await recordAudit(kv, "import", "mem::graph::import-graphify", [], {

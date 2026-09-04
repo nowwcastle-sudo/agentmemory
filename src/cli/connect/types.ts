@@ -20,6 +20,22 @@ export type ConnectOptions = {
   guidelines?: boolean;
 };
 
+export type AgentProbe = {
+  presence: "absent" | "config-only" | "executable";
+  usable: boolean;
+  executablePath?: string;
+  version?: string;
+  configPath?: string;
+  wiring: "unwired" | "partial" | "wired" | "unknown";
+  activation: "not-checked" | "restart-required" | "trust-required" | "verified";
+  durability: "not-checked" | "outbox-capable" | "verified";
+  reason?: string;
+};
+
+export type AgentProbeOptions = {
+  executeVersion?: boolean;
+};
+
 export type ConnectAdapter = {
   name: string;
   displayName: string;
@@ -39,6 +55,7 @@ export type ConnectAdapter = {
    */
   category?: "native" | "mcp";
   detect(): boolean;
+  probe?(options?: AgentProbeOptions): AgentProbe;
   install(opts: ConnectOptions): Promise<ConnectResult>;
 };
 

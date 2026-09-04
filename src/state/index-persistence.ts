@@ -1,9 +1,11 @@
+import { createHash } from "node:crypto";
 import { SearchIndex } from "./search-index.js";
 import { VectorIndex } from "./vector-index.js";
 import type { StateKV } from "./kv.js";
 import { KV, generateId } from "./schema.js";
 import { logger } from "../logger.js";
 import { safeAudit } from "../functions/audit.js";
+import type { IndexPersistenceStatus } from "../types.js";
 
 const DEBOUNCE_MS = 5000;
 const FAILURE_LOG_THROTTLE_MS = 60_000;
@@ -16,11 +18,19 @@ const VECTOR_MANIFEST_KEY = "vectors:manifest";
 const VECTOR_SHARD_SCOPE_PREFIX = `${KV.bm25Index}:vectors:`;
 const INDEX_SHARD_KEY = "data";
 const DEFAULT_INDEX_SHARD_CHARS = 2_000_000;
+const INDEX_STATUS_KEY = "current";
+
+function isIndexPersistenceAuditEnabled(): boolean {
+  const value = process.env["AGENTMEMORY_AUDIT_INDEX_PERSIST"]
+    ?.trim()
+    .toLowerCase();
+  return value === "1" || value === "true";
+}
 
 type IndexShardManifest = {
   v: 1;
   generation?: string;
-  shards: Array<{ scope: string; key: string; chars: number }>;
+  shards: Array<{ scope: string; key: string; chars: number; sha256?: string }>;
   chars: number;
 };
 
@@ -46,6 +56,10 @@ function statePath(scope: string, key: string): string {
   return `${scope}/${key}`;
 }
 
+function contentHash(value: string): string {
+  return createHash("sha256").update(value).digest("hex");
+}
+
 function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
@@ -54,20 +68,32 @@ function isValidShardDescriptor(
   shard: unknown,
 ): shard is IndexShardManifest["shards"][number] {
   if (!shard || typeof shard !== "object") return false;
-  const candidate = shard as { scope?: unknown; key?: unknown; chars?: unknown };
+  const candidate = shard as {
+    scope?: unknown;
+    key?: unknown;
+    chars?: unknown;
+    sha256?: unknown;
+  };
   return (
     typeof candidate.scope === "string" &&
     candidate.scope.length > 0 &&
     typeof candidate.key === "string" &&
     candidate.key.length > 0 &&
     Number.isInteger(candidate.chars) &&
-    candidate.chars >= 0
+    candidate.chars >= 0 &&
+    (candidate.sha256 === undefined ||
+      (typeof candidate.sha256 === "string" &&
+        /^[a-f0-9]{64}$/.test(candidate.sha256)))
   );
 }
 
 export class IndexPersistence {
   private timer: ReturnType<typeof setTimeout> | null = null;
   private lastFailureLogAt = 0;
+  private status: IndexPersistenceStatus = { dirty: false };
+  private statusWrite: Promise<void> = Promise.resolve();
+  private saveQueue: Promise<void> = Promise.resolve();
+  private mutationVersion = 0;
 
   constructor(
     private kv: StateKV,
@@ -77,28 +103,86 @@ export class IndexPersistence {
   ) {}
 
   scheduleSave(): void {
+    this.mutationVersion += 1;
+    if (!this.status.dirty) {
+      this.status = {
+        ...this.status,
+        dirty: true,
+        dirtySince: new Date().toISOString(),
+      };
+      void this.persistStatus();
+    }
     if (this.timer) clearTimeout(this.timer);
     // setTimeout discards the returned promise, so any rejection inside
     // save() would surface as unhandledRejection and crash the process
     // under sustained iii-engine write timeouts (issue #204). Funnel
     // rejections through logFailure() instead.
     this.timer = setTimeout(() => {
-      this.save().catch((err) => this.logFailure(err));
+      void this.save();
     }, DEBOUNCE_MS);
   }
 
-  async save(): Promise<void> {
+  save(): Promise<boolean> {
+    const run = this.saveQueue.then(() => this.performSave());
+    this.saveQueue = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }
+
+  private async performSave(): Promise<boolean> {
     if (this.timer) {
       clearTimeout(this.timer);
       this.timer = null;
     }
+    const savingVersion = this.mutationVersion;
+    const attemptAt = new Date().toISOString();
+    this.status = {
+      ...this.status,
+      dirty: true,
+      dirtySince: this.status.dirtySince ?? attemptAt,
+      lastAttemptAt: attemptAt,
+    };
+    await this.persistStatus().catch(() => {});
     try {
       await this.saveBm25Index(this.bm25.serialize());
       if (this.vector) {
         await this.saveVectorIndex(this.vector.serialize());
       }
+      const lastSuccessAt = new Date().toISOString();
+      const caughtUp = this.mutationVersion === savingVersion;
+      this.status = caughtUp
+        ? {
+            dirty: false,
+            lastAttemptAt: attemptAt,
+            lastSuccessAt,
+            ...(this.status.lastFailureAt
+              ? { lastFailureAt: this.status.lastFailureAt }
+              : {}),
+          }
+        : {
+            dirty: true,
+            dirtySince: this.status.dirtySince ?? attemptAt,
+            lastAttemptAt: attemptAt,
+            lastSuccessAt,
+            ...(this.status.lastFailureAt
+              ? { lastFailureAt: this.status.lastFailureAt }
+              : {}),
+          };
+      await this.persistStatus().catch(() => {});
+      return caughtUp;
     } catch (err) {
       this.logFailure(err);
+      this.status = {
+        ...this.status,
+        dirty: true,
+        lastAttemptAt: attemptAt,
+        lastFailureAt: new Date().toISOString(),
+        lastError: "index_save_failed",
+      };
+      await this.persistStatus().catch(() => {});
+      return false;
     }
   }
 
@@ -106,6 +190,12 @@ export class IndexPersistence {
     bm25: SearchIndex | null;
     vector: VectorIndex | null;
   }> {
+    const persistedStatus = await this.kv
+      .get<IndexPersistenceStatus>(KV.indexStatus, INDEX_STATUS_KEY)
+      .catch(() => null);
+    if (persistedStatus && typeof persistedStatus.dirty === "boolean") {
+      this.status = { ...persistedStatus };
+    }
     let bm25: SearchIndex | null = null;
     let vector: VectorIndex | null = null;
 
@@ -119,6 +209,10 @@ export class IndexPersistence {
       vector = VectorIndex.deserialize(vecData);
     }
 
+    if (this.status.dirty && bm25 && (!this.vector || vector)) {
+      this.scheduleSave();
+    }
+
     return { bm25, vector };
   }
 
@@ -127,6 +221,21 @@ export class IndexPersistence {
       clearTimeout(this.timer);
       this.timer = null;
     }
+  }
+
+  getStatus(): IndexPersistenceStatus {
+    return { ...this.status };
+  }
+
+  private persistStatus(): Promise<void> {
+    const snapshot = { ...this.status };
+    const write = this.statusWrite
+      .catch(() => {})
+      .then(async () => {
+        await this.kv.set(KV.indexStatus, INDEX_STATUS_KEY, snapshot);
+      });
+    this.statusWrite = write.catch(() => {});
+    return write;
   }
 
   private logFailure(err: unknown): void {
@@ -179,22 +288,39 @@ export class IndexPersistence {
       this.options.createGeneration?.() ?? createIndexGeneration();
     const chunkChars = shardChars(this.options);
     const shards: IndexShardManifest["shards"] = [];
-    const chunks: string[] = [];
+    const writes: Array<{
+      shard: IndexShardManifest["shards"][number];
+      chunk: string;
+    }> = [];
 
     for (let offset = 0; offset < serialized.length; offset += chunkChars) {
       const shardIndex = shards.length;
+      const chunk = serialized.slice(offset, offset + chunkChars);
+      const sha256 = contentHash(chunk);
+      const previousShard = previous?.shards?.[shardIndex];
+      if (
+        previousShard?.chars === chunk.length &&
+        previousShard.sha256 === sha256
+      ) {
+        shards.push(previousShard);
+        continue;
+      }
       const scope = `${scopePrefix}${generation}:${String(shardIndex).padStart(
         5,
         "0",
       )}`;
-      const chunk = serialized.slice(offset, offset + chunkChars);
-      shards.push({ scope, key: INDEX_SHARD_KEY, chars: chunk.length });
-      chunks.push(chunk);
+      const shard = {
+        scope,
+        key: INDEX_SHARD_KEY,
+        chars: chunk.length,
+        sha256,
+      };
+      shards.push(shard);
+      writes.push({ shard, chunk });
     }
 
     const writeResults = await Promise.allSettled(
-      shards.map(async (shard, index) => {
-        const chunk = chunks[index] ?? "";
+      writes.map(async ({ shard, chunk }) => {
         await this.kv.set(shard.scope, shard.key, chunk);
         await this.auditIndexPersistence("shard_write", [
           statePath(shard.scope, shard.key),
@@ -211,7 +337,10 @@ export class IndexPersistence {
       (result): result is PromiseRejectedResult => result.status === "rejected",
     );
     if (failedWrite) {
-      await this.deleteShards(shards, "shard_write_rollback");
+      await this.deleteShards(
+        writes.map(({ shard }) => shard),
+        "shard_write_rollback",
+      );
       throw failedWrite.reason;
     }
 
@@ -249,7 +378,10 @@ export class IndexPersistence {
           error: errorMessage(err),
         });
       } else {
-        await this.deleteShards(shards, "manifest_publish_rollback");
+        await this.deleteShards(
+          writes.map(({ shard }) => shard),
+          "manifest_publish_rollback",
+        );
       }
       throw err;
     }
@@ -271,6 +403,7 @@ export class IndexPersistence {
     targetIds: string[],
     details: Record<string, unknown>,
   ): Promise<void> {
+    if (!isIndexPersistenceAuditEnabled()) return;
     await safeAudit(
       this.kv,
       "index_persist",
@@ -333,7 +466,8 @@ export class IndexPersistence {
       return (
         shard.scope === expectedShard.scope &&
         shard.key === expectedShard.key &&
-        shard.chars === expectedShard.chars
+        shard.chars === expectedShard.chars &&
+        shard.sha256 === expectedShard.sha256
       );
     });
   }
@@ -442,6 +576,13 @@ export class IndexPersistence {
           key: shard.key,
           expected: shard.chars,
           actual: chunk.length,
+        });
+        return null;
+      }
+      if (shard.sha256 && contentHash(chunk) !== shard.sha256) {
+        logger.warn(`index persistence: ${label} shard hash mismatch`, {
+          scope: shard.scope,
+          key: shard.key,
         });
         return null;
       }

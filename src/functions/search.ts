@@ -1,5 +1,5 @@
 import type { ISdk } from 'iii-sdk'
-import type { CompactSearchResult, CompressedObservation, Memory, SearchResult, Session } from '../types.js'
+import type { CompactSearchResult, CompressedObservation, Memory, RetrievalMetadata, RetrievalScope, SearchResult, Session } from '../types.js'
 import { KV } from '../state/schema.js'
 import { StateKV } from '../state/kv.js'
 import { SearchIndex } from '../state/search-index.js'
@@ -9,6 +9,9 @@ import { memoryToObservation } from '../state/memory-utils.js'
 import { recordAccessBatch } from './access-tracker.js'
 import { logger } from "../logger.js";
 import { getAgentId, isAgentScopeIsolated } from "../config.js";
+import { matchesRetrievalScope, observationRetrievalMetadata } from "../state/retrieval-scope.js";
+import type { IndexPersistenceStatus } from "../types.js";
+import { withKeyedLock } from "../state/keyed-mutex.js";
 
 let index: SearchIndex | null = null
 let vectorIndex: VectorIndex | null = null
@@ -23,6 +26,7 @@ let currentEmbeddingProvider: EmbeddingProvider | null = null
 type HybridRanker = (
   query: string,
   limit: number,
+  scope?: RetrievalScope,
 ) => Promise<Array<{ observation: CompressedObservation; sessionId: string; combinedScore: number }>>
 let hybridRanker: HybridRanker | null = null
 
@@ -77,17 +81,26 @@ export function vectorIndexRemove(id: string): void {
 // isolation don't need to wire persistence.
 let indexPersistence: {
   scheduleSave: () => void;
-  save: () => Promise<void>;
+  save: () => Promise<boolean | void>;
+  getStatus?: () => IndexPersistenceStatus;
 } | null = null;
 
 export function setIndexPersistence(
-  p: { scheduleSave: () => void; save: () => Promise<void> } | null,
+  p: {
+    scheduleSave: () => void;
+    save: () => Promise<boolean | void>;
+    getStatus?: () => IndexPersistenceStatus;
+  } | null,
 ): void {
   indexPersistence = p;
 }
 
 export function scheduleIndexSave(): void {
   indexPersistence?.scheduleSave();
+}
+
+export function getIndexPersistenceStatus(): IndexPersistenceStatus | null {
+  return indexPersistence?.getStatus?.() ?? null;
 }
 
 // Synchronous flush variant for delete paths. The debounced
@@ -99,8 +112,9 @@ export function scheduleIndexSave(): void {
 // even when persistence fails — callers must not treat a failed
 // flush as a fatal error on the delete itself (the KV delete already
 // committed before this is invoked).
-export async function flushIndexSave(): Promise<void> {
-  await indexPersistence?.save();
+export async function flushIndexSave(): Promise<boolean> {
+  if (!indexPersistence) return false;
+  return (await indexPersistence.save()) !== false;
 }
 
 // Hard cap on embedding input length. Most providers cap input around
@@ -126,6 +140,7 @@ export async function vectorIndexAddGuarded(
   sessionId: string,
   text: string,
   context: { kind: "memory" | "observation" | "synthetic"; logId: string },
+  metadata: RetrievalMetadata = {},
 ): Promise<boolean> {
   const vi = vectorIndex
   const ep = currentEmbeddingProvider
@@ -142,7 +157,7 @@ export async function vectorIndexAddGuarded(
       })
       return false
     }
-    vi.add(id, sessionId, embedding)
+    vi.add(id, sessionId, embedding, metadata)
     return true
   } catch (err) {
     logger.warn("vector-index add: embed failed — skipping", {
@@ -171,6 +186,7 @@ export async function vectorIndexAddBatchGuarded(
     sessionId: string
     text: string
     context: { kind: "memory" | "observation" | "synthetic"; logId: string }
+    metadata?: RetrievalMetadata
   }>,
 ): Promise<{ ok: number; fail: number }> {
   const vi = vectorIndex
@@ -218,7 +234,7 @@ export async function vectorIndexAddBatchGuarded(
       continue
     }
     try {
-      vi.add(item.id, item.sessionId, embedding)
+      vi.add(item.id, item.sessionId, embedding, item.metadata)
       ok++
     } catch (err) {
       logger.warn("vector-index add batch: index write failed — skipping item", {
@@ -258,6 +274,7 @@ function getRebuildEmbedBatchSize(): number {
 export async function indexRecords(
   observations: CompressedObservation[],
   memories: Memory[],
+  persist = true,
 ): Promise<number> {
   const idx = getSearchIndex()
   const vectorEnabled = Boolean(vectorIndex && currentEmbeddingProvider)
@@ -267,6 +284,7 @@ export async function indexRecords(
     sessionId: string
     text: string
     context: { kind: "memory" | "observation" | "synthetic"; logId: string }
+    metadata?: RetrievalMetadata
   }
   const pending: EmbedJob[] = []
   const flush = async (): Promise<void> => {
@@ -290,6 +308,7 @@ export async function indexRecords(
       sessionId: memory.sessionIds?.[0] ?? 'memory',
       text: memory.title + ' ' + memory.content,
       context: { kind: "memory", logId: memory.id },
+      metadata: observationRetrievalMetadata(memoryToObservation(memory)),
     })
     count++
   }
@@ -301,10 +320,12 @@ export async function indexRecords(
       sessionId: obs.sessionId,
       text: obs.title + ' ' + obs.narrative,
       context: { kind: "observation", logId: obs.id },
+      metadata: observationRetrievalMetadata(obs),
     })
     count++
   }
   await flush()
+  if (persist && count > 0) scheduleIndexSave()
   return count
 }
 
@@ -344,7 +365,13 @@ export async function rebuildIndex(kv: StateKV): Promise<number> {
     const results = await Promise.all(
       chunk.map(async (s) => {
         try {
-          return await kv.list<CompressedObservation>(KV.observations(s.id))
+          const observations = await kv.list<CompressedObservation>(KV.observations(s.id))
+          return observations.map((observation) => ({
+            ...observation,
+            projectId: observation.projectId ?? s.project,
+            visibility: observation.visibility ?? "project",
+            sourceKind: observation.sourceKind ?? "observation",
+          }))
         } catch {
           failedSessions.push(s.id)
           return [] as CompressedObservation[]
@@ -353,19 +380,39 @@ export async function rebuildIndex(kv: StateKV): Promise<number> {
     )
     const chunkObs = results.flat()
     if (chunkObs.length > 0) {
-      indexed += await indexRecords(chunkObs, [])
+      indexed += await indexRecords(chunkObs, [], false)
     }
   }
   if (failedSessions.length > 0) {
     logger.warn('rebuildIndex: failed to load observations for sessions', { failedSessions })
   }
 
-  indexed += await indexRecords([], memories)
+  indexed += await indexRecords([], memories, false)
   if (memoriesLoaded) memoryIndexReady = true
   return indexed
 }
 
 export function registerSearchFunction(sdk: ISdk, kv: StateKV): void {
+  sdk.registerFunction("mem::index-reconcile", async () =>
+    withKeyedLock("index-reconcile", async () => {
+      const indexed = await rebuildIndex(kv);
+      const snapshotSaved = await flushIndexSave();
+      if (!snapshotSaved) {
+        return {
+          success: false,
+          error: "index_snapshot_failed",
+          indexed,
+          status: getIndexPersistenceStatus(),
+        };
+      }
+      return {
+        success: true,
+        indexed,
+        status: getIndexPersistenceStatus(),
+      };
+    }),
+  );
+
   sdk.registerFunction(
     'mem::search',
     async (data: {
@@ -430,6 +477,14 @@ export function registerSearchFunction(sdk: ISdk, kv: StateKV): void {
             'Pass agentId: "*" to opt in to a wildcard read.',
         );
       }
+      const retrievalScope: RetrievalScope | undefined =
+        projectFilter || explicitAgentId || envAgentId || wildcardAgent
+          ? {
+              ...(projectFilter ? { projectId: projectFilter } : {}),
+              ...(filterAgentId ? { actorAgentId: filterAgentId } : {}),
+              wildcardAgent,
+            }
+          : undefined;
       const format = typeof data.format === 'string' ? data.format : 'full'
       if (!['full', 'compact', 'narrative'].includes(format)) {
         throw new Error("mem::search: format must be one of 'full', 'compact', or 'narrative'")
@@ -464,15 +519,13 @@ export function registerSearchFunction(sdk: ISdk, kv: StateKV): void {
         await rebuildPromise
       }
 
-      // When filtering by project/cwd, over-fetch from the index so the
-      // post-filter still has a chance of returning `effectiveLimit` results.
-      // Over-fetch whenever ANY post-index filter is active. agentId
-      // is dropped after the observation/memory is loaded (BM25 index
-      // doesn't carry it), so without the over-fetch isolated-mode
-      // queries return underfilled pages when same-agent matches
-      // rank lower than cross-agent ones in the hybrid score.
-      const filtering = !!(projectFilter || cwdFilter || filterAgentId)
-      const fetchLimit = filtering ? Math.max(effectiveLimit * 10, 100) : effectiveLimit
+      // Project and privacy scope are applied inside every candidate
+      // generator. cwd remains session-only metadata, so it is the sole
+      // reason to over-fetch and post-filter here.
+      const filtering = !!(projectFilter || cwdFilter || retrievalScope)
+      const fetchLimit = cwdFilter
+        ? Math.max(effectiveLimit * 10, 100)
+        : effectiveLimit
       // Hybrid results carry the observation the ranker already loaded,
       // so the load pass below doesn't refetch every record it just
       // enriched.
@@ -484,7 +537,7 @@ export function registerSearchFunction(sdk: ISdk, kv: StateKV): void {
       }>
       if (hybridRanker && vectorIndex && vectorIndex.size > 0) {
         try {
-          const hybrid = await hybridRanker(query, fetchLimit)
+          const hybrid = await hybridRanker(query, fetchLimit, retrievalScope)
           results = hybrid.map((r) => ({
             obsId: r.observation.id,
             sessionId: r.sessionId,
@@ -495,10 +548,10 @@ export function registerSearchFunction(sdk: ISdk, kv: StateKV): void {
           logger.warn("hybrid ranking failed, falling back to keyword search", {
             error: err instanceof Error ? err.message : String(err),
           })
-          results = idx.search(query, fetchLimit)
+          results = idx.search(query, fetchLimit, retrievalScope)
         }
       } else {
-        results = idx.search(query, fetchLimit)
+        results = idx.search(query, fetchLimit, retrievalScope)
       }
 
       // Resolve session -> project/cwd once per sessionId we touch.
@@ -528,12 +581,10 @@ export function registerSearchFunction(sdk: ISdk, kv: StateKV): void {
       // Memory entries with a synthetic sessionId take a secondary KV.memories
       // path so project filtering works correctly for them too.
       //
-      // When agentId filtering is active we can't cap at effectiveLimit
-      // here — the second pass (post-load) is what drops cross-agent
-      // rows, and capping early would underfill the result page. Use
-      // fetchLimit as the upper bound in that case; the final
-      // truncation lives at the end of the second pass.
-      const earlyCap = filterAgentId ? fetchLimit : effectiveLimit
+      // Every ranked stream has already applied project/privacy scope.
+      // This pass only validates loaded source metadata and the cwd field
+      // that does not live in the indexes, so the normal result cap is safe.
+      const earlyCap = effectiveLimit
       const candidates: typeof results = []
       for (const r of results) {
         if (candidates.length >= earlyCap) break
@@ -551,15 +602,12 @@ export function registerSearchFunction(sdk: ISdk, kv: StateKV): void {
             //      directly to get the memory's own project field.
             //   2. Deleted session — the session existed when the entry was indexed
             //      but was since evicted. The KV.memories probe returns null for
-            //      these (they are observations, not memories), so memProject is
-            //      null and the entry passes through as unscoped. This is the safe
-            //      fallback: we lose the ability to filter but never incorrectly
-            //      block a result whose session we can no longer verify.
-            // In both cases, a null memProject means "project unknown — treat as
-            // unscoped and let it through" to preserve backward-compatibility.
+            //      these observations.
+            // Explicit project reads fail closed for legacy rows whose project
+            // cannot be proven from either a session or a memory record.
             if (projectFilter) {
               const memProject = await loadMemoryProject(r.obsId)
-              if (memProject !== null && memProject !== projectFilter) continue
+              if (memProject !== projectFilter) continue
             }
             // cwd filter does not apply to unbound entries.
           }
@@ -586,13 +634,27 @@ export function registerSearchFunction(sdk: ISdk, kv: StateKV): void {
       )
       const enriched: SearchResult[] = []
       for (let i = 0; i < candidates.length; i++) {
-        const obs = obsResults[i]
-        if (!obs) continue
-        // #817: enforce agent-scope after the observation/memory is
-        // loaded. The BM25 index doesn't carry agentId so the filter
-        // happens post-lookup. Wildcard ("*") and no-isolation paths
-        // resolved filterAgentId=undefined upstream and pass through.
-        if (filterAgentId !== undefined && obs.agentId !== filterAgentId) continue
+        const loaded = obsResults[i]
+        if (!loaded) continue
+        let obs = loaded
+        if (retrievalScope?.projectId && !obs.projectId) {
+          const session = await loadSession(candidates[i].sessionId)
+          if (session?.project) {
+            obs = {
+              ...obs,
+              projectId: session.project,
+              visibility: obs.visibility ?? "project",
+              sourceKind: obs.sourceKind ?? "observation",
+            }
+          }
+        }
+        if (
+          retrievalScope &&
+          !matchesRetrievalScope(
+            observationRetrievalMetadata(obs),
+            retrievalScope,
+          )
+        ) continue
         if (enriched.length >= effectiveLimit) break
         enriched.push({
           observation: obs,

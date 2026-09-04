@@ -1,4 +1,6 @@
 #!/usr/bin/env node
+import { defaultHookDelivery, hookSessionId, stableHookCaptureId } from "./_delivery.js";
+import { resolveProjectPayload, hookCwd } from "./_project.js";
 
 // Inlined — see src/hooks/sdk-guard.ts for canonical version. Kept local
 // per-hook so tsdown does not emit a shared hashed chunk that would churn
@@ -7,15 +9,6 @@ function isSdkChildContext(payload: unknown): boolean {
   if (process.env["AGENTMEMORY_SDK_CHILD"] === "1") return true;
   if (!payload || typeof payload !== "object") return false;
   return (payload as { entrypoint?: unknown }).entrypoint === "sdk-ts";
-}
-
-const REST_URL = process.env["AGENTMEMORY_URL"] || "http://localhost:3111";
-const SECRET = process.env["AGENTMEMORY_SECRET"] || "";
-
-function authHeaders(): Record<string, string> {
-  const h: Record<string, string> = { "Content-Type": "application/json" };
-  if (SECRET) h["Authorization"] = `Bearer ${SECRET}`;
-  return h;
 }
 
 async function main() {
@@ -38,17 +31,38 @@ async function main() {
     return;
   }
 
-  const sessionId = ((data.session_id || data.sessionId || data.conversation_id) as string) || "unknown";
+  const sessionId = hookSessionId(data);
+  if (!sessionId) return;
 
-  // session/end already fans out the summary server-side (#1203).
-  fetch(`${REST_URL}/agentmemory/session/end`, {
-    method: "POST",
-    headers: authHeaders(),
-    body: JSON.stringify({ sessionId }),
-    signal: AbortSignal.timeout(5000),
-  }).catch(() => {});
+  const assistantResponse = typeof data.last_assistant_message === "string"
+    ? data.last_assistant_message.trim()
+    : "";
+  const cwd = hookCwd(data) || process.cwd();
+  const delivery = defaultHookDelivery();
+  if (assistantResponse) {
+    await delivery.deliver("/agentmemory/observe", {
+      captureId: stableHookCaptureId(
+        sessionId,
+        "assistant",
+        data.turn_id ?? assistantResponse,
+      ),
+      hookType: "post_tool_use",
+      sessionId,
+      ...resolveProjectPayload(cwd),
+      cwd,
+      ...(typeof data.agent_id === "string" ? { agentId: data.agent_id } : {}),
+      timestamp: new Date().toISOString(),
+      data: {
+        tool_name: "assistant_response",
+        tool_input: { turn_id: data.turn_id },
+        tool_output: assistantResponse,
+      },
+    });
+  }
 
-  setTimeout(() => process.exit(0), 1500).unref();
+  // Stop fires once per agent turn. Checkpoint current work without marking
+  // the session completed; a true SessionEnd uses session-end.ts.
+  await delivery.deliver("/agentmemory/session/checkpoint", { sessionId });
 }
 
 main().catch(() => process.exit(0));

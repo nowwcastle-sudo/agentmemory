@@ -95,3 +95,40 @@ describe("evaluateHealth memory severity", () => {
     expect(strict.status).toBe("healthy");
   });
 });
+
+describe("evaluateHealth KV connectivity severity", () => {
+  it("goes critical when the KV read/write probe fails", () => {
+    const { status, alerts } = evaluateHealth(
+      snap({
+        kvConnectivity: {
+          status: "error",
+          error: "kv_probe_failed",
+          latencyMs: 5001,
+        },
+      }),
+    );
+
+    expect(status).toBe("critical");
+    expect(alerts).toContain("kv_connectivity_error");
+  });
+
+  it("goes degraded, not critical, when KV is connected but slow", () => {
+    const { status, alerts } = evaluateHealth(
+      snap({ kvConnectivity: { status: "ok", latencyMs: 2500 } }),
+      { kvLatencyWarnMs: 2000 },
+    );
+
+    expect(status).toBe("degraded");
+    expect(alerts).toContain("kv_latency_warn_2500ms");
+    expect(alerts).not.toContain("kv_connectivity_error");
+  });
+
+  it("stays healthy when the KV probe succeeds below the latency threshold", () => {
+    expect(
+      evaluateHealth(
+        snap({ kvConnectivity: { status: "ok", latencyMs: 1999 } }),
+        { kvLatencyWarnMs: 2000 },
+      ),
+    ).toMatchObject({ status: "healthy", alerts: [] });
+  });
+});

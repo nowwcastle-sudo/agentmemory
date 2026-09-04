@@ -6,7 +6,7 @@ import type {
   Memory,
   MemoryProvider,
 } from "../types.js";
-import { KV, generateId } from "../state/schema.js";
+import { KV, fingerprintId, generateId } from "../state/schema.js";
 import type { StateKV } from "../state/kv.js";
 import {
   SEMANTIC_MERGE_SYSTEM,
@@ -18,15 +18,18 @@ import { recordAudit } from "./audit.js";
 import { getConsolidationDecayDays, isConsolidationEnabled } from "../config.js";
 import { logger } from "../logger.js";
 
-function applyDecay(
-  items: Array<{
+function applyDecay<
+  T extends {
     strength: number;
     lastAccessedAt?: string;
     updatedAt: string;
-  }>,
+  },
+>(
+  items: T[],
   decayDays: number,
-): void {
-  if (decayDays <= 0 || !Number.isFinite(decayDays)) return;
+): T[] {
+  const changed: T[] = [];
+  if (decayDays <= 0 || !Number.isFinite(decayDays)) return changed;
   const now = Date.now();
   for (const item of items) {
     const lastAccess = item.lastAccessedAt || item.updatedAt;
@@ -34,12 +37,17 @@ function applyDecay(
       (now - new Date(lastAccess).getTime()) / (1000 * 60 * 60 * 24);
     if (daysSince > decayDays) {
       const decayPeriods = Math.floor(daysSince / decayDays);
-      item.strength = Math.max(
+      const nextStrength = Math.max(
         0.1,
         item.strength * Math.pow(0.9, decayPeriods),
       );
+      if (nextStrength !== item.strength) {
+        item.strength = nextStrength;
+        changed.push(item);
+      }
     }
   }
+  return changed;
 }
 
 export function registerConsolidationPipelineFunction(
@@ -48,27 +56,48 @@ export function registerConsolidationPipelineFunction(
   provider: MemoryProvider,
 ): void {
   sdk.registerFunction("mem::consolidate-pipeline", 
-    async (data?: { tier?: string; force?: boolean; project?: string }) => {
+    async (data?: {
+      tier?: string;
+      force?: boolean;
+      project?: string;
+      strict?: boolean;
+      previousSourceFingerprint?: string;
+    }) => {
       if (!data?.force && !isConsolidationEnabled()) {
         return { success: false, skipped: true, reason: "Consolidation disabled: set CONSOLIDATION_ENABLED=true or configure an LLM provider (ANTHROPIC_API_KEY / OPENAI_API_KEY / OPENROUTER_API_KEY / GEMINI_API_KEY / GOOGLE_API_KEY / MINIMAX_API_KEY / OPENAI_BASE_URL / AGENTMEMORY_PROVIDER=agent-sdk)" };
       }
       const tier = data?.tier || "all";
       const decayDays = getConsolidationDecayDays();
       const results: Record<string, unknown> = {};
+      let sourceFingerprint: string | undefined;
+      let strictError: string | undefined;
 
       if (tier === "all" || tier === "semantic") {
         const summaries = await kv.list<SessionSummary>(KV.summaries);
         const existingSemantic = await kv.list<SemanticMemory>(KV.semantic);
+        const recentSummaries = [...summaries]
+          .sort(
+            (a, b) =>
+              new Date(b.createdAt).getTime() -
+              new Date(a.createdAt).getTime(),
+          )
+          .slice(0, 20);
+        sourceFingerprint = fingerprintId(
+          "maintenance-semantic",
+          JSON.stringify(
+            recentSummaries.map((summary) => ({
+              sessionId: summary.sessionId,
+              sourceFingerprint: summary.sourceFingerprint,
+              title: summary.title,
+              narrative: summary.narrative,
+              concepts: summary.concepts,
+            })),
+          ),
+        );
 
-        if (summaries.length >= 5) {
-          const recentSummaries = summaries
-            .sort(
-              (a, b) =>
-                new Date(b.createdAt).getTime() -
-                new Date(a.createdAt).getTime(),
-            )
-            .slice(0, 20);
-
+        if (data?.previousSourceFingerprint === sourceFingerprint) {
+          results.semantic = { skipped: true, reason: "source unchanged" };
+        } else if (summaries.length >= 5) {
           const prompt = buildSemanticMergePrompt(
             recentSummaries.map((s) => ({
               title: s.title,
@@ -124,6 +153,7 @@ export function registerConsolidationPipelineFunction(
             const msg = err instanceof Error ? err.message : String(err);
             logger.error("Semantic consolidation failed", { error: msg });
             results.semantic = { error: msg };
+            strictError = strictError ?? msg;
           }
         } else {
           results.semantic = {
@@ -155,9 +185,16 @@ export function registerConsolidationPipelineFunction(
             content: m.content,
             frequency: m.sessionIds.length || 1,
           }))
-          .filter((p) => p.frequency >= 2);
+          .filter((p) => p.frequency >= 2)
+          .sort((a, b) => a.content.localeCompare(b.content));
+        sourceFingerprint = fingerprintId(
+          "maintenance-procedural",
+          JSON.stringify(patterns),
+        );
 
-        if (patterns.length >= 2) {
+        if (data?.previousSourceFingerprint === sourceFingerprint) {
+          results.procedural = { skipped: true, reason: "source unchanged" };
+        } else if (patterns.length >= 2) {
           const prompt = buildProceduralExtractionPrompt(patterns);
 
           try {
@@ -219,6 +256,7 @@ export function registerConsolidationPipelineFunction(
             const msg = err instanceof Error ? err.message : String(err);
             logger.error("Procedural extraction failed", { error: msg });
             results.procedural = { error: msg };
+            strictError = strictError ?? msg;
           }
         } else {
           results.procedural = {
@@ -230,20 +268,22 @@ export function registerConsolidationPipelineFunction(
 
       if (tier === "all" || tier === "decay") {
         const semantic = await kv.list<SemanticMemory>(KV.semantic);
-        applyDecay(semantic, decayDays);
-        for (const s of semantic) {
+        const changedSemantic = applyDecay(semantic, decayDays);
+        for (const s of changedSemantic) {
           await kv.set(KV.semantic, s.id, s);
         }
 
         const procedural = await kv.list<ProceduralMemory>(KV.procedural);
-        applyDecay(procedural, decayDays);
-        for (const p of procedural) {
+        const changedProcedural = applyDecay(procedural, decayDays);
+        for (const p of changedProcedural) {
           await kv.set(KV.procedural, p.id, p);
         }
 
         results.decay = {
           semantic: semantic.length,
           procedural: procedural.length,
+          semanticUpdated: changedSemantic.length,
+          proceduralUpdated: changedProcedural.length,
         };
       }
 
@@ -264,7 +304,19 @@ export function registerConsolidationPipelineFunction(
       });
 
       logger.info("Consolidation pipeline complete", { tier, results });
-      return { success: true, results };
+      if (data?.strict && strictError) {
+        return {
+          success: false,
+          error: strictError,
+          results,
+          ...(sourceFingerprint ? { sourceFingerprint } : {}),
+        };
+      }
+      return {
+        success: true,
+        results,
+        ...(sourceFingerprint ? { sourceFingerprint } : {}),
+      };
     },
   );
 }

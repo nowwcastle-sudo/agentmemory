@@ -198,8 +198,9 @@ describe("Diagnostics Functions", () => {
       // 15 = 8 original (actions, leases, sentinels, sketches, signals,
       // sessions, memories, mesh) + 6 added in #lesson-visibility
       // (lessons, summaries, semantic, procedural, crystals, insights) +
-      // 1 added in #memory-project-scope (memory-project-coverage).
-      expect(result.summary.pass).toBe(15);
+      // 1 added in #memory-project-scope (memory-project-coverage), plus
+      // five pipeline checks (compression, summary, graph, graph snapshot, index).
+      expect(result.summary.pass).toBe(20);
       expect(result.summary.warn).toBe(0);
       expect(result.summary.fail).toBe(0);
       expect(result.summary.fixable).toBe(0);

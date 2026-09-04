@@ -5,6 +5,7 @@ vi.mock("../src/logger.js", () => ({
 }));
 
 import { registerGraphFunction } from "../src/functions/graph.js";
+import { ProjectionCoordinator } from "../src/functions/projection-coordinator.js";
 import type {
   CompressedObservation,
   GraphNode,
@@ -82,6 +83,7 @@ const testObs: CompressedObservation = {
 describe("Graph Functions", () => {
   let sdk: ReturnType<typeof mockSdk>;
   let kv: ReturnType<typeof mockKV>;
+  let graphCore: Function;
   const ORIG_GRAPH_FLAG = process.env["GRAPH_EXTRACTION_ENABLED"];
 
   beforeEach(() => {
@@ -89,12 +91,45 @@ describe("Graph Functions", () => {
     kv = mockKV();
     vi.clearAllMocks();
     process.env["GRAPH_EXTRACTION_ENABLED"] = "true";
-    registerGraphFunction(sdk as never, kv as never, mockProvider as never);
+    graphCore = registerGraphFunction(
+      sdk as never,
+      kv as never,
+      mockProvider as never,
+      new ProjectionCoordinator(),
+    ) as unknown as Function;
   });
 
   afterEach(() => {
     if (ORIG_GRAPH_FLAG === undefined) delete process.env["GRAPH_EXTRACTION_ENABLED"];
     else process.env["GRAPH_EXTRACTION_ENABLED"] = ORIG_GRAPH_FLAG;
+  });
+
+  it("returns one core whose persisted result matches the public wrapper", async () => {
+    const direct = (await graphCore({ observations: [testObs] })) as {
+      success: boolean;
+      nodesAdded: number;
+      edgesAdded: number;
+    };
+    const wrapperSdk = mockSdk();
+    const wrapperKv = mockKV();
+    registerGraphFunction(
+      wrapperSdk as never,
+      wrapperKv as never,
+      mockProvider as never,
+      new ProjectionCoordinator(),
+    );
+    const wrapped = (await wrapperSdk.trigger("mem::graph-extract", {
+      observations: [testObs],
+    })) as typeof direct;
+
+    expect(direct).toMatchObject({
+      success: true,
+      nodesAdded: 2,
+      edgesAdded: 1,
+    });
+    expect(wrapped).toMatchObject(direct);
+    expect(await kv.list<GraphNode>("mem:graph:nodes")).toHaveLength(2);
+    expect(await wrapperKv.list<GraphNode>("mem:graph:nodes")).toHaveLength(2);
   });
 
   it("graph-extract creates nodes and edges from XML response", async () => {
@@ -569,6 +604,70 @@ describe("Graph Functions", () => {
       expect(snap?.stats.totalNodes).toBe(0);
     });
 
+    it("graph-reset publishes a distinct generation even at the same clock time", async () => {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date("2026-02-01T00:00:00.000Z"));
+      try {
+        await sdk.trigger("mem::graph-reset", {});
+        const first = await kv.get<{ graphGeneration?: string }>(
+          "mem:graph:snapshot",
+          "current",
+        );
+        await sdk.trigger("mem::graph-reset", {});
+        const second = await kv.get<{ graphGeneration?: string }>(
+          "mem:graph:snapshot",
+          "current",
+        );
+
+        expect(first?.graphGeneration).toMatch(/^ggen_/);
+        expect(second?.graphGeneration).toMatch(/^ggen_/);
+        expect(second?.graphGeneration).not.toBe(first?.graphGeneration);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("post-reset extract and rebuild do not reconnect the prior generation", async () => {
+      await sdk.trigger("mem::graph-extract", { observations: [testObs] });
+      const oldNodes = await kv.list<GraphNode>("mem:graph:nodes");
+      const oldNodeIds = new Set(oldNodes.map((node) => node.id));
+
+      await sdk.trigger("mem::graph-reset", {});
+      const resetSnapshot = await kv.get<{ graphGeneration?: string }>(
+        "mem:graph:snapshot",
+        "current",
+      );
+      const extract = (await sdk.trigger("mem::graph-extract", {
+        observations: [testObs],
+      })) as { success: boolean; nodesAdded: number; edgesAdded: number };
+
+      expect(extract.success).toBe(true);
+      expect(extract.nodesAdded).toBe(2);
+      expect(extract.edgesAdded).toBe(1);
+
+      const current = (await sdk.trigger("mem::graph-query", {})) as GraphQueryResult;
+      expect(current.nodes).toHaveLength(2);
+      expect(current.edges).toHaveLength(1);
+      expect(current.nodes.every((node) => !oldNodeIds.has(node.id))).toBe(true);
+      expect(
+        current.nodes.every(
+          (node) => node.graphGeneration === resetSnapshot?.graphGeneration,
+        ),
+      ).toBe(true);
+      expect(
+        current.edges.every(
+          (edge) => edge.graphGeneration === resetSnapshot?.graphGeneration,
+        ),
+      ).toBe(true);
+
+      const rebuilt = (await sdk.trigger("mem::graph-snapshot-rebuild", {
+        force: true,
+      })) as { success: boolean; totalNodes: number; totalEdges: number };
+      expect(rebuilt.success).toBe(true);
+      expect(rebuilt.totalNodes).toBe(2);
+      expect(rebuilt.totalEdges).toBe(1);
+    });
+
     it("graph-reset writes empty snapshot; legacy rows stay as orphans (#825)", async () => {
       await sdk.trigger("mem::graph-extract", { observations: [testObs] });
       // Index entries exist after the extract.
@@ -737,6 +836,185 @@ describe("Graph Functions", () => {
       };
       expect(result.success).toBe(true);
       expect(listCalls).toBe(0);
+    });
+  });
+
+  describe("graph-schema seam", () => {
+    const mkNode = (id: string, name: string, extra: Partial<GraphNode> = {}): GraphNode =>
+      ({ id, type: "concept", name, properties: {}, sourceObservationIds: [id], projectId: "p1", visibility: "project", createdAt: "2026-09-03T00:00:00.000Z", ...extra });
+    const mkEdge = (id: string, s: string, t: string, type: GraphEdge["type"] = "related_to"): GraphEdge =>
+      ({ id, type, sourceNodeId: s, targetNodeId: t, weight: 0.5, sourceObservationIds: [id], createdAt: "2026-09-03T00:00:00.000Z" });
+
+    it("persistGraphDelta writes rejected assertions, stores only accepted and counts on the snapshot", async () => {
+      const { persistGraphDelta } = await import("../src/functions/graph.js");
+      const bad = mkNode("n2", "p95", { type: "metric" as never });
+      const result = await persistGraphDelta(kv as never, [mkNode("n1", "Alpha"), bad], [mkEdge("e1", "n1", "n2", "covers" as never)], ["o1"]);
+      expect(result).toEqual({ newNodeCount: 1, newEdgeCount: 0, rejectedCount: 2 });
+      expect((await kv.list<GraphNode>("mem:graph:nodes")).map((n) => n.id)).toEqual(["n1"]);
+      const rejected = await kv.list<{ id: string; reason: string }>("mem:graph:rejected");
+      expect(rejected.map((r) => [r.id, r.reason]).sort()).toEqual([["rej:edge:e1", "unknown_edge_type"], ["rej:node:n2", "unknown_node_type"]]);
+      const stats = (await sdk.trigger("mem::graph-stats", {})) as { rejected?: number };
+      expect(stats.rejected).toBe(2);
+    });
+
+    it("re-extracting a hyphen/case variant merges into the same node and records the alias", async () => {
+      const { persistGraphDelta } = await import("../src/functions/graph.js");
+      await persistGraphDelta(kv as never, [mkNode("a", "session initialization")], [], ["a"]);
+      const second = await persistGraphDelta(kv as never, [mkNode("b", "Session-Initialization")], [], ["b"]);
+      expect(second.newNodeCount).toBe(0);
+      const nodes = await kv.list<GraphNode>("mem:graph:nodes");
+      expect(nodes).toHaveLength(1);
+      expect(nodes[0].id).toBe("a");
+      expect(nodes[0].aliases).toEqual(["Session-Initialization"]);
+      expect([...nodes[0].sourceObservationIds].sort()).toEqual(["a", "b"]);
+      expect(await kv.get<string>("mem:graph:name-index", "p1|project||concept|session initialization")).toBe("a");
+    });
+
+    it("an edge that becomes a self-loop after merge is rejected inside the lock, not stored", async () => {
+      const { persistGraphDelta } = await import("../src/functions/graph.js");
+      await persistGraphDelta(kv as never, [mkNode("a", "retry logic")], [], ["a"]);
+      const r = await persistGraphDelta(kv as never, [mkNode("x", "Retry-Logic"), mkNode("y", "retry_logic")], [mkEdge("e", "x", "y")], ["o"]);
+      expect(r.newEdgeCount).toBe(0);
+      expect(r.rejectedCount).toBe(1);
+      expect(await kv.list("mem:graph:edges")).toEqual([]);
+      expect((await kv.list<{ reason: string }>("mem:graph:rejected")).map((x) => x.reason)).toEqual(["self_reference"]);
+    });
+
+    it("stops storing rejected records past the 5000 counter but keeps counting", async () => {
+      const { persistGraphDelta } = await import("../src/functions/graph.js");
+      const snap = await kv.get<{ stats: Record<string, unknown> }>("mem:graph:snapshot", "current");
+      const base = snap ?? { version: 1, topNodes: [], topEdges: [], topDegrees: {}, stats: { totalNodes: 0, totalEdges: 0, nodesByType: {}, edgesByType: {} }, updatedAt: "2026-09-03T00:00:00.000Z", dirty: false };
+      await kv.set("mem:graph:snapshot", "current", { ...base, stats: { ...base.stats, rejected: 5000 } });
+      const r = await persistGraphDelta(kv as never, [mkNode("m", "p95", { type: "metric" as never })], [], ["o"]);
+      expect(r.rejectedCount).toBe(1);
+      expect(await kv.list("mem:graph:rejected")).toEqual([]);
+      const stats = (await sdk.trigger("mem::graph-stats", {})) as { rejected?: number };
+      expect(stats.rejected).toBe(5001);
+    });
+
+    it("snapshot-rebuild indexes live nodes by the canonical key and skips stale members", async () => {
+      const { canonicalGraphKey } = await import("../src/functions/graph-schema.js");
+      await sdk.trigger("mem::graph-extract", { observations: [testObs] });
+      const live = mkNode("keep", "Dup-Name");
+      const absorbed = mkNode("gone", "dup name", { stale: true, mergedInto: "keep" });
+      await kv.set("mem:graph:nodes", live.id, live);
+      await kv.set("mem:graph:nodes", absorbed.id, absorbed);
+      await sdk.trigger("mem::graph-snapshot-rebuild", { force: true });
+      expect(await kv.get<string>("mem:graph:name-index", "p1|project||concept|dup name")).toBe("keep");
+      expect(await kv.get<string>("mem:graph:name-index", canonicalGraphKey("concept", "Dup-Name", live))).toBe("keep");
+      for (const n of await kv.list<GraphNode>("mem:graph:nodes")) {
+        if (n.stale) continue;
+        expect(await kv.get<string>("mem:graph:name-index", canonicalGraphKey(n.type, n.name, n))).toBe(n.id);
+      }
+    });
+
+    it("stores at most the remaining room under the cap within one delta", async () => {
+      const { persistGraphDelta } = await import("../src/functions/graph.js");
+      const snap = await kv.get<{ stats: Record<string, unknown> }>("mem:graph:snapshot", "current");
+      const base = snap ?? { version: 1, topNodes: [], topEdges: [], topDegrees: {}, stats: { totalNodes: 0, totalEdges: 0, nodesByType: {}, edgesByType: {} }, updatedAt: "2026-09-03T00:00:00.000Z", dirty: false };
+      await kv.set("mem:graph:snapshot", "current", { ...base, stats: { ...base.stats, rejected: 4999 } });
+      const bad = ["a", "b", "c"].map((id) => mkNode(id, `x${id}`, { type: "metric" as never }));
+      const r = await persistGraphDelta(kv as never, bad, [], ["o"]);
+      expect(r.rejectedCount).toBe(3);
+      expect(await kv.list("mem:graph:rejected")).toHaveLength(1);
+      const stats = (await sdk.trigger("mem::graph-stats", {})) as { rejected?: number };
+      expect(stats.rejected).toBe(5002);
+    });
+
+    it("snapshot-rebuild keeps the rejected counter", async () => {
+      const { persistGraphDelta } = await import("../src/functions/graph.js");
+      await persistGraphDelta(kv as never, [mkNode("n1", "Alpha"), mkNode("n2", "p95", { type: "metric" as never })], [], ["o1"]);
+      await sdk.trigger("mem::graph-snapshot-rebuild", { force: true });
+      const stats = (await sdk.trigger("mem::graph-stats", {})) as { rejected?: number; totalNodes: number };
+      expect(stats.totalNodes).toBe(1);
+      expect(stats.rejected).toBe(1);
+    });
+  });
+
+  // The viewer's Rejected tab reads this endpoint. byReason/byKind describe the
+  // whole store so the summary line stays stable while a filter narrows `total`.
+  describe("mem::graph-rejected", () => {
+    type RejectedPage = {
+      rejected: Array<{ id: string; kind: string; reason: string; capturedAt: string }>;
+      total: number;
+      offset: number;
+      limit: number;
+      cap: number;
+      byReason: Record<string, number>;
+      byKind: { node: number; edge: number };
+    };
+
+    const seed = async (
+      rows: Array<{ id: string; kind: "node" | "edge"; reason: string; capturedAt: string }>,
+    ): Promise<void> => {
+      for (const row of rows) {
+        await kv.set("mem:graph:rejected", row.id, { ...row, record: { id: row.id } });
+      }
+    };
+
+    const sample = [
+      { id: "r1", kind: "node" as const, reason: "unknown_node_type", capturedAt: "2026-09-01T00:00:00.000Z" },
+      { id: "r2", kind: "edge" as const, reason: "unknown_edge_type", capturedAt: "2026-09-03T00:00:00.000Z" },
+      { id: "r3", kind: "node" as const, reason: "unknown_node_type", capturedAt: "2026-09-02T00:00:00.000Z" },
+      { id: "r4", kind: "edge" as const, reason: "self_reference", capturedAt: "2026-08-31T00:00:00.000Z" },
+    ];
+
+    it("returns an empty page (not an error) when nothing was ever rejected", async () => {
+      const page = (await sdk.trigger("mem::graph-rejected", {})) as RejectedPage;
+      expect(page.rejected).toEqual([]);
+      expect(page.total).toBe(0);
+      expect(page.byReason).toEqual({});
+      expect(page.byKind).toEqual({ node: 0, edge: 0 });
+      expect(page.cap).toBe(5000);
+      expect(page.limit).toBe(100);
+      expect(page.offset).toBe(0);
+    });
+
+    it("sorts newest first by capturedAt", async () => {
+      await seed(sample);
+      const page = (await sdk.trigger("mem::graph-rejected", {})) as RejectedPage;
+      expect(page.rejected.map((r) => r.id)).toEqual(["r2", "r3", "r1", "r4"]);
+    });
+
+    it("filters by kind and by reason, keeping byReason/byKind over the full store", async () => {
+      await seed(sample);
+      const nodes = (await sdk.trigger("mem::graph-rejected", { kind: "node" })) as RejectedPage;
+      expect(nodes.rejected.map((r) => r.id)).toEqual(["r3", "r1"]);
+      expect(nodes.total).toBe(2);
+      // Aggregates still describe every stored record, not the filtered slice.
+      expect(nodes.byKind).toEqual({ node: 2, edge: 2 });
+      expect(nodes.byReason).toEqual({
+        unknown_node_type: 2,
+        unknown_edge_type: 1,
+        self_reference: 1,
+      });
+
+      const byReason = (await sdk.trigger("mem::graph-rejected", {
+        reason: "unknown_edge_type",
+      })) as RejectedPage;
+      expect(byReason.rejected.map((r) => r.id)).toEqual(["r2"]);
+      expect(byReason.total).toBe(1);
+    });
+
+    it("clamps limit into 1..1000 and floors offset at 0", async () => {
+      await seed(sample);
+      expect(((await sdk.trigger("mem::graph-rejected", { limit: 0 })) as RejectedPage).limit).toBe(1);
+      expect(((await sdk.trigger("mem::graph-rejected", { limit: -5 })) as RejectedPage).limit).toBe(1);
+      expect(((await sdk.trigger("mem::graph-rejected", { limit: 99999 })) as RejectedPage).limit).toBe(1000);
+      const bad = (await sdk.trigger("mem::graph-rejected", {
+        limit: "abc",
+        offset: -3,
+      })) as RejectedPage;
+      expect(bad.limit).toBe(100);
+      expect(bad.offset).toBe(0);
+    });
+
+    it("pages with limit + offset over the sorted list", async () => {
+      await seed(sample);
+      const page = (await sdk.trigger("mem::graph-rejected", { limit: 2, offset: 1 })) as RejectedPage;
+      expect(page.rejected.map((r) => r.id)).toEqual(["r3", "r1"]);
+      expect(page.total).toBe(4);
+      expect(page.offset).toBe(1);
     });
   });
 });

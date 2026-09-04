@@ -76,6 +76,10 @@ import { hydrateProcessEnvFromFile } from "./config.js";
 import { VERSION } from "./version.js";
 import { getAllTools, ESSENTIAL_TOOLS } from "./mcp/tools-registry.js";
 import { knownAgents } from "./cli/connect/index.js";
+import {
+  resolveClaudeDebugDir,
+  resolveClaudeProjectsDir,
+} from "./claude-paths.js";
 
 const ALL_TOOLS_COUNT = getAllTools().length;
 const CORE_TOOLS_COUNT = getAllTools().filter((t) => ESSENTIAL_TOOLS.has(t.name)).length;
@@ -204,7 +208,7 @@ Commands:
                      the engine was started natively but state file is missing).
   mcp                Start standalone MCP shim — opt-in surface for MCP-only clients
                      (Cursor, Gemini CLI, etc). REST always available at :3111.
-  import-jsonl [p]   Import Claude Code JSONL transcripts (default: ~/.claude/projects)
+  import-jsonl [p]   Import Claude Code JSONL transcripts (default: CLAUDE_CONFIG_DIR/projects or ~/.claude/projects)
                      --max-files <N> | --max-files=<N>: override scan cap (default 200, max 1000;
                      out-of-range is rejected; for trees >1000 files, batch by subdirectory)
 
@@ -2316,7 +2320,7 @@ function findLatestDebugLog(debugDir: string): string | undefined {
 }
 
 function checkClaudeCodeHooks(): CCHooksCheck {
-  const debugDir = join(homedir(), ".claude", "debug");
+  const debugDir = resolveClaudeDebugDir();
   if (!existsSync(debugDir)) return { state: "no-cc-dir" };
 
   const logPath = findLatestDebugLog(debugDir);
@@ -2538,7 +2542,7 @@ async function passiveServerChecks(): Promise<DoctorCheck[]> {
       ok: hasEmbed,
       hint: hasEmbed
         ? undefined
-        : "Running BM25-only. Set EMBEDDING_PROVIDER=local for on-device semantic search, or add OPENAI_API_KEY / VOYAGE_API_KEY / COHERE_API_KEY / OLLAMA_HOST",
+        : "Running BM25-only. Set EMBEDDING_PROVIDER=local for on-device semantic search, or configure a supported remote embedding provider",
     },
   );
 
@@ -3727,7 +3731,8 @@ async function runImportJsonl(): Promise<void> {
   const secret = process.env["AGENTMEMORY_SECRET"];
   if (secret) headers["authorization"] = `Bearer ${secret}`;
 
-  p.log.info(`Importing JSONL from ${pathArg || "~/.claude/projects"}…`);
+  const defaultImportPath = resolveClaudeProjectsDir();
+  p.log.info(`Importing JSONL from ${pathArg || defaultImportPath}…`);
   const spinner = p.spinner();
   spinner.start("scanning files");
 
@@ -3802,7 +3807,7 @@ async function runImportJsonl(): Promise<void> {
       if (discovered > upper || json.traversalCapped) {
         p.log.warn(
           `${baseMsg} Tree exceeds the server's --max-files limit of ${upper}; ` +
-            `batch by subdirectory (run import-jsonl once per project under ~/.claude/projects).`,
+            `batch by subdirectory (run import-jsonl once per project under ${defaultImportPath}).`,
         );
       } else {
         const suggested = Math.min(

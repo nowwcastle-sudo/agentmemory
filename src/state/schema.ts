@@ -4,6 +4,16 @@ import { hasCjk, segmentCjk } from "./cjk-segmenter.js";
 export const KV = {
   sessions: "mem:sessions",
   observations: (sessionId: string) => `mem:obs:${sessionId}`,
+  rawObservations: (sessionId: string) => `mem:raw-obs:${sessionId}`,
+  observationProjections: "mem:obs:projections",
+  sessionProjections: "mem:session:projections",
+  maintenanceProjections: "mem:maintenance:projections",
+  graphProjections: "mem:graph:projections",
+  projectionPending: (stage: "compression" | "summary" | "graph") =>
+    `mem:pipeline:${stage}:pending`,
+  projectionFailed: (stage: "compression" | "summary" | "graph") =>
+    `mem:pipeline:${stage}:failed`,
+  indexStatus: "mem:index:status",
   memories: "mem:memories",
   summaries: "mem:summaries",
   config: "mem:config",
@@ -35,6 +45,8 @@ export const KV = {
   // - graphNodeDegree: key nodeId -> incident-edge count. Read /
   //   incremented on edge writes to maintain the snapshot top-N
   //   ranking without scanning all edges.
+  // graph-schema: assertions the persist seam rejected (verbatim record + reason).
+  graphRejected: "mem:graph:rejected",
   graphNameIndex: "mem:graph:name-index",
   graphEdgeKey: "mem:graph:edge-key",
   graphNodeDegree: "mem:graph:node-degree",

@@ -32,6 +32,15 @@ export const CORE_TOOLS: McpToolDef[] = [
           type: "number",
           description: "Optional token budget to trim returned results",
         },
+        project: {
+          type: "string",
+          description: "Stable canonical project identifier to search",
+        },
+        agentId: {
+          type: "string",
+          description:
+            "Current agent identity used only for agent_private visibility checks; '*' opts out",
+        },
       },
       required: ["query"],
     },
@@ -86,8 +95,12 @@ export const CORE_TOOLS: McpToolDef[] = [
         agentId: {
           type: "string",
           description:
-            "Agent identity to scope this memory to. When set, agent-scoped recall " +
-            "and search only surface it for the same agentId. Omit for shared memory.",
+            "Agent identity recorded as provenance. It becomes an access boundary only when visibility is agent_private.",
+        },
+        visibility: {
+          type: "string",
+          description:
+            "Visibility: project (default, shared across agents in the project) or agent_private",
         },
       },
       required: ["content"],
@@ -136,6 +149,15 @@ export const CORE_TOOLS: McpToolDef[] = [
           description: "Comma-separated observation IDs to expand",
         },
         limit: { type: "number", description: "Max results (default 10)" },
+        project: {
+          type: "string",
+          description: "Stable canonical project identifier to search",
+        },
+        agentId: {
+          type: "string",
+          description:
+            "Current agent identity used only for agent_private visibility checks; '*' opts out",
+        },
       },
       required: ["query"],
     },
@@ -280,6 +302,15 @@ export const V040_TOOLS: McpToolDef[] = [
           description: "Max BFS depth (default 3, max 5)",
         },
         query: { type: "string", description: "Search nodes by name" },
+        project: {
+          type: "string",
+          description: "Stable canonical project identifier to query",
+        },
+        agentId: {
+          type: "string",
+          description:
+            "Current agent identity used for agent_private visibility checks; '*' opts out",
+        },
       },
     },
   },

@@ -13,6 +13,13 @@ const testHome = mkdtempSync(join(tmpdir(), "agentmemory-test-home-"));
 
 export default defineConfig({
   test: {
+    // Windows child-process and filesystem fixtures exceed their 5s test
+    // budgets when many Vitest files compete for the same host resources.
+    // Keep Linux CI parallel while making the documented `npm test` command
+    // deterministic on supported Windows installs.
+    ...(process.platform === "win32"
+      ? { fileParallelism: false, maxWorkers: 1, testTimeout: 30_000 }
+      : {}),
     env: {
       AGENTMEMORY_OUTBOX_DIR: join(testHome, "outbox"),
       HOME: testHome,

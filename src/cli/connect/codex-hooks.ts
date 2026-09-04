@@ -75,16 +75,19 @@ export function buildMergedHooks(
   existing: HookManifest | null,
   pluginRoot: string,
   manifestFile = "hooks.codex.json",
+  managedScriptRoots: string[] = [join(pluginRoot, "scripts")],
+  commandRoot: string = `${pluginRoot}/scripts`,
 ): HookManifest {
   const bundledManifestPath = join(pluginRoot, "hooks", manifestFile);
   const ours = JSON.parse(readFileSync(bundledManifestPath, "utf-8")) as HookManifest;
-  const scriptsDir = join(pluginRoot, "scripts");
 
   const out: HookManifest = { hooks: {} };
 
   if (existing?.hooks) {
     for (const [event, entries] of Object.entries(existing.hooks)) {
-      const kept = entries.filter((entry) => !isAgentmemoryEntry(entry, scriptsDir));
+      const kept = entries.filter(
+        (entry) => !isManagedEntry(entry, managedScriptRoots),
+      );
       if (kept.length > 0) out.hooks[event] = kept;
     }
   }
@@ -94,7 +97,10 @@ export function buildMergedHooks(
       const next: HookEntry = {
         hooks: entry.hooks.map((handler) => ({
           type: handler.type,
-          command: handler.command.replace(/\$\{CLAUDE_PLUGIN_ROOT\}/g, pluginRoot),
+          command: handler.command.replace(
+            /\$\{CLAUDE_PLUGIN_ROOT\}[\\/]scripts/g,
+            commandRoot,
+          ),
         })),
       };
       if (entry.matcher !== undefined) next.matcher = entry.matcher;
@@ -106,11 +112,14 @@ export function buildMergedHooks(
   return out;
 }
 
-function isAgentmemoryEntry(entry: HookEntry, scriptsDir: string): boolean {
-  const normalizedScriptsDir = normalizePathForCommandMatch(scriptsDir);
-  return entry.hooks.some((handler) =>
-    normalizePathForCommandMatch(handler.command).includes(normalizedScriptsDir),
+function isManagedEntry(entry: HookEntry, scriptRoots: string[]): boolean {
+  const normalizedRoots = scriptRoots.map((root) =>
+    normalizePathForCommandMatch(root).replace(/\/$/, "")
   );
+  return entry.hooks.some((handler) => {
+    const command = normalizePathForCommandMatch(handler.command);
+    return normalizedRoots.some((root) => command.includes(`${root}/`));
+  });
 }
 
 function normalizePathForCommandMatch(value: string): string {

@@ -150,6 +150,7 @@ export function registerCrystallizeFunction(
       olderThanDays?: number;
       project?: string;
       dryRun?: boolean;
+      maxGroups?: number;
     }) => {
       const olderThanDays = data.olderThanDays ?? 7;
       const dryRun = data.dryRun ?? false;
@@ -169,7 +170,13 @@ export function registerCrystallizeFunction(
       }
 
       if (allActions.length === 0) {
-        return { success: true, groupCount: 0, crystalIds: [] };
+        return {
+          success: true,
+          groupCount: 0,
+          processedGroupCount: 0,
+          remainingGroups: 0,
+          crystalIds: [],
+        };
       }
 
       const groups = new Map<string, Action[]>();
@@ -183,8 +190,17 @@ export function registerCrystallizeFunction(
         }
       }
 
+      const groupEntries = Array.from(groups.entries()).sort(([left], [right]) =>
+        left.localeCompare(right),
+      );
+      const maxGroups =
+        typeof data.maxGroups === "number" && Number.isFinite(data.maxGroups)
+          ? Math.max(1, Math.floor(data.maxGroups))
+          : groupEntries.length;
+      const selectedGroups = groupEntries.slice(0, maxGroups);
+
       if (dryRun) {
-        const groupSummaries = Array.from(groups.entries()).map(
+        const groupSummaries = selectedGroups.map(
           ([key, actions]) => ({
             groupKey: key,
             actionCount: actions.length,
@@ -195,13 +211,15 @@ export function registerCrystallizeFunction(
           success: true,
           dryRun: true,
           groupCount: groups.size,
+          processedGroupCount: selectedGroups.length,
+          remainingGroups: groups.size,
           groups: groupSummaries,
           crystalIds: [],
         };
       }
 
       const crystalIds: string[] = [];
-      for (const [, groupActions] of groups) {
+      for (const [, groupActions] of selectedGroups) {
         const actionIds = groupActions.map((a) => a.id);
         const project = groupActions[0].project;
 
@@ -222,6 +240,8 @@ export function registerCrystallizeFunction(
       return {
         success: true,
         groupCount: groups.size,
+        processedGroupCount: selectedGroups.length,
+        remainingGroups: Math.max(0, groups.size - crystalIds.length),
         crystalIds,
       };
     },

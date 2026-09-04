@@ -1,4 +1,14 @@
 #!/usr/bin/env node
+//#region src/hooks/_delivery.ts
+function hookSessionId(data) {
+	const value = [
+		data.session_id,
+		data.sessionId,
+		data.conversation_id
+	].find((candidate) => typeof candidate === "string" && candidate.trim().length > 0);
+	return typeof value === "string" ? value.trim() : null;
+}
+//#endregion
 //#region src/hooks/pre-tool-use.ts
 function isSdkChildContext(payload) {
 	if (process.env["AGENTMEMORY_SDK_CHILD"] === "1") return true;
@@ -56,8 +66,8 @@ async function main() {
 		const pattern = toolInput["pattern"];
 		if (typeof pattern === "string" && pattern.length > 0) terms.push(pattern);
 	}
-	const rawSessionId = data.session_id || data.sessionId || data.conversation_id;
-	const sessionId = typeof rawSessionId === "string" && rawSessionId.length > 0 ? rawSessionId : "unknown";
+	const sessionId = hookSessionId(data);
+	if (!sessionId) return;
 	const project = typeof data.project === "string" && data.project.trim().length > 0 ? data.project.trim() : void 0;
 	try {
 		const res = await fetch(`${REST_URL}/agentmemory/enrich`, {

@@ -10,6 +10,7 @@ import type {
   Session,
 } from "../types.js";
 import { importOrigin } from "../types.js";
+import { resolveClaudeProjectsDir } from "../claude-paths.js";
 import type { StateKV } from "../state/kv.js";
 import { KV, generateId, fingerprintId } from "../state/schema.js";
 import { parseJsonlText } from "../replay/jsonl-parser.js";
@@ -305,7 +306,7 @@ export function registerReplayFunctions(sdk: ISdk, kv: StateKV): void {
         }
       | { success: false; error: string }
     > => {
-      const defaultRoot = join(homedir(), ".claude", "projects");
+      const defaultRoot = resolveClaudeProjectsDir();
       const rawPath = data.path || defaultRoot;
       if (typeof rawPath !== "string" || rawPath.length === 0) {
         return { success: false, error: "path must be a non-empty string" };
@@ -395,7 +396,12 @@ export function registerReplayFunctions(sdk: ISdk, kv: StateKV): void {
           : undefined;
 
         const existing = await kv.get<Session>(KV.sessions, parsed.sessionId);
+        const effectiveProject = existing?.project ?? parsed.project;
+        const effectiveProjectName = existing?.projectName ?? parsed.projectName;
         if (existing) {
+          if (!existing.projectName && existing.project === parsed.project) {
+            existing.projectName = parsed.projectName;
+          }
           existing.observationCount =
             (existing.observationCount || 0) + parsed.observations.length;
           if (parsed.endedAt > (existing.endedAt || "")) {
@@ -424,6 +430,7 @@ export function registerReplayFunctions(sdk: ISdk, kv: StateKV): void {
           const session: Session = {
             id: parsed.sessionId,
             project: parsed.project,
+            projectName: parsed.projectName,
             cwd: parsed.cwd,
             startedAt: parsed.startedAt,
             endedAt: parsed.endedAt,
@@ -438,6 +445,8 @@ export function registerReplayFunctions(sdk: ISdk, kv: StateKV): void {
         const compressed: CompressedObservation[] = [];
         await Promise.all(
           parsed.observations.map(async (obs) => {
+            obs.projectId = effectiveProject;
+            obs.projectName = effectiveProjectName;
             const synthetic = buildSyntheticCompression(obs);
             synthetic.origin = importOrigin(
               synthetic.origin,
@@ -463,7 +472,7 @@ export function registerReplayFunctions(sdk: ISdk, kv: StateKV): void {
         await deriveCrystalAndLessons(
           kv,
           parsed.sessionId,
-          parsed.project,
+          effectiveProject,
           parsed.observations,
           compressed,
           firstPrompt,

@@ -3,6 +3,8 @@ import { VectorIndex } from "../state/vector-index.js";
 import { KV } from "../state/schema.js";
 import type { StateKV } from "../state/kv.js";
 import { logger } from "../logger.js";
+import { memoryToObservation } from "../state/memory-utils.js";
+import { observationRetrievalMetadata } from "../state/retrieval-scope.js";
 
 export interface MigrateVectorIndexResult {
   success: boolean;
@@ -73,6 +75,7 @@ export async function migrateVectorIndex(
           textMems[i].id,
           textMems[i].sessionIds[0] ?? "memory",
           embeddings[i],
+          observationRetrievalMetadata(memoryToObservation(textMems[i])),
         );
         processed++;
       }
@@ -129,7 +132,12 @@ export async function migrateVectorIndex(
           failed++;
           continue;
         }
-        newIndex.add(textObs[i].id, textObs[i].sessionId, embeddings[i]);
+        newIndex.add(
+          textObs[i].id,
+          textObs[i].sessionId,
+          embeddings[i],
+          observationRetrievalMetadata(textObs[i]),
+        );
         processed++;
       }
     } catch (err) {

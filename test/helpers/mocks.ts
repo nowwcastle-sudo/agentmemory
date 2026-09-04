@@ -37,6 +37,11 @@ export function mockKV() {
 
 export function mockSdk(opts?: { looseTrigger?: boolean }) {
   const functions = new Map<string, Handler>();
+  const triggers: Array<{
+    type: string;
+    function_id: string;
+    config?: { topic?: string };
+  }> = [];
   const looseTrigger = opts?.looseTrigger ?? false;
   return {
     fns: functions,
@@ -48,7 +53,9 @@ export function mockSdk(opts?: { looseTrigger?: boolean }) {
       const id = typeof idOrOpts === "string" ? idOrOpts : idOrOpts.id;
       functions.set(id, handler);
     },
-    registerTrigger: vi.fn(),
+    registerTrigger: vi.fn((trigger) => {
+      triggers.push(trigger);
+    }),
     trigger: async (
       idOrInput:
         | string
@@ -59,6 +66,21 @@ export function mockSdk(opts?: { looseTrigger?: boolean }) {
         typeof idOrInput === "string" ? idOrInput : idOrInput.function_id;
       const payload =
         typeof idOrInput === "string" ? data : (idOrInput.payload as unknown);
+      if (id === "iii::durable::publish") {
+        const published = payload as { topic?: string; data?: unknown };
+        const subscribers = triggers.filter(
+          (trigger) =>
+            trigger.type === "durable:subscriber" &&
+            trigger.config?.topic === published.topic,
+        );
+        await Promise.all(
+          subscribers.map(async (trigger) => {
+            const subscriber = functions.get(trigger.function_id);
+            if (subscriber) await subscriber(published.data);
+          }),
+        );
+        return null;
+      }
       const fn = functions.get(id);
       if (!fn) {
         // looseTrigger mirrors production fan-out where side-effect

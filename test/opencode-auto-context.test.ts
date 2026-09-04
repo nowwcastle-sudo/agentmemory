@@ -15,7 +15,7 @@ describe("OpenCode plugin auto-context injection (#431)", () => {
   it("captures context returned by POST /session/start", () => {
     expect(plugin).toMatch(/startContextCache\s*=\s*new Map<string,\s*string>/);
     expect(plugin).toMatch(
-      /postJson\(["']\/session\/start["']/,
+      /postJsonDurable\(["']\/session\/start["']/,
     );
     // Snapshot `activeSessionId` into a local before the await so the cached
     // context binds to the session that opened it, not a later one.
@@ -27,7 +27,7 @@ describe("OpenCode plugin auto-context injection (#431)", () => {
   it("chat.system.transform reads cached context first, falls back to /context", () => {
     expect(plugin).toMatch(/startContextCache\.get\(sid\)/);
     expect(plugin).toMatch(/postJson\(["']\/context["']/);
-    expect(plugin).toMatch(/startContextCache\.delete\(sid\)/);
+    expect(plugin).toMatch(/startContextCache\.set\(sid/);
   });
 
   it("session.deleted clears the cache to avoid stale entries", () => {
@@ -55,7 +55,8 @@ describe("OpenCode plugin project name resolution", () => {
 
   async function startPayloadFor(
     ctx: Record<string, unknown>,
-  ): Promise<{ project: unknown; cwd: unknown }> {
+  ): Promise<{ project: unknown; projectName: unknown; cwd: unknown }> {
+    fetchMock.mockClear();
     const { AgentmemoryCapturePlugin } = await import(
       "../plugin/opencode/agentmemory-capture.ts"
     );
@@ -70,7 +71,7 @@ describe("OpenCode plugin project name resolution", () => {
     );
     if (!startCall) throw new Error("no /session/start call captured");
     const body = JSON.parse((startCall[1] as { body: string }).body);
-    return { project: body.project, cwd: body.cwd };
+    return { project: body.project, projectName: body.projectName, cwd: body.cwd };
   }
 
   async function projectFor(ctx: Record<string, unknown>): Promise<unknown> {
@@ -82,25 +83,27 @@ describe("OpenCode plugin project name resolution", () => {
     expect(await projectFor({ worktree: "/should/be/ignored" })).toBe("my-proj");
   });
 
-  it("treats whitespace-only env value as unset and falls back to the basename", async () => {
+  it("treats whitespace-only env value as unset and derives a stable path ID", async () => {
     process.env.AGENTMEMORY_PROJECT_NAME = "   ";
-    expect(await projectFor({ worktree: "/repo/alpha" })).toBe("alpha");
+    expect(await projectFor({ worktree: "/repo/alpha" })).toMatch(
+      /^path:[0-9a-f]{32}$/,
+    );
   });
 
-  // Canonicalization: project is the git-toplevel/cwd BASENAME (matching the
-  // hooks' resolveProject), while cwd keeps the full path. A nonexistent dir
-  // cannot be a git repo, so these exercise the basename fallback.
-  it("sends the basename as project and the full path as cwd", async () => {
+  it("sends a stable project ID, display name, and full cwd separately", async () => {
     const payload = await startPayloadFor({ worktree: "/repo/alpha" });
-    expect(payload.project).toBe("alpha");
+    expect(payload.project).toMatch(/^path:[0-9a-f]{32}$/);
+    expect(payload.projectName).toBe("alpha");
     expect(payload.cwd).toBe("/repo/alpha");
   });
 
   it("falls back to ctx.project.id when worktree is absent", async () => {
-    expect(await projectFor({ project: { id: "/repo/beta" } })).toBe("beta");
+    const payload = await startPayloadFor({ project: { id: "/repo/beta" } });
+    expect(payload.project).toMatch(/^path:[0-9a-f]{32}$/);
+    expect(payload.projectName).toBe("beta");
   });
 
-  it("resolves the git toplevel basename inside a real repository", async () => {
+  it("resolves a stable ID and display name inside a real repository", async () => {
     const { mkdtempSync, mkdirSync, rmSync } = await import("node:fs");
     const { tmpdir } = await import("node:os");
     const { join } = await import("node:path");
@@ -111,12 +114,57 @@ describe("OpenCode plugin project name resolution", () => {
     mkdirSync(nested, { recursive: true });
     execFileSync("git", ["init", "--quiet"], { cwd: repo, stdio: "ignore" });
     try {
-      // Subdirectory of the repo still resolves to the repo basename.
-      expect(await projectFor({ worktree: nested })).toBe("oc-fixture-repo");
+      const payload = await startPayloadFor({ worktree: nested });
+      expect(payload.project).toMatch(/^path:[0-9a-f]{32}$/);
+      expect(payload.projectName).toBe("oc-fixture-repo");
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
   });
+
+  it("merges a linked worktree and separates foreign paths with the same basename", async () => {
+    const { mkdtempSync, mkdirSync, rmSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const { execFileSync } = await import("node:child_process");
+    const root = mkdtempSync(join(tmpdir(), "amem-oc-identity-"));
+    const repo = join(root, "canonical");
+    const worktree = join(root, "linked");
+    const foreignA = join(root, "foreign-a", "same-name");
+    const foreignB = join(root, "foreign-b", "same-name");
+    mkdirSync(repo, { recursive: true });
+    mkdirSync(foreignA, { recursive: true });
+    mkdirSync(foreignB, { recursive: true });
+    execFileSync("git", ["init", "--quiet"], { cwd: repo, stdio: "ignore" });
+    execFileSync(
+      "git",
+      [
+        "-c",
+        "user.name=AgentMemory Test",
+        "-c",
+        "user.email=agentmemory-test@example.invalid",
+        "commit",
+        "--quiet",
+        "--allow-empty",
+        "-m",
+        "fixture",
+      ],
+      { cwd: repo, stdio: "ignore" },
+    );
+    execFileSync("git", ["worktree", "add", "--quiet", "--detach", worktree], {
+      cwd: repo,
+      stdio: "ignore",
+    });
+
+    try {
+      expect(await projectFor({ worktree })).toBe(await projectFor({ worktree: repo }));
+      expect(await projectFor({ worktree: foreignA })).not.toBe(
+        await projectFor({ worktree: foreignB }),
+      );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 15_000);
 });
 
 describe("OpenCode plugin file-tool matching", () => {
@@ -125,7 +173,7 @@ describe("OpenCode plugin file-tool matching", () => {
   it("matches OpenCode's lowercase tool names case-insensitively", () => {
     // OpenCode reports "read"/"edit"/... in lowercase; the old capitalized
     // set never matched, silently disabling file enrichment.
-    expect(plugin).toContain('FILE_TOOLS = new Set(["read", "write", "edit", "glob", "grep"])');
+    expect(plugin).toContain('FILE_TOOLS = new Set(["read", "write", "edit", "glob", "grep", "apply_patch"])');
     expect(plugin).toContain('FILE_TOOLS.has(String(input.tool ?? "").toLowerCase())');
   });
 });

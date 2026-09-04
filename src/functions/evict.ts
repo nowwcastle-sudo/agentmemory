@@ -4,11 +4,11 @@ import type {
   CompressedObservation,
   RawObservation,
   SessionSummary,
+  SessionProjection,
   Memory,
 } from "../types.js";
 import { KV } from "../state/schema.js";
 import { StateKV } from "../state/kv.js";
-import { isConsolidationEnabled } from "../config.js";
 import { recordAudit } from "./audit.js";
 import { deleteAccessLog } from "./access-tracker.js";
 import { logger } from "../logger.js";
@@ -60,10 +60,8 @@ async function recoverStaleSession(
 ): Promise<boolean> {
   try {
     const result = await sdk.trigger({
-      function_id: "event::session::stopped",
-      // Suppress the per-session consolidation fan-out: eviction runs a
-      // single corpus-wide consolidation pass after all recoveries instead.
-      payload: { sessionId, skipConsolidation: true },
+      function_id: "event::session::ended",
+      payload: { sessionId, evictAfterSuccess: true },
     });
     if (!isValidRecoveryResult(result)) {
       logger.warn("Stale session recovery failed", {
@@ -79,29 +77,6 @@ async function recoverStaleSession(
       error: err instanceof Error ? err.message : String(err),
     });
     return false;
-  }
-}
-
-async function runRecoveredSessionConsolidation(sdk: ISdk): Promise<void> {
-  // Same gate as the session-stop path: keyless installs must not fire
-  // no-op LLM consolidation from an eviction sweep either.
-  if (!isConsolidationEnabled()) return;
-  try {
-    await sdk.trigger({
-      function_id: "mem::consolidate-pipeline",
-      payload: { tier: "all", force: true },
-    });
-    // One crystallization pass for the batch (the per-session fan-out was
-    // suppressed with skipConsolidation), keeping recovered sessions
-    // consistent with normally-stopped ones without the N-fold amplification.
-    await sdk.trigger({
-      function_id: "mem::auto-crystallize",
-      payload: { olderThanDays: 0 },
-    });
-  } catch (err) {
-    logger.warn("Recovered session consolidation failed", {
-      error: err instanceof Error ? err.message : String(err),
-    });
   }
 }
 
@@ -126,73 +101,102 @@ export function registerEvictFunction(sdk: ISdk, kv: StateKV): void {
         dryRun,
       };
 
-      let recoveredStaleSessions = 0;
       const sessions = await kv.list<Session>(KV.sessions).catch(() => []);
       const summaries = await kv
         .list<SessionSummary>(KV.summaries)
         .catch(() => []);
       const summaryIds = new Set(summaries.map((s) => s.sessionId));
+      const sessionProjections = await kv
+        .list<SessionProjection>(KV.sessionProjections)
+        .catch(() => []);
+      const projectionBySession = new Map(
+        sessionProjections.map((projection) => [
+          projection.sessionId,
+          projection,
+        ]),
+      );
 
       for (const session of sessions) {
         if (!session.startedAt) continue;
         const age = now - new Date(session.startedAt).getTime();
         const staleDays = cfg.staleSessionDays * MS_PER_DAY;
-        if (age > staleDays && !summaryIds.has(session.id)) {
-          if (dryRun) {
+        if (age <= staleDays) continue;
+
+        const projection = projectionBySession.get(session.id);
+        const enrichmentSucceeded =
+          projection?.status === "succeeded" &&
+          projection.evictAfterSuccess === true;
+        if (dryRun) {
+          if (enrichmentSucceeded || !summaryIds.has(session.id)) {
             stats.staleSessions++;
-          } else {
-            const observations = await kv
-              .list<CompressedObservation | RawObservation>(
-                KV.observations(session.id),
-              )
-              .catch((err) => {
-                logger.warn("Stale session observation scan failed", {
-                  sessionId: session.id,
-                  error: err instanceof Error ? err.message : String(err),
-                });
-                return null;
-              });
-            if (!observations) continue;
-
-            let recovered = false;
-            const hasCompressedObservations = observations.some(
-              isCompressedObservation,
-            );
-            if (hasCompressedObservations) {
-              recovered = await recoverStaleSession(sdk, session.id);
-              if (!recovered) continue;
-              recoveredStaleSessions++;
-            } else if (observations.length > 0) {
-              logger.warn("Stale session has no compressed observations", {
-                sessionId: session.id,
-              });
-              continue;
-            }
-
-            try {
-              await kv.delete(KV.sessions, session.id);
-              stats.staleSessions++;
-            } catch (err) {
-              logger.warn("Eviction delete failed", {
-                resource: "session",
-                id: session.id,
-                error: err instanceof Error ? err.message : String(err),
-              });
-              continue;
-            }
-            await recordAudit(kv, "delete", "mem::evict", [session.id], {
-              resource: "session",
-              reason: recovered
-                ? "stale_session_recovered_then_evicted"
-                : "stale_session_without_summary",
-              dryRun,
-            });
           }
+          continue;
         }
-      }
 
-      if (!dryRun && recoveredStaleSessions > 0) {
-        await runRecoveredSessionConsolidation(sdk);
+        if (enrichmentSucceeded) {
+          try {
+            await kv.delete(KV.sessions, session.id);
+            stats.staleSessions++;
+          } catch (err) {
+            logger.warn("Eviction delete failed", {
+              resource: "session",
+              id: session.id,
+              error: err instanceof Error ? err.message : String(err),
+            });
+            continue;
+          }
+          await recordAudit(kv, "delete", "mem::evict", [session.id], {
+            resource: "session",
+            reason: "stale_session_projection_succeeded_then_evicted",
+            dryRun,
+          });
+          continue;
+        }
+        if (summaryIds.has(session.id)) continue;
+
+        const observations = await kv
+          .list<CompressedObservation | RawObservation>(
+            KV.observations(session.id),
+          )
+          .catch((err) => {
+            logger.warn("Stale session observation scan failed", {
+              sessionId: session.id,
+              error: err instanceof Error ? err.message : String(err),
+            });
+            return null;
+          });
+        if (!observations) continue;
+
+        const hasCompressedObservations = observations.some(
+          isCompressedObservation,
+        );
+        if (hasCompressedObservations) {
+          await recoverStaleSession(sdk, session.id);
+          continue;
+        }
+        if (observations.length > 0) {
+          logger.warn("Stale session has no compressed observations", {
+            sessionId: session.id,
+          });
+          continue;
+        }
+
+        try {
+          await kv.delete(KV.sessions, session.id);
+          stats.staleSessions++;
+        } catch (err) {
+          logger.warn("Eviction delete failed", {
+            resource: "session",
+            id: session.id,
+            error: err instanceof Error ? err.message : String(err),
+          });
+          continue;
+        }
+        await recordAudit(kv, "delete", "mem::evict", [session.id], {
+          resource: "session",
+          reason: "stale_session_without_summary",
+          dryRun,
+        });
       }
 
       const projectObs = new Map<string, CompressedObservation[]>();

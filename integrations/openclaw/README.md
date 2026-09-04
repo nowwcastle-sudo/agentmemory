@@ -126,8 +126,10 @@ Then enable it in `~/.openclaw/openclaw.json`:
 What the plugin does:
 
 - claims the `plugins.slots.memory = "agentmemory"` slot via `api.registerMemoryCapability({ promptBuilder })` so OpenClaw recognises it as the active memory plugin
-- recalls relevant long-term memory before the agent starts (via the `before_agent_start` hook)
+- starts the durable session, captures the user prompt, and recalls relevant long-term memory before prompt assembly (via the `before_prompt_build` hook)
 - captures completed conversation turns after the agent finishes (via the `agent_end` hook)
+- closes the durable session only on OpenClaw's `session_end` hook; each `agent_end` is a turn checkpoint, not a terminal event
+- keeps failed session/capture requests in `~/.agentmemory/outbox/openclaw` without persisting the bearer secret, then replays them oldest-first on the next event
 
 OpenClaw blocks conversation-reading hooks from non-bundled plugins by default. Allow it once in `openclaw.json` so turn capture works:
 
@@ -139,6 +141,10 @@ OpenClaw blocks conversation-reading hooks from non-bundled plugins by default. 
   }
 }
 ```
+
+The plugin requires a real OpenClaw session identity. If a host build omits both
+`sessionId` and `sessionKey`, the event is skipped with a warning instead of being
+merged into a shared `unknown` session.
 - shares the same backend with Claude Code, Codex CLI, Gemini CLI, Hermes, pi, and other agents
 
 ### Memory runtime (current scope)

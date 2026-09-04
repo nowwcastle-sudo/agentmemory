@@ -372,4 +372,59 @@ describe("TemporalGraph", () => {
     expect(result.success).toBe(false);
     expect(result.error).toBe("No observations provided");
   });
+
+  it("temporal query prefers the live node over a stale merged duplicate", async () => {
+    const { registerTemporalGraphFunctions } = await import(
+      "../src/functions/temporal-graph.js"
+    );
+    const stale: GraphNode = { id: "gn_old", type: "person", name: "Bob", properties: {}, sourceObservationIds: ["obs_0"], createdAt: "2023-01-01T00:00:00Z", stale: true, mergedInto: "gn_new" };
+    const live: GraphNode = { id: "gn_new", type: "person", name: "Bob", properties: {}, sourceObservationIds: ["obs_1"], createdAt: "2024-01-01T00:00:00Z" };
+    const edge: GraphEdge = { id: "ge_1", type: "located_in" as any, sourceNodeId: "gn_new", targetNodeId: "gn_3", weight: 0.9, sourceObservationIds: ["obs_1"], createdAt: "2024-06-01T00:00:00Z", tcommit: "2024-06-01T00:00:00Z", tvalid: "2024-06-01", version: 1, isLatest: true };
+    const sdk = mockSdk();
+    const kv = mockKV([stale, live], [edge]);
+    registerTemporalGraphFunctions(sdk as never, kv as never, { name: "test", compress: vi.fn(), summarize: vi.fn() });
+    const result = (await sdk.trigger("mem::temporal-query", { entityName: "Bob" })) as any;
+    expect(result.entity.id).toBe("gn_new");
+    expect(result.currentEdges.map((e: GraphEdge) => e.id)).toEqual(["ge_1"]);
+    const diff = (await sdk.trigger("mem::differential-state", { entityName: "Bob" })) as any;
+    expect(diff.error).toBeUndefined();
+    expect(diff.entity).toBe("Bob");
+    // changes are keyed off the resolved node id: only the live node owns ge_1
+    expect(diff.totalChanges).toBe(1);
+    expect(diff.changes[0].target).toBe("gn_3");
+  });
+
+  it("temporal extract merges into the live node and never revives a stale duplicate", async () => {
+    const { registerTemporalGraphFunctions } = await import(
+      "../src/functions/temporal-graph.js"
+    );
+    const response = `<temporal_graph>
+  <entities>
+    <entity type="person" name="Alice"><property key="role">engineer</property></entity>
+    <entity type="organization" name="Acme Corp"><property key="industry">tech</property></entity>
+  </entities>
+  <relationships>
+    <relationship type="works_at" source="Alice" target="Acme Corp" weight="0.9" valid_from="2024-01-01" valid_to="current"><reasoning>joined</reasoning></relationship>
+  </relationships>
+</temporal_graph>`;
+    const stale: GraphNode = { id: "gn_stale", type: "person", name: "Alice", properties: {}, sourceObservationIds: ["obs_0"], createdAt: "2023-01-01T00:00:00Z", stale: true, mergedInto: "gn_live" };
+    const live: GraphNode = { id: "gn_live", type: "person", name: "Alice", properties: {}, sourceObservationIds: ["obs_0"], createdAt: "2023-06-01T00:00:00Z" };
+    const sdk = mockSdk();
+    const kv = mockKV([stale, live]);
+    registerTemporalGraphFunctions(sdk as never, kv as never, { name: "test", compress: vi.fn().mockResolvedValue(response), summarize: vi.fn().mockResolvedValue(response) });
+    const result = (await sdk.trigger("mem::temporal-graph-extract", {
+      observations: [{ id: "obs_1", title: "Alice at Acme", narrative: "Alice works at Acme Corp", concepts: [], files: [], type: "conversation", timestamp: "2024-01-01T00:00:00Z" }],
+    })) as { success: boolean; nodesAdded: number };
+    expect(result.success).toBe(true);
+    expect(result.nodesAdded).toBe(2); // nodesAdded counts extracted nodes, merged or not
+    const nodes = await kv.list<GraphNode>("mem:graph:nodes");
+    expect(nodes).toHaveLength(3); // stale + live + Acme Corp; no second live "Alice"
+    const liveAfter = nodes.find((n) => n.id === "gn_live")!;
+    const staleAfter = nodes.find((n) => n.id === "gn_stale")!;
+    expect(liveAfter.sourceObservationIds).toContain("obs_1");
+    expect(staleAfter.sourceObservationIds).toEqual(["obs_0"]);
+    expect(staleAfter.stale).toBe(true);
+    const edges = await kv.list<GraphEdge>("mem:graph:edges");
+    expect(edges[0].sourceNodeId).toBe("gn_live");
+  });
 });

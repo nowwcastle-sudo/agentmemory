@@ -6,9 +6,10 @@ import { withKeyedLock } from "../state/keyed-mutex.js";
 import { memoryToObservation } from "../state/memory-utils.js";
 import { deleteAccessLog } from "./access-tracker.js";
 import { recordAudit } from "./audit.js";
-import { getSearchIndex, isMemoryIndexReady, vectorIndexAddGuarded, vectorIndexRemove, flushIndexSave } from "./search.js";
+import { getSearchIndex, isMemoryIndexReady, scheduleIndexSave, vectorIndexAddGuarded, vectorIndexRemove, flushIndexSave } from "./search.js";
 import { getAgentId } from "../config.js";
 import { logger } from "../logger.js";
+import { observationRetrievalMetadata } from "../state/retrieval-scope.js";
 
 // Slicing by UTF-16 code unit can cut an astral character (emoji, some CJK
 // extensions) mid surrogate pair, leaving a lone high surrogate that renders
@@ -30,6 +31,8 @@ export function registerRememberFunction(sdk: ISdk, kv: StateKV): void {
       sourceObservationIds?: string[];
       agentId?: string;
       project?: string;
+      projectName?: string;
+      visibility?: "project" | "agent_private";
     }) => {
       if (
         !data.content ||
@@ -46,6 +49,16 @@ export function registerRememberFunction(sdk: ISdk, kv: StateKV): void {
       }
       if (data.sourceObservationIds && !Array.isArray(data.sourceObservationIds)) {
         return { success: false, error: "sourceObservationIds must be an array" };
+      }
+      if (
+        data.visibility !== undefined &&
+        data.visibility !== "project" &&
+        data.visibility !== "agent_private"
+      ) {
+        return {
+          success: false,
+          error: "visibility must be 'project' or 'agent_private'",
+        };
       }
       const validTypes = new Set([
         "pattern",
@@ -67,6 +80,21 @@ export function registerRememberFunction(sdk: ISdk, kv: StateKV): void {
         typeof data.project === "string" && data.project.trim().length > 0
           ? data.project.trim()
           : undefined;
+      const projectName =
+        typeof data.projectName === "string" && data.projectName.trim().length > 0
+          ? data.projectName.trim()
+          : undefined;
+      const callAgentId =
+        typeof data.agentId === "string" && data.agentId.trim().length > 0
+          ? data.agentId.trim().slice(0, 128)
+          : getAgentId();
+      const visibility = data.visibility ?? "project";
+      if (visibility === "agent_private" && !callAgentId) {
+        return {
+          success: false,
+          error: "agent_private visibility requires agentId",
+        };
+      }
 
       return withKeyedLock("mem:remember", async () => {
         // Candidate generation: query the BM25 index with the new content
@@ -86,7 +114,10 @@ export function registerRememberFunction(sdk: ISdk, kv: StateKV): void {
             // it ranks near the top regardless. Only mem_-prefixed ids can
             // resolve in KV.memories, so skip the guaranteed-miss lookups.
             const hits = idx
-              .search(data.content, 50)
+              .search(data.content, 50, {
+                ...(project ? { projectId: project } : {}),
+                ...(callAgentId ? { actorAgentId: callAgentId } : {}),
+              })
               .filter((h) => h.obsId.startsWith("mem_"));
             const loaded = await Promise.all(
               hits.map((h) =>
@@ -119,7 +150,17 @@ export function registerRememberFunction(sdk: ISdk, kv: StateKV): void {
           // Both sides must have an explicit project for the guard to engage;
           // an unscoped memory (legacy, no project field) is treated as a
           // wildcard so pre-existing data is not stranded.
-          if (project && existing.project && existing.project !== project) {
+          if (project && existing.project !== project) {
+            continue;
+          }
+          const existingVisibility = existing.visibility ?? "project";
+          if (existingVisibility !== visibility) {
+            continue;
+          }
+          if (
+            visibility === "agent_private" &&
+            existing.agentId !== callAgentId
+          ) {
             continue;
           }
           const similarity = jaccardSimilarity(
@@ -144,11 +185,6 @@ export function registerRememberFunction(sdk: ISdk, kv: StateKV): void {
         // filter by agent. Request body wins (multi-agent runtimes
         // explicitly tagging at write time), env AGENT_ID fallback,
         // none → memory is unscoped (legacy behavior).
-        const callAgentId =
-          typeof data.agentId === "string" && data.agentId.trim().length > 0
-            ? data.agentId.trim().slice(0, 128)
-            : getAgentId();
-
         const memory: Memory = {
           id: generateId("mem"),
           createdAt: now,
@@ -170,6 +206,8 @@ export function registerRememberFunction(sdk: ISdk, kv: StateKV): void {
           origin: { channel: "agent", capturedAt: now },
           ...(callAgentId ? { agentId: callAgentId } : {}),
           ...(project !== undefined && { project }),
+          ...(projectName !== undefined && { projectName }),
+          visibility,
         };
 
         if (data.ttlDays && typeof data.ttlDays === "number" && data.ttlDays > 0) {
@@ -208,7 +246,24 @@ export function registerRememberFunction(sdk: ISdk, kv: StateKV): void {
           memory.sessionIds?.[0] ?? "memory",
           memory.title + " " + memory.content,
           { kind: "memory", logId: memory.id },
+          observationRetrievalMetadata(memoryToObservation(memory)),
         );
+        scheduleIndexSave();
+
+        try {
+          await sdk.trigger({
+            function_id: "mem::project-graph-sources",
+            payload: {
+              sources: [{ sourceKind: "memory", sourceId: memory.id }],
+            },
+            action: TriggerAction.Void(),
+          });
+        } catch (err) {
+          logger.warn("Non-fatal memory graph projection dispatch failure", {
+            memId: memory.id,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
 
         if (supersededId) {
           await sdk.trigger({

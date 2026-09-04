@@ -15,6 +15,7 @@ vi.mock("../src/functions/search.js", () => ({
   getSearchIndex: () => ({
     add: vi.fn(),
   }),
+  scheduleIndexSave: vi.fn(),
   vectorIndexAddGuarded: vi.fn().mockResolvedValue(false),
 }));
 
@@ -92,7 +93,7 @@ describe("End-to-End Multimodal Flow", () => {
     const res = await observeCallback(fakeIncomingData);
     expect(res.observationId).toBeDefined();
 
-    const obsList = await kv.list("mem:obs:test-session");
+    const obsList = await kv.list("mem:raw-obs:test-session");
     expect(obsList.length).toBe(1);
 
     const raw = obsList[0] as RawObservation;
@@ -135,7 +136,7 @@ describe("End-to-End Multimodal Flow", () => {
 
     expect(compressCallback).not.toBeNull();
 
-    const rawObsList = await kv.list("mem:obs:test-session");
+    const rawObsList = await kv.list("mem:raw-obs:test-session");
     const raw = rawObsList[0] as RawObservation;
 
     expect(raw.modality).toBeDefined();

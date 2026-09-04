@@ -2,7 +2,14 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, dirname } from "node:path";
 import * as p from "@clack/prompts";
-import type { ConnectAdapter, ConnectOptions, ConnectResult } from "./types.js";
+import type {
+  AgentProbe,
+  AgentProbeOptions,
+  ConnectAdapter,
+  ConnectOptions,
+  ConnectResult,
+} from "./types.js";
+import { probeExecutable } from "./probe.js";
 import {
   backupFile,
   logAlreadyWired,
@@ -16,6 +23,8 @@ import {
   findPluginRoot,
   type HookManifest,
 } from "./codex-hooks.js";
+import { resolvePathLayout } from "../../runtime-paths.js";
+import { installStableHookBundle } from "./stable-hooks.js";
 
 const CODEX_DIR = join(homedir(), ".codex");
 const CODEX_TOML = join(CODEX_DIR, "config.toml");
@@ -60,6 +69,47 @@ function stripExistingBlock(toml: string): string {
   return out.join("\n").replace(/\n{3,}$/, "\n\n").trimEnd() + "\n";
 }
 
+function hasAgentMemoryHooks(manifest: HookManifest | null): boolean {
+  return Object.values(manifest?.hooks ?? {}).some((entries) =>
+    Array.isArray(entries) && entries.some((entry) =>
+      Array.isArray(entry.hooks) && entry.hooks.some((handler) =>
+        typeof handler.command === "string" &&
+        handler.command.replace(/\\/g, "/").toLowerCase().includes("agentmemory")
+      )
+    )
+  );
+}
+
+function probeCodex(options: AgentProbeOptions = {}): AgentProbe {
+  const executable = probeExecutable(["codex"], options);
+  const configExists = existsSync(CODEX_DIR) || existsSync(CODEX_TOML);
+  const toml = existsSync(CODEX_TOML) ? readFileSync(CODEX_TOML, "utf-8") : "";
+  const mcpWired = isWiredText(toml);
+  const hooksWired = hasAgentMemoryHooks(readJsonSafe<HookManifest>(CODEX_HOOKS));
+  const wiring = mcpWired && hooksWired
+    ? "wired"
+    : mcpWired || hooksWired
+      ? "partial"
+      : "unwired";
+
+  return {
+    ...executable,
+    presence: executable.presence === "executable"
+      ? "executable"
+      : configExists
+        ? "config-only"
+        : "absent",
+    configPath: CODEX_TOML,
+    wiring,
+    activation: hooksWired
+      ? "trust-required"
+      : mcpWired
+        ? "restart-required"
+        : "not-checked",
+    durability: hooksWired ? "outbox-capable" : "not-checked",
+  };
+}
+
 export const adapter: ConnectAdapter = {
   name: "codex",
   displayName: "Codex CLI",
@@ -69,7 +119,11 @@ export const adapter: ConnectAdapter = {
     "→ Using MCP. Hooks ship via the Codex plugin; on Codex Desktop, also pass --with-hooks to install the global hooks.json workaround for openai/codex#16430.",
 
   detect(): boolean {
-    return existsSync(CODEX_DIR);
+    return probeCodex().usable;
+  },
+
+  probe(options): AgentProbe {
+    return probeCodex(options);
   },
 
   async install(opts: ConnectOptions): Promise<ConnectResult> {
@@ -79,6 +133,14 @@ export const adapter: ConnectAdapter = {
 
     if (wired && !opts.force) {
       logAlreadyWired("Codex CLI", CODEX_TOML);
+      if (opts.withHooks) {
+        const hookResult = installCodexHooks(opts);
+        if (hookResult.kind === "skipped") {
+          p.log.warn(
+            `Codex hooks fallback skipped: ${hookResult.reason}.`,
+          );
+        }
+      }
       return { kind: "already-wired", mutatedPath: CODEX_TOML };
     }
 
@@ -150,8 +212,26 @@ function installCodexHooks(opts: ConnectOptions): ConnectResult {
     };
   }
 
+  const stableRoot = resolvePathLayout().hooksDir;
+  try {
+    installStableHookBundle(pluginRoot, stableRoot, ["hooks.codex.json"], {
+      dryRun: opts.dryRun,
+    });
+  } catch (err) {
+    return {
+      kind: "skipped",
+      reason: err instanceof Error ? err.message : String(err),
+    };
+  }
+
   const existing = readJsonSafe<HookManifest>(CODEX_HOOKS);
-  const merged = buildMergedHooks(existing, pluginRoot);
+  const merged = buildMergedHooks(
+    existing,
+    pluginRoot,
+    "hooks.codex.json",
+    [join(pluginRoot, "scripts"), stableRoot],
+    stableRoot,
+  );
 
   if (opts.dryRun) {
     p.log.info(
@@ -173,7 +253,7 @@ function installCodexHooks(opts: ConnectOptions): ConnectResult {
     "Codex runs only trusted hooks: launch `codex` (the TUI) once and choose \"Trust all and continue\" at the \"Hooks need review\" prompt. `codex exec` never shows the prompt, so hooks stay inert until then.",
   );
   p.log.info(
-    "User-scope hooks reference absolute paths under the bundled plugin/ dir. Re-run `agentmemory connect codex --with-hooks` after upgrading agentmemory to refresh them, then re-approve in the TUI.",
+    `User-scope hooks reference the verified stable bundle at ${stableRoot}. Re-run \`agentmemory connect codex --with-hooks\` after upgrading agentmemory to refresh it, then re-approve in the TUI.`,
   );
 
   return {

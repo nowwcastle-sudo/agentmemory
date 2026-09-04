@@ -62,6 +62,8 @@ function mockSdk() {
 const enabledConfig: ClaudeBridgeConfig = {
   enabled: true,
   projectPath: "/tmp/my-project",
+  projectId: "project-current",
+  legacyProjectIds: ["my-project"],
   memoryFilePath: "/tmp/.claude/MEMORY.md",
   lineBudget: 200,
 };
@@ -69,6 +71,8 @@ const enabledConfig: ClaudeBridgeConfig = {
 const disabledConfig: ClaudeBridgeConfig = {
   enabled: false,
   projectPath: "",
+  projectId: "",
+  legacyProjectIds: [],
   memoryFilePath: "",
   lineBudget: 200,
 };
@@ -135,6 +139,7 @@ describe("Claude Bridge Functions", () => {
       strength: 5,
       version: 1,
       isLatest: true,
+      project: "project-current",
     };
     await kv.set("mem:memories", "mem_1", mem);
 
@@ -151,6 +156,96 @@ describe("Claude Bridge Functions", () => {
     expect(writeFileSync).toHaveBeenCalled();
     const writtenContent = vi.mocked(writeFileSync).mock.calls[0][1] as string;
     expect(writtenContent).toContain("Auth pattern");
+  });
+
+  it("exports only the canonical project and reads its profile summary", async () => {
+    registerClaudeBridgeFunction(sdk as never, kv as never, enabledConfig);
+    const memory = (
+      id: string,
+      title: string,
+      project?: string,
+    ): Memory => ({
+      id,
+      createdAt: "2026-09-01T00:00:00Z",
+      updatedAt: "2026-09-01T00:00:00Z",
+      type: "pattern",
+      title,
+      content: `${title} content`,
+      concepts: [],
+      files: [],
+      sessionIds: ["session-1"],
+      strength: 5,
+      version: 1,
+      isLatest: true,
+      ...(project ? { project } : {}),
+    });
+    await kv.set("mem:memories", "current", memory(
+      "current",
+      "CURRENT-PROJECT-MARKER",
+      "project-current",
+    ));
+    await kv.set("mem:memories", "foreign", memory(
+      "foreign",
+      "FOREIGN-PROJECT-MARKER",
+      "project-foreign",
+    ));
+    await kv.set("mem:memories", "unscoped", memory(
+      "unscoped",
+      "UNSCOPED-MARKER",
+    ));
+    await kv.set("mem:profiles", "project-current", {
+      summary: "CURRENT-PROFILE-SUMMARY",
+    });
+    vi.mocked(existsSync).mockReturnValue(true);
+
+    const result = (await sdk.trigger("mem::claude-bridge-sync", {})) as {
+      success: boolean;
+    };
+    const written = vi.mocked(writeFileSync).mock.calls[0][1] as string;
+
+    expect(result.success).toBe(true);
+    expect(written).toContain("CURRENT-PROJECT-MARKER");
+    expect(written).toContain("CURRENT-PROFILE-SUMMARY");
+    expect(written).not.toContain("FOREIGN-PROJECT-MARKER");
+    expect(written).not.toContain("UNSCOPED-MARKER");
+  });
+
+  it("accepts raw-path and legacy project IDs during migration", async () => {
+    registerClaudeBridgeFunction(sdk as never, kv as never, enabledConfig);
+    const rawPathMemory: Memory = {
+      id: "raw-path",
+      createdAt: "2026-09-01T00:00:00Z",
+      updatedAt: "2026-09-01T00:00:00Z",
+      type: "fact",
+      title: "RAW-PATH-MARKER",
+      content: "raw path compatibility",
+      concepts: [],
+      files: [],
+      sessionIds: ["session-raw"],
+      strength: 4,
+      version: 1,
+      isLatest: true,
+      project: enabledConfig.projectPath,
+    };
+    const legacyMemory: Memory = {
+      ...rawPathMemory,
+      id: "legacy",
+      title: "LEGACY-ID-MARKER",
+      project: enabledConfig.legacyProjectIds[0],
+    };
+    await kv.set("mem:memories", rawPathMemory.id, rawPathMemory);
+    await kv.set("mem:memories", legacyMemory.id, legacyMemory);
+    await kv.set("mem:profiles", enabledConfig.projectPath, {
+      summary: "RAW-PATH-PROFILE-SUMMARY",
+    });
+    vi.mocked(existsSync).mockReturnValue(true);
+
+    await sdk.trigger("mem::claude-bridge-sync", {});
+    const written = vi.mocked(writeFileSync).mock.calls[0][1] as string;
+
+    expect(written).toContain("RAW-PATH-MARKER");
+    expect(written).toContain("LEGACY-ID-MARKER");
+    expect(written).toContain("RAW-PATH-PROFILE-SUMMARY");
   });
 
   it("claude-bridge-sync returns error when not configured", async () => {

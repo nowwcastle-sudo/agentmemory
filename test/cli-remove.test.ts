@@ -8,6 +8,8 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import {
   buildRemovePlan,
   formatPlan,
+  legacyLocalBinIii,
+  privateIiiBin,
   type ConnectManifest,
   type RemoveContext,
 } from "../src/cli/remove-plan.js";
@@ -33,6 +35,11 @@ function touch(relPath: string, content = ""): void {
   const full = join(sandbox, relPath);
   mkdirSync(join(full, ".."), { recursive: true });
   writeFileSync(full, content);
+}
+
+function touchAbsolute(path: string, content = ""): void {
+  mkdirSync(join(path, ".."), { recursive: true });
+  writeFileSync(path, content);
 }
 
 function mkdir(relPath: string): void {
@@ -112,7 +119,7 @@ describe("buildRemovePlan", () => {
   });
 
   it("local-bin/iii is alwaysAsk when version does not match", () => {
-    touch(".local/bin/iii", "fakebin");
+    touchAbsolute(legacyLocalBinIii(sandbox), "fakebin");
     const plan = buildRemovePlan(
       ctx({ localBinIiiVersion: "9.9.9" }),
       { force: false, keepData: false },
@@ -123,7 +130,7 @@ describe("buildRemovePlan", () => {
   });
 
   it("local-bin/iii is auto-fixable when version matches pinned", () => {
-    touch(".local/bin/iii", "fakebin");
+    touchAbsolute(legacyLocalBinIii(sandbox), "fakebin");
     const plan = buildRemovePlan(
       ctx({ localBinIiiVersion: "0.11.2" }),
       { force: false, keepData: false },
@@ -141,7 +148,7 @@ describe("buildRemovePlan", () => {
   });
 
   it("private ~/.agentmemory/bin/iii is removed without prompt", () => {
-    touch(".agentmemory/bin/iii", "fakebin");
+    touchAbsolute(privateIiiBin(sandbox), "fakebin");
     const plan = buildRemovePlan(ctx(), { force: false, keepData: false });
     const item = plan.find((p) => p.id === "private-bin-iii")!;
     expect(item).toBeDefined();

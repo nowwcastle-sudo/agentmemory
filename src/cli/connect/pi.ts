@@ -18,7 +18,7 @@ import {
 const PI_DIR = join(homedir(), ".pi");
 const PI_EXT_DIR = join(PI_DIR, "agent", "extensions", "agentmemory");
 const DOCS = "https://github.com/rohitg00/agentmemory/tree/main/integrations/pi";
-const EXT_FILES = ["index.ts", "security.ts"] as const;
+const EXT_FILES = ["index.ts", "security.ts", "project-identity.ts"] as const;
 
 function findPiSourceDir(): string | null {
   let packageRoot: string;

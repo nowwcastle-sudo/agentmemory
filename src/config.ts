@@ -10,6 +10,13 @@ import type {
   ClaudeBridgeConfig,
   TeamConfig,
 } from "./types.js";
+import { parseEnvFile } from "./env-file.js";
+import { resolvePathLayout } from "./runtime-paths.js";
+import {
+  resolveClaudeConfigDir,
+  toClaudeProjectSlug,
+} from "./claude-paths.js";
+import { resolveProjectIdentity } from "./hooks/_project.js";
 
 function safeParseInt(value: string | undefined, fallback: number): number {
   if (!value) return fallback;
@@ -17,8 +24,9 @@ function safeParseInt(value: string | undefined, fallback: number): number {
   return Number.isNaN(parsed) ? fallback : parsed;
 }
 
-const DATA_DIR = join(homedir(), ".agentmemory");
-const ENV_FILE = join(DATA_DIR, ".env");
+const PATH_LAYOUT = resolvePathLayout();
+const DATA_DIR = PATH_LAYOUT.configRoot;
+const ENV_FILE = PATH_LAYOUT.envFile;
 
 let warnPremiumModelShown = false;
 
@@ -37,25 +45,7 @@ function loadEnvFile(): Record<string, string> {
     return envFileCache;
   }
   const content = readFileSync(ENV_FILE, "utf-8");
-  const vars: Record<string, string> = {};
-  for (const line of content.split("\n")) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith("#")) continue;
-    const eqIdx = trimmed.indexOf("=");
-    if (eqIdx === -1) continue;
-    const key = trimmed.slice(0, eqIdx).trim();
-    let val = trimmed.slice(eqIdx + 1).trim();
-    const quoteChar = val[0] === '"' || val[0] === "'" ? val[0] : "";
-    if (quoteChar) {
-      const closeIdx = val.indexOf(quoteChar, 1);
-      if (closeIdx !== -1) val = val.slice(1, closeIdx);
-    } else {
-      const hashIdx = val.indexOf(" #");
-      if (hashIdx !== -1) val = val.slice(0, hashIdx).trim();
-    }
-    vars[key] = val;
-  }
-  envFileCache = vars;
+  envFileCache = parseEnvFile(content);
   return envFileCache;
 }
 
@@ -214,7 +204,7 @@ export function loadConfig(): AgentMemoryConfig {
     viewerPort,
     provider,
     tokenBudget: safeParseInt(env["TOKEN_BUDGET"], 2000),
-    maxObservationsPerSession: safeParseInt(env["MAX_OBS_PER_SESSION"], 500),
+    maxObservationsPerSession: safeParseInt(env["MAX_OBS_PER_SESSION"], 0),
     compressionModel: provider.model,
     dataDir: DATA_DIR,
   };
@@ -286,6 +276,16 @@ export function loadClaudeBridgeConfig(): ClaudeBridgeConfig {
   const enabled = env["CLAUDE_MEMORY_BRIDGE"] === "true";
   const projectPath = env["CLAUDE_PROJECT_PATH"] || "";
   const lineBudget = safeParseInt(env["CLAUDE_MEMORY_LINE_BUDGET"], 200);
+  const explicitProject = env["AGENTMEMORY_PROJECT_NAME"]?.trim();
+  const identity = projectPath
+    ? explicitProject
+      ? {
+          projectId: explicitProject,
+          projectName: explicitProject,
+          legacyProjectIds: [] as string[],
+        }
+      : resolveProjectIdentity(projectPath, { useEnvOverride: false })
+    : { projectId: "", projectName: "", legacyProjectIds: [] as string[] };
   let memoryFilePath = "";
   if (enabled && projectPath) {
     // Claude Code stores project memory at
@@ -295,17 +295,23 @@ export function loadClaudeBridgeConfig(): ClaudeBridgeConfig {
     // Code keeps it; stripping it produced a slug Claude never reads).
     // The `memory/` subdirectory holds MEMORY.md (the index) plus one
     // per-topic `.md` file per memory (verified against Claude Code 2.x).
-    const safePath = projectPath.replace(/[/\\]/g, "-");
+    const safePath = toClaudeProjectSlug(projectPath);
     memoryFilePath = join(
-      homedir(),
-      ".claude",
+      resolveClaudeConfigDir(env, homedir()),
       "projects",
       safePath,
       "memory",
       "MEMORY.md",
     );
   }
-  return { enabled, projectPath, memoryFilePath, lineBudget };
+  return {
+    enabled,
+    projectPath,
+    projectId: identity.projectId,
+    legacyProjectIds: identity.legacyProjectIds,
+    memoryFilePath,
+    lineBudget,
+  };
 }
 
 export function loadTeamConfig(): TeamConfig | null {
@@ -373,7 +379,7 @@ export function loadSnapshotConfig(): {
   return {
     enabled: env["SNAPSHOT_ENABLED"] === "true",
     interval,
-    dir: env["SNAPSHOT_DIR"] || join(homedir(), ".agentmemory", "snapshots"),
+    dir: resolvePathLayout({ env }).snapshotsDir,
   };
 }
 

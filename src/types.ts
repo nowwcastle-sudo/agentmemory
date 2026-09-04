@@ -1,6 +1,7 @@
 export interface Session {
   id: string;
   project: string;
+  projectName?: string;
   cwd: string;
   startedAt: string;
   endedAt?: string;
@@ -12,6 +13,7 @@ export interface Session {
   summary?: string;
   commitShas?: string[];
   agentId?: string;
+  sourceClient?: string;
 }
 
 export interface CommitLink {
@@ -46,6 +48,7 @@ export function importOrigin(
 
 export interface RawObservation {
   id: string;
+  captureId?: string;
   sessionId: string;
   timestamp: string;
   hookType: HookType;
@@ -58,7 +61,54 @@ export interface RawObservation {
   modality?: "text" | "image" | "mixed";
   imageData?: string;
   agentId?: string;
+  sourceClient?: string;
+  projectId?: string;
+  projectName?: string;
+  visibility?: GraphVisibility;
   origin?: Origin;
+}
+
+export interface ObservationProjection {
+  observationId: string;
+  captureId: string;
+  sessionId: string;
+  status: "pending" | "running" | "succeeded" | "failed";
+  attempts: number;
+  updatedAt: string;
+  lastError?: string;
+}
+
+export interface SessionProjection {
+  sessionId: string;
+  status: "pending" | "running" | "succeeded" | "failed";
+  attempts: number;
+  observationCount: number;
+  updatedAt: string;
+  sourceFingerprint?: string;
+  lastError?: string;
+  evictAfterSuccess?: boolean;
+}
+
+export type MaintenanceProjectionStage =
+  | "semantic"
+  | "reflect"
+  | "procedural"
+  | "crystallize"
+  | "decay";
+
+export interface MaintenanceProjection {
+  id: "global";
+  status: "pending" | "running" | "succeeded" | "failed";
+  requestedGeneration: number;
+  processedGeneration: number;
+  processingGeneration?: number;
+  stage: MaintenanceProjectionStage;
+  stageCursor?: number;
+  stageFingerprints?: Partial<Record<MaintenanceProjectionStage, string>>;
+  attempts: number;
+  requestedAt: string;
+  updatedAt: string;
+  lastError?: string;
 }
 
 export interface CompressedObservation {
@@ -79,7 +129,74 @@ export interface CompressedObservation {
   imageDescription?: string;
   modality?: "text" | "image" | "mixed";
   agentId?: string;
+  sourceClient?: string;
+  projectId?: string;
+  projectName?: string;
+  visibility?: GraphVisibility;
+  sourceKind?: GraphSourceKind;
   origin?: Origin;
+}
+
+export type GraphSourceKind = "observation" | "memory" | "summary";
+export type GraphProjectionMode = "configured" | "structural" | "semantic";
+export type GraphExtractionLevel = "structural" | "semantic";
+export type GraphVisibility = "project" | "agent_private";
+
+export interface GraphSourceLocator {
+  sourceKind: GraphSourceKind;
+  sourceId: string;
+  sessionId?: string;
+  projectId?: string;
+  actorAgentId?: string;
+  visibility?: GraphVisibility;
+}
+
+export interface RetrievalScope {
+  projectId?: string;
+  actorAgentId?: string;
+  wildcardAgent?: boolean;
+}
+
+export interface RetrievalMetadata {
+  sourceKind?: GraphSourceKind;
+  sourceId?: string;
+  sessionId?: string;
+  projectId?: string;
+  actorAgentId?: string;
+  visibility?: GraphVisibility;
+}
+
+export interface GraphSource {
+  sourceKind: GraphSourceKind;
+  sourceId: string;
+  sessionId?: string;
+  projectId: string;
+  actorAgentId?: string;
+  visibility: GraphVisibility;
+  observationType?: ObservationType;
+  title: string;
+  narrative: string;
+  concepts: string[];
+  files: string[];
+  timestamp: string;
+}
+
+export interface GraphProjection {
+  sourceKind: GraphSourceKind;
+  sourceId: string;
+  sessionId?: string;
+  projectId: string;
+  actorAgentId?: string;
+  visibility: GraphVisibility;
+  status: "pending" | "running" | "succeeded" | "failed";
+  outcome?: "graph" | "no_structure";
+  attempts: number;
+  updatedAt: string;
+  graphGeneration?: string;
+  sourceFingerprint?: string;
+  extractionLevel?: GraphExtractionLevel;
+  requestedExtractionLevel?: GraphExtractionLevel;
+  lastError?: string;
 }
 
 export type ObservationType =
@@ -121,12 +238,15 @@ export interface Memory {
   imageData?: string;
   agentId?: string;
   project?: string;
+  projectName?: string;
+  visibility?: GraphVisibility;
   origin?: Origin;
 }
 
 export interface SessionSummary {
   sessionId: string;
   project: string;
+  projectName?: string;
   createdAt: string;
   title: string;
   narrative: string;
@@ -134,6 +254,8 @@ export interface SessionSummary {
   filesModified: string[];
   concepts: string[];
   observationCount: number;
+  sourceFingerprint?: string;
+  coveredObservationIds?: string[];
 }
 
 export type HookType =
@@ -143,17 +265,23 @@ export type HookType =
   | "post_tool_use"
   | "post_tool_failure"
   | "pre_compact"
+  | "post_compact"
   | "subagent_start"
   | "subagent_stop"
   | "notification"
   | "task_completed"
   | "stop"
+  | "interrupt"
   | "session_end";
 
 export interface HookPayload {
   hookType: HookType;
+  captureId?: string;
+  agentId?: string;
+  sourceClient?: string;
   sessionId: string;
   project: string;
+  projectName?: string;
   cwd: string;
   timestamp: string;
   data: unknown;
@@ -171,6 +299,7 @@ export type ProviderType = "agent-sdk" | "anthropic" | "gemini" | "openrouter" |
 
 export interface MemoryProvider {
   name: string;
+  readonly isNoop?: boolean;
   compress(systemPrompt: string, userPrompt: string): Promise<string>;
   summarize(systemPrompt: string, userPrompt: string): Promise<string>;
   describeImage?(imageData: string, mimeType: string, prompt: string): Promise<string>;
@@ -235,6 +364,47 @@ export interface HealthSnapshot {
   status: "healthy" | "degraded" | "critical";
   alerts: string[];
   notes?: string[];
+  pipeline?: PipelineHealth;
+  connectorOutbox?: {
+    current: number;
+    legacy: number;
+    malformed: number;
+    claimed: number;
+  };
+}
+
+export type ProjectionPipelineStage = "compression" | "summary" | "graph";
+
+export interface ProjectionBacklog {
+  pending: number;
+  failed: number;
+  oldestPendingAgeMs?: number;
+  oldestFailedAgeMs?: number;
+}
+
+export interface IndexPersistenceStatus {
+  dirty: boolean;
+  dirtySince?: string;
+  lastAttemptAt?: string;
+  lastSuccessAt?: string;
+  lastFailureAt?: string;
+  lastError?: string;
+}
+
+export interface PipelineHealth {
+  collectedAt: string;
+  compression: ProjectionBacklog;
+  summary: ProjectionBacklog;
+  graph: ProjectionBacklog;
+  graphSnapshot: { present: boolean; dirty: boolean; updatedAt?: string };
+  index: IndexPersistenceStatus;
+  projectionCoordinator?: {
+    activeStage?: "compression" | "summary" | "graph" | "maintenance";
+    activeSince?: string;
+    deferredStages: Array<
+      "compression" | "summary" | "graph" | "maintenance"
+    >;
+  };
 }
 
 export interface CircuitBreakerState {
@@ -280,6 +450,7 @@ export interface HybridSearchResult {
   combinedScore: number;
   sessionId: string;
   graphContext?: string;
+  source?: GraphSourceLocator;
 }
 
 export interface CompactSearchResult {
@@ -334,6 +505,7 @@ export interface ExportData {
   observations: Record<string, CompressedObservation[]>;
   memories: Memory[];
   summaries: SessionSummary[];
+  sessionProjections?: SessionProjection[];
   profiles?: ProjectProfile[];
   graphNodes?: GraphNode[];
   graphEdges?: GraphEdge[];
@@ -352,6 +524,53 @@ export interface ExportData {
   insights?: Insight[];
   accessLogs?: AccessLogExport[];
   pagination?: ExportPagination;
+}
+
+export interface SnapshotProjectionMarker {
+  id: string;
+  stage: ProjectionPipelineStage;
+  since: string;
+  updatedAt: string;
+  lastError?: string;
+}
+
+export interface SnapshotPayload extends ExportData {
+  graphGeneration?: string;
+  graphResetAt?: string;
+  rawObservations: Record<string, RawObservation[]>;
+  observationProjections: ObservationProjection[];
+  graphProjections: GraphProjection[];
+  projectionBacklogs: Record<
+    "compression" | "graph",
+    {
+      pending: SnapshotProjectionMarker[];
+      failed: SnapshotProjectionMarker[];
+    }
+  > & {
+    summary?: {
+      pending: SnapshotProjectionMarker[];
+      failed: SnapshotProjectionMarker[];
+    };
+  };
+  routineRuns?: RoutineRun[];
+  slots?: MemorySlot[];
+  globalSlots?: MemorySlot[];
+  meshPeers?: MeshPeer[];
+  retentionScores?: RetentionScore[];
+  graphEdgeHistory?: GraphEdge[];
+  // graph-schema rejected assertions (mem:graph:rejected); snapshot round-trip only
+  graphRejected?: GraphRejectedAssertion[];
+  commits?: CommitLink[];
+}
+
+export interface SnapshotEnvelope {
+  formatVersion: 2;
+  createdAt: string;
+  payload: SnapshotPayload;
+  integrity: {
+    algorithm: "sha256";
+    digest: string;
+  };
 }
 
 export interface AccessLogExport {
@@ -374,6 +593,8 @@ export interface FallbackConfig {
 export interface ClaudeBridgeConfig {
   enabled: boolean;
   projectPath: string;
+  projectId: string;
+  legacyProjectIds: string[];
   memoryFilePath: string;
   lineBudget: number;
 }
@@ -397,7 +618,9 @@ export type GraphNodeType =
   | "preference"
   | "location"
   | "organization"
-  | "event";
+  | "event"
+  | "task"
+  | "feature";
 
 export interface GraphNode {
   id: string;
@@ -405,10 +628,19 @@ export interface GraphNode {
   name: string;
   properties: Record<string, unknown>;
   sourceObservationIds: string[];
+  sourceRefs?: GraphSourceLocator[];
+  projectId?: string;
+  actorAgentId?: string;
+  visibility?: GraphVisibility;
+  graphGeneration?: string;
   createdAt: string;
   updatedAt?: string;
   aliases?: string[];
   stale?: boolean;
+  // graph-schema backfill lineage: the keeper lists absorbed ids, an absorbed
+  // (stale) node points at its keeper. Never deleted.
+  mergedFrom?: string[];
+  mergedInto?: string;
 }
 
 export type GraphEdgeType =
@@ -427,7 +659,14 @@ export type GraphEdgeType =
   | "rejected"
   | "avoids"
   | "located_in"
-  | "succeeded_by";
+  | "succeeded_by"
+  | "implements"
+  | "part_of"
+  | "contains"
+  | "documents"
+  | "defines"
+  | "validates"
+  | "tests";
 
 export interface GraphEdge {
   id: string;
@@ -436,6 +675,11 @@ export interface GraphEdge {
   targetNodeId: string;
   weight: number;
   sourceObservationIds: string[];
+  sourceRefs?: GraphSourceLocator[];
+  projectId?: string;
+  actorAgentId?: string;
+  visibility?: GraphVisibility;
+  graphGeneration?: string;
   createdAt: string;
   tcommit?: string;
   tvalid?: string;
@@ -486,6 +730,14 @@ export interface GraphQueryResult {
 // KV.graphSnapshot with a single key "current". `dirty` is set true by
 // mem::graph-extract after writes and flipped false when the snapshot
 // rebuild completes.
+export interface GraphRejectedAssertion {
+  id: string;
+  kind: "node" | "edge";
+  reason: string;
+  record: GraphNode | GraphEdge;
+  capturedAt: string;
+}
+
 export interface GraphSnapshot {
   version: 1;
   topNodes: GraphNode[];
@@ -501,9 +753,13 @@ export interface GraphSnapshot {
     totalEdges: number;
     nodesByType: Record<string, number>;
     edgesByType: Record<string, number>;
+    // graph-schema: cumulative count of assertions the seam rejected (counter only;
+    // records live in mem:graph:rejected up to a cap). Absent on pre-schema snapshots.
+    rejected?: number;
   };
   updatedAt: string;
   dirty: boolean;
+  graphGeneration?: string;
   // #825 follow-up: ISO timestamp set by mem::graph-reset. After
   // reset, mem::graph-extract treats any pre-resetAt node as an
   // orphan (skip merge, write fresh) so future extracts don't
@@ -656,6 +912,8 @@ export interface SnapshotMeta {
     observations: number;
     memories: number;
     graphNodes: number;
+    rawObservations?: number;
+    graphEdges?: number;
   };
 }
 

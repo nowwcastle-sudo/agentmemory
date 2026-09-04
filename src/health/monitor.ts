@@ -3,10 +3,20 @@ import type { HealthSnapshot } from "../types.js";
 import type { StateKV } from "../state/kv.js";
 import { KV } from "../state/schema.js";
 import { evaluateHealth } from "./thresholds.js";
+import { collectPipelineHealth } from "./pipeline.js";
+import { getIndexPersistenceStatus } from "../functions/search.js";
+import {
+  defaultConnectorOutboxes,
+  inspectConnectorOutboxes,
+  type ConnectorOutbox,
+} from "../functions/connector-outbox.js";
+import type { ProjectionCoordinator } from "../functions/projection-coordinator.js";
 
 export function registerHealthMonitor(
   sdk: ISdk,
   kv: StateKV,
+  connectorOutboxes: ConnectorOutbox[] = defaultConnectorOutboxes(),
+  coordinator?: ProjectionCoordinator,
 ): { stop: () => void } {
   let connectionState = "connected";
   let prevCpuUsage = process.cpuUsage();
@@ -83,6 +93,15 @@ export function registerHealthMonitor(
       status: "healthy",
       alerts: [],
     };
+
+    snapshot.pipeline = await collectPipelineHealth(
+      kv,
+      getIndexPersistenceStatus() ?? undefined,
+      coordinator,
+    );
+    snapshot.connectorOutbox = await inspectConnectorOutboxes(
+      connectorOutboxes,
+    );
 
     const evaluated = evaluateHealth(snapshot);
     snapshot.status = evaluated.status;

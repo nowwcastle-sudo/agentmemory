@@ -487,6 +487,30 @@ describe("Crystallize Functions", () => {
       expect(result.crystalIds[1]).toMatch(/^crys_/);
     });
 
+    it("processes at most maxGroups and reports the remaining groups", async () => {
+      const a1 = makeAction({ id: "act_bounded1", status: "done", project: "proj1" });
+      const a2 = makeAction({ id: "act_bounded2", status: "done", project: "proj2" });
+      await kv.set("mem:actions", a1.id, a1);
+      await kv.set("mem:actions", a2.id, a2);
+
+      const result = (await sdk.trigger("mem::auto-crystallize", {
+        maxGroups: 1,
+      })) as {
+        success: boolean;
+        groupCount: number;
+        processedGroupCount: number;
+        remainingGroups: number;
+        crystalIds: string[];
+      };
+
+      expect(result.success).toBe(true);
+      expect(result.groupCount).toBe(2);
+      expect(result.processedGroupCount).toBe(1);
+      expect(result.remainingGroups).toBe(1);
+      expect(result.crystalIds).toHaveLength(1);
+      expect(provider.summarize).toHaveBeenCalledTimes(1);
+    });
+
     it("filters by project when specified", async () => {
       const a1 = makeAction({ id: "act_fp1", status: "done", project: "keep" });
       const a2 = makeAction({ id: "act_fp2", status: "done", project: "skip" });

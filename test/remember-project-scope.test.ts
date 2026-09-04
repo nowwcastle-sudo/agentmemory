@@ -22,6 +22,7 @@ vi.mock("iii-sdk", async (importOriginal) => {
 import { vi } from "vitest";
 import { registerRememberFunction } from "../src/functions/remember.js";
 import { getSearchIndex, setIndexPersistence } from "../src/functions/search.js";
+import { KV } from "../src/state/schema.js";
 
 function mockKV() {
   const store = new Map<string, Map<string, unknown>>();
@@ -80,14 +81,34 @@ describe("mem::remember — project field stamping", () => {
         type: "bug",
         files: ["src/middleware/auth.ts"],
         project: "api",
+        projectName: "API service",
       },
-    }) as { success: boolean; memory: { id: string; project?: string } };
+    }) as { success: boolean; memory: { id: string; project?: string; projectName?: string } };
 
     expect(result.success).toBe(true);
     expect(result.memory.project).toBe("api");
+    expect(result.memory.projectName).toBe("API service");
 
-    const stored = await kv.get<{ project?: string }>("mem:memories", result.memory.id);
+    const stored = await kv.get<{ project?: string; projectName?: string }>("mem:memories", result.memory.id);
     expect(stored?.project).toBe("api");
+    expect(stored?.projectName).toBe("API service");
+  });
+
+  it("trims the optional display project name", async () => {
+    const sdk = mockSdk();
+    const kv = mockKV();
+    registerRememberFunction(sdk as never, kv as never);
+
+    const result = await sdk.trigger({
+      function_id: "mem::remember",
+      payload: {
+        content: "display name is presentation metadata",
+        project: "git:stable-id",
+        projectName: "  AgentMemory  ",
+      },
+    }) as { memory: { projectName?: string } };
+
+    expect(result.memory.projectName).toBe("AgentMemory");
   });
 
   it("leaves project undefined when not provided (backward-compat)", async () => {
@@ -203,7 +224,7 @@ describe("mem::remember — cross-project dedup isolation", () => {
     expect(original?.isLatest).toBe(false);
   });
 
-  it("allows an unscoped memory to be superseded by a scoped one (legacy compat)", async () => {
+  it("does not let a scoped memory supersede a legacy row with unknown project", async () => {
     const sdk = mockSdk();
     const kv = mockKV();
     registerRememberFunction(sdk as never, kv as never);
@@ -227,7 +248,9 @@ describe("mem::remember — cross-project dedup isolation", () => {
       },
     }) as { memory: { supersedes: string[] } };
 
-    expect(scoped.memory.supersedes).toContain(legacy.memory.id);
+    expect(scoped.memory.supersedes).not.toContain(legacy.memory.id);
+    const legacyAfter = await kv.get<any>(KV.memories, legacy.memory.id);
+    expect(legacyAfter?.isLatest).toBe(true);
   });
 
   it("allows a scoped memory to be superseded by an unscoped one (legacy compat)", async () => {

@@ -1,18 +1,24 @@
 import { TriggerAction, type ISdk } from "iii-sdk";
-import type { RawObservation, HookPayload, Origin } from "../types.js";
+import type {
+  RawObservation,
+  HookPayload,
+  ObservationProjection,
+  Origin,
+  Session,
+} from "../types.js";
 
 const TOOL_HOOKS = new Set(["pre_tool_use", "post_tool_use", "post_tool_failure"]);
-import { KV, STREAM, generateId } from "../state/schema.js";
+import { KV, STREAM, fingerprintId, generateId } from "../state/schema.js";
 import { StateKV } from "../state/kv.js";
 import { stripPrivateData } from "./privacy.js";
 import { DedupMap } from "./dedup.js";
 import { withKeyedLock } from "../state/keyed-mutex.js";
 import { isAutoCompressEnabled } from "../config.js";
-import { buildSyntheticCompression } from "./compress-synthetic.js";
-import { getSearchIndex, vectorIndexAddGuarded } from "./search.js";
 import { getAgentId } from "../config.js";
 import { logger } from "../logger.js";
+import { markProjectionPending } from "../health/pipeline.js";
 import { saveImageToDisk } from "../utils/image-store.js";
+import { observationProjectionQueue } from "./observation-projection.js";
 
 export function extractImage(d: unknown): string | undefined {
   if (!d) return undefined;
@@ -43,322 +49,430 @@ export function registerObserveFunction(
   dedupMap?: DedupMap,
   maxObservationsPerSession?: number,
 ): void {
-  sdk.registerFunction("mem::observe", 
-    async (payload: HookPayload) => {
+  sdk.registerFunction("mem::observe", async (payload: HookPayload) => {
+    if (
+      !payload?.sessionId ||
+      typeof payload.sessionId !== "string" ||
+      !payload.hookType ||
+      typeof payload.hookType !== "string" ||
+      !payload.timestamp ||
+      typeof payload.timestamp !== "string"
+    ) {
+      return {
+        success: false,
+        error:
+          "Invalid payload: sessionId, hookType, and timestamp are required",
+      };
+    }
+    if (
+      payload.captureId !== undefined &&
+      (typeof payload.captureId !== "string" || !payload.captureId.trim())
+    ) {
+      return {
+        success: false,
+        error: "Invalid payload: captureId must be a non-empty string",
+      };
+    }
+    if (
+      payload.sourceClient !== undefined &&
+      (typeof payload.sourceClient !== "string" || !payload.sourceClient.trim())
+    ) {
+      return {
+        success: false,
+        error: "Invalid payload: sourceClient must be a non-empty string",
+      };
+    }
+
+    const requestedCaptureId = payload.captureId?.trim();
+    let obsId = requestedCaptureId
+      ? fingerprintId("obs", `${payload.sessionId}:${requestedCaptureId}`)
+      : generateId("obs");
+
+    let dedupHash: string | undefined;
+    if (dedupMap) {
+      const dataIsObject =
+        typeof payload.data === "object" && payload.data !== null;
+      const d = dataIsObject
+        ? (payload.data as Record<string, unknown>)
+        : {};
+      const toolName = (d["tool_name"] as string) || payload.hookType;
+      const dedupInput =
+        d["tool_input"] !== undefined
+          ? d["tool_input"]
+          : dataIsObject
+            ? d
+            : payload.data;
+      dedupHash = dedupMap.computeHash(
+        payload.sessionId,
+        toolName,
+        dedupInput,
+      );
+      if (!requestedCaptureId) {
+        obsId = dedupMap.getObservationId(dedupHash) ?? obsId;
+      }
+    }
+
+    let sanitizedRaw: unknown = payload.data;
+    try {
+      const jsonStr = JSON.stringify(payload.data);
+      const sanitized = stripPrivateData(jsonStr);
+      sanitizedRaw = JSON.parse(sanitized);
+    } catch {
+      sanitizedRaw = stripPrivateData(String(payload.data));
+    }
+
+    let originChannel: Origin["channel"] = "agent";
+    if (payload.hookType === "prompt_submit") originChannel = "user";
+    else if (TOOL_HOOKS.has(payload.hookType)) originChannel = "tool";
+    const captureId = requestedCaptureId ?? obsId;
+    const rawCandidate: RawObservation = {
+      id: obsId,
+      captureId,
+      sessionId: payload.sessionId,
+      timestamp: payload.timestamp,
+      hookType: payload.hookType,
+      raw: sanitizedRaw,
+      ...(typeof payload.project === "string" && payload.project.trim()
+        ? { projectId: payload.project.trim() }
+        : {}),
+      ...(typeof payload.projectName === "string" && payload.projectName.trim()
+        ? { projectName: payload.projectName.trim() }
+        : {}),
+      visibility: "project",
+      origin: {
+        channel: originChannel,
+        capturedAt: payload.timestamp,
+      },
+    };
+
+    let extractedImage: string | undefined;
+    if (typeof sanitizedRaw === "object" && sanitizedRaw !== null) {
+      const d = sanitizedRaw as Record<string, unknown>;
+      if (
+        payload.hookType === "post_tool_use" ||
+        payload.hookType === "post_tool_failure"
+      ) {
+        rawCandidate.toolName = d["tool_name"] as string | undefined;
+        rawCandidate.toolInput = d["tool_input"];
+        rawCandidate.toolOutput = d["tool_output"] || d["error"];
+        if (rawCandidate.origin && rawCandidate.toolName) {
+          rawCandidate.origin.detail = rawCandidate.toolName;
+        }
+      }
+      if (payload.hookType === "prompt_submit") {
+        rawCandidate.userPrompt = d["prompt"] as string | undefined;
+      }
+      extractedImage = extractImage(sanitizedRaw);
+      if (extractedImage) {
+        rawCandidate.modality =
+          rawCandidate.toolInput ||
+          rawCandidate.toolOutput ||
+          rawCandidate.userPrompt
+            ? "mixed"
+            : "image";
+      }
+    } else if (typeof sanitizedRaw === "string") {
+      extractedImage = extractImage(sanitizedRaw);
+      if (extractedImage) rawCandidate.modality = "image";
+    }
+
+    return withKeyedLock(`obs:${payload.sessionId}`, async () => {
+      const rawScope = KV.rawObservations(payload.sessionId);
+      const existingRaw = await kv.get<RawObservation>(rawScope, obsId);
+      const isNewCapture = !existingRaw;
+      const existingSession = await kv.get<Session>(
+        KV.sessions,
+        payload.sessionId,
+      );
+      let previousObservationCount =
+        typeof existingSession?.observationCount === "number" &&
+        Number.isFinite(existingSession.observationCount) &&
+        existingSession.observationCount >= 0
+          ? existingSession.observationCount
+          : undefined;
+
+      if (previousObservationCount === undefined) {
+        const [rawRows, derivedRows] = await Promise.all([
+          kv.list<{ id?: string }>(rawScope),
+          kv.list<{ id?: string }>(KV.observations(payload.sessionId)),
+        ]);
+        previousObservationCount = new Set(
+          [...rawRows, ...derivedRows]
+            .map((row) => row.id)
+            .filter((id): id is string => typeof id === "string"),
+        ).size;
+      }
 
       if (
-        !payload?.sessionId ||
-        typeof payload.sessionId !== "string" ||
-        !payload.hookType ||
-        typeof payload.hookType !== "string" ||
-        !payload.timestamp ||
-        typeof payload.timestamp !== "string"
+        isNewCapture &&
+        maxObservationsPerSession &&
+        maxObservationsPerSession > 0
       ) {
-        return {
-          success: false,
-          error:
-            "Invalid payload: sessionId, hookType, and timestamp are required",
-        };
-      }
-
-      const obsId = generateId("obs");
-
-      let dedupHash: string | undefined;
-      if (dedupMap) {
-        const dataIsObject =
-          typeof payload.data === "object" && payload.data !== null;
-        const d = dataIsObject
-          ? (payload.data as Record<string, unknown>)
-          : {};
-        const toolName = (d["tool_name"] as string) || payload.hookType;
-        // Hash the full payload when tool_input is absent so distinct
-        // events never collapse onto one key.
-        const dedupInput =
-          d["tool_input"] !== undefined
-            ? d["tool_input"]
-            : dataIsObject
-              ? d
-              : payload.data;
-        dedupHash = dedupMap.computeHash(
-          payload.sessionId,
-          toolName,
-          dedupInput,
-        );
-        if (dedupMap.isDuplicate(dedupHash)) {
-          return { deduplicated: true, sessionId: payload.sessionId };
+        if (previousObservationCount >= maxObservationsPerSession) {
+          return {
+            success: false,
+            error: `Session observation limit reached (${maxObservationsPerSession})`,
+          };
         }
       }
 
-      let sanitizedRaw: unknown = payload.data;
-      try {
-        const jsonStr = JSON.stringify(payload.data);
-        const sanitized = stripPrivateData(jsonStr);
-        sanitizedRaw = JSON.parse(sanitized);
-      } catch {
-        sanitizedRaw = stripPrivateData(String(payload.data));
-      }
+      const eventAgentId =
+        (typeof payload.agentId === "string" && payload.agentId.trim().length > 0
+          ? payload.agentId.trim().slice(0, 128)
+          : undefined) ?? existingSession?.agentId ?? getAgentId();
+      const eventSourceClient =
+        existingSession?.sourceClient ??
+        (typeof payload.sourceClient === "string" && payload.sourceClient.trim()
+          ? payload.sourceClient.trim().slice(0, 64)
+          : undefined);
 
-      let originChannel: Origin["channel"] = "agent";
-      if (payload.hookType === "prompt_submit") originChannel = "user";
-      else if (TOOL_HOOKS.has(payload.hookType)) originChannel = "tool";
-      const raw: RawObservation = {
-        id: obsId,
-        sessionId: payload.sessionId,
-        timestamp: payload.timestamp,
-        hookType: payload.hookType,
-        raw: sanitizedRaw,
-        origin: {
-          channel: originChannel,
-          capturedAt: payload.timestamp,
-        },
-      };
-
-      let extractedImage: string | undefined;
-
-      if (typeof sanitizedRaw === "object" && sanitizedRaw !== null) {
-        const d = sanitizedRaw as Record<string, unknown>;
+      let raw = existingRaw ?? rawCandidate;
+      if (isNewCapture) {
+        if (eventAgentId) raw.agentId = eventAgentId;
+        if (eventSourceClient) raw.sourceClient = eventSourceClient;
+        if (!raw.projectId && existingSession?.project) {
+          raw.projectId = existingSession.project;
+        }
+        if (!raw.projectName && existingSession?.projectName) {
+          raw.projectName = existingSession.projectName;
+        }
         if (
-          payload.hookType === "post_tool_use" ||
-          payload.hookType === "post_tool_failure"
+          extractedImage &&
+          (extractedImage.startsWith("data:image/") ||
+            extractedImage.startsWith("iVBORw0KGgo") ||
+            extractedImage.startsWith("/9j/"))
         ) {
-          raw.toolName = d["tool_name"] as string | undefined;
-          raw.toolInput = d["tool_input"];
-          raw.toolOutput = d["tool_output"] || d["error"];
-          if (raw.origin && raw.toolName) raw.origin.detail = raw.toolName;
-        }
-        if (payload.hookType === "prompt_submit") {
-          raw.userPrompt = d["prompt"] as string | undefined;
-        }
-
-        extractedImage = extractImage(sanitizedRaw);
-        if (extractedImage) {
-          raw.modality = (raw.toolInput || raw.toolOutput || raw.userPrompt) ? "mixed" : "image";
-        }
-      } else if (typeof sanitizedRaw === "string") {
-        extractedImage = extractImage(sanitizedRaw);
-        if (extractedImage) {
-          raw.modality = "image";
-        }
-      }
-
-      const pendingImageData = extractedImage;
-
-      return withKeyedLock(`obs:${payload.sessionId}`, async () => {
-        if (maxObservationsPerSession && maxObservationsPerSession > 0) {
-          const existing = await kv.list(KV.observations(payload.sessionId));
-          if (existing.length >= maxObservationsPerSession) {
-            return {
-              success: false,
-              error: `Session observation limit reached (${maxObservationsPerSession})`,
-            };
-          }
-        }
-
-        // Existing session is the source of truth for agentId (even
-        // undefined). Env AGENT_ID only fires when no session row
-        // exists yet — otherwise an unscoped session would get
-        // retroactively scoped by a later AGENT_ID export.
-        const existingSession = await kv.get<{
-          agentId?: string;
-          observationCount?: number;
-          firstPrompt?: string;
-        }>(KV.sessions, payload.sessionId);
-        const inheritedAgentId = existingSession
-          ? existingSession.agentId
-          : getAgentId();
-        if (inheritedAgentId) {
-          raw.agentId = inheritedAgentId;
-        }
-
-        if (pendingImageData && (pendingImageData.startsWith("data:image/") || pendingImageData.startsWith("iVBORw0KGgo") || pendingImageData.startsWith("/9j/"))) {
-          const { filePath, bytesWritten } = await saveImageToDisk(pendingImageData);
+          const { filePath, bytesWritten } =
+            await saveImageToDisk(extractedImage);
           raw.imageData = filePath;
           const { incrementImageRef } = await import("./image-refs.js");
           await incrementImageRef(kv, filePath);
-          sdk.trigger({
-            function_id: "mem::disk-size-delta",
-            payload: { deltaBytes: bytesWritten },
-            action: TriggerAction.Void(),
-          });
-          if (process.env["AGENTMEMORY_IMAGE_EMBEDDINGS"] === "true") {
+          await Promise.allSettled([
             sdk.trigger({
-              function_id: "mem::vision-embed",
-              payload: {
-                imageRef: filePath,
-                sessionId: payload.sessionId,
-                observationId: obsId,
-              },
+              function_id: "mem::disk-size-delta",
+              payload: { deltaBytes: bytesWritten },
               action: TriggerAction.Void(),
-            });
-          }
+            }),
+            ...(process.env["AGENTMEMORY_IMAGE_EMBEDDINGS"] === "true"
+              ? [
+                  sdk.trigger({
+                    function_id: "mem::vision-embed",
+                    payload: {
+                      imageRef: filePath,
+                      sessionId: payload.sessionId,
+                      observationId: obsId,
+                    },
+                    action: TriggerAction.Void(),
+                  }),
+                ]
+              : []),
+          ]);
         }
 
         try {
-
-          await kv.set(KV.observations(payload.sessionId), obsId, raw);
-
+          await kv.set(rawScope, obsId, raw);
         } catch (error) {
           if (raw.imageData) {
-            // Roll back the ref taken above. decrementImageRef deletes the file
-            // only when no other observation still references it (deduped images
-            // survive) and emits the disk-size delta itself — deleting the file
-            // directly here would orphan shared images and leave a stale ref.
-            // If the rollback itself fails, log it but still surface the
-            // original write error (the more useful failure to diagnose).
             try {
               const { decrementImageRef } = await import("./image-refs.js");
               await decrementImageRef(kv, sdk, raw.imageData);
             } catch (rollbackError) {
-              logger.error("Failed to roll back image ref after observation write failure", {
-                imageRef: raw.imageData,
-                error: rollbackError instanceof Error ? rollbackError.message : String(rollbackError),
-              });
+              logger.error(
+                "Failed to roll back image ref after observation write failure",
+                {
+                  imageRef: raw.imageData,
+                  error:
+                    rollbackError instanceof Error
+                      ? rollbackError.message
+                      : String(rollbackError),
+                },
+              );
             }
           }
           throw error;
         }
+      }
 
-        if (dedupMap && dedupHash) {
-          dedupMap.record(dedupHash);
+      if (dedupMap && dedupHash) {
+        dedupMap.record(dedupHash, obsId);
+      }
+
+      const observationCount = previousObservationCount + (isNewCapture ? 1 : 0);
+
+      if (existingSession && isNewCapture) {
+        const updatedSession = {
+          ...existingSession,
+          updatedAt: new Date().toISOString(),
+          observationCount,
+          ...(eventSourceClient ? { sourceClient: eventSourceClient } : {}),
+        };
+        if (existingSession.status === "completed") {
+          updatedSession.status = "active";
+          delete updatedSession.endedAt;
         }
-
-        await sdk.trigger({
-          function_id: "stream::set",
-          payload: {
-          stream_name: STREAM.name,
-          group_id: STREAM.group(payload.sessionId),
-          item_id: obsId,
-          data: { type: "raw", observation: raw },
-          },
-        });
-
-        await sdk.trigger({
-          function_id: "stream::send",
-          payload: {
-            stream_name: STREAM.name,
-            group_id: STREAM.viewerGroup,
-            id: `raw-${obsId}`,
-            type: "raw_observation",
-            data: { type: "raw", observation: raw, sessionId: payload.sessionId },
-          },
-          action: TriggerAction.Void(),
-        });
-
-        const session = existingSession;
-        if (session) {
-          const updates: Array<{ type: "set"; path: string; value: unknown }> = [
-            { type: "set", path: "updatedAt", value: new Date().toISOString() },
-            {
-              type: "set",
-              path: "observationCount",
-              value: (session.observationCount || 0) + 1,
-            },
-          ];
-          if (!session.firstPrompt && typeof raw.userPrompt === "string") {
-            const trimmed = raw.userPrompt.replace(/\s+/g, " ").trim();
-            if (trimmed.length > 0) {
-              updates.push({
-                type: "set",
-                path: "firstPrompt",
-                value: trimmed.slice(0, 200),
-              });
-            }
+        if (!existingSession.firstPrompt && typeof raw.userPrompt === "string") {
+          const trimmed = raw.userPrompt.replace(/\s+/g, " ").trim();
+          if (trimmed.length > 0) {
+            updatedSession.firstPrompt = trimmed.slice(0, 200);
           }
-          await kv.update(KV.sessions, payload.sessionId, updates);
-        } else if (
-          typeof payload.project === "string" &&
-          payload.project.trim().length > 0 &&
-          typeof payload.cwd === "string" &&
-          payload.cwd.trim().length > 0
-        ) {
-          // OpenCode (and any plugin that skips POST /session/start)
-          // can fire observations before the session record exists. Without
-          // an implicit create, those observations stack up but
-          // `memory_sessions` never lists them, and summarize bails with
-          // "Session not found for summarize". Create the session now from
-          // the observation payload — but only when project + cwd are
-          // present (HookPayload contract). Older test payloads without
-          // those fields keep their original no-op behaviour.
-          const trimmedPrompt =
-            typeof raw.userPrompt === "string"
-              ? raw.userPrompt.replace(/\s+/g, " ").trim().slice(0, 200)
-              : undefined;
-          const ts = new Date().toISOString();
-          await kv.set(KV.sessions, payload.sessionId, {
-            id: payload.sessionId,
-            project: payload.project,
-            cwd: payload.cwd,
-            startedAt: payload.timestamp ?? ts,
-            updatedAt: ts,
-            status: "active",
-            observationCount: 1,
-            ...(inheritedAgentId ? { agentId: inheritedAgentId } : {}),
-            ...(trimmedPrompt && trimmedPrompt.length > 0
-              ? { firstPrompt: trimmedPrompt }
-              : {}),
-          });
         }
+        if (
+          !existingSession.projectName &&
+          typeof payload.projectName === "string" &&
+          payload.projectName.trim()
+        ) {
+          updatedSession.projectName = payload.projectName.trim();
+        }
+        await kv.set(KV.sessions, payload.sessionId, updatedSession);
+      } else if (
+        !existingSession &&
+        typeof payload.project === "string" &&
+        payload.project.trim().length > 0 &&
+        typeof payload.cwd === "string" &&
+        payload.cwd.trim().length > 0
+      ) {
+        const trimmedPrompt =
+          typeof raw.userPrompt === "string"
+            ? raw.userPrompt.replace(/\s+/g, " ").trim().slice(0, 200)
+            : undefined;
+        const ts = new Date().toISOString();
+        await kv.set(KV.sessions, payload.sessionId, {
+          id: payload.sessionId,
+          project: payload.project,
+          ...(typeof payload.projectName === "string" && payload.projectName.trim()
+            ? { projectName: payload.projectName.trim() }
+            : {}),
+          cwd: payload.cwd,
+          startedAt: payload.timestamp ?? ts,
+          updatedAt: ts,
+          status: "active",
+          observationCount,
+          ...(eventAgentId ? { agentId: eventAgentId } : {}),
+          ...(eventSourceClient ? { sourceClient: eventSourceClient } : {}),
+          ...(trimmedPrompt && trimmedPrompt.length > 0
+            ? { firstPrompt: trimmedPrompt }
+            : {}),
+        });
+      }
 
-        // Per-observation LLM compression is opt-in as of 0.8.8.
-        // Default path: build a zero-LLM synthetic compression so recall
-        // and BM25 search still work without burning the user's Claude
-        // token allocation on every tool invocation.
-        if (isAutoCompressEnabled()) {
-          await sdk.trigger({
-            function_id: "mem::compress",
-            payload: {
-              observationId: obsId,
-              sessionId: payload.sessionId,
-              raw,
-            },
-            action: TriggerAction.Void(),
-          });
-        } else {
-          const synthetic = buildSyntheticCompression(raw);
-          await kv.set(
-            KV.observations(payload.sessionId),
-            obsId,
-            synthetic,
-          );
-          getSearchIndex().add(synthetic);
-          await vectorIndexAddGuarded(
-            synthetic.id,
-            synthetic.sessionId,
-            synthetic.title + " " + (synthetic.narrative || ""),
-            { kind: "synthetic", logId: synthetic.id },
-          );
-          await sdk.trigger({
+      let projection = await kv.get<ObservationProjection>(
+        KV.observationProjections,
+        obsId,
+      );
+      const projectionWasMissing = !projection;
+      if (!projection) {
+        projection = {
+          observationId: obsId,
+          captureId: raw.captureId ?? captureId,
+          sessionId: payload.sessionId,
+          status: "pending",
+          attempts: 0,
+          updatedAt: new Date().toISOString(),
+        };
+        await kv.set(KV.observationProjections, obsId, projection);
+      }
+
+      if (!isNewCapture && !projectionWasMissing) {
+        return {
+          observationId: obsId,
+          captureId: projection.captureId,
+          deduplicated: true,
+          sessionId: payload.sessionId,
+          projectionStatus: projection.status,
+        };
+      }
+
+      if (projection.status === "succeeded") {
+        return {
+          observationId: obsId,
+          captureId: projection.captureId,
+          deduplicated: true,
+          sessionId: payload.sessionId,
+        };
+      }
+
+      await markProjectionPending(
+        kv,
+        "compression",
+        obsId,
+        projection.updatedAt,
+      );
+
+      if (isNewCapture) {
+        void Promise.allSettled([
+          sdk.trigger({
             function_id: "stream::set",
             payload: {
               stream_name: STREAM.name,
               group_id: STREAM.group(payload.sessionId),
               item_id: obsId,
-              data: { type: "compressed", observation: synthetic },
+              data: { type: "raw", observation: raw },
             },
-          });
-          await sdk.trigger({
-            function_id: "stream::set",
+          }),
+          sdk.trigger({
+            function_id: "stream::send",
             payload: {
               stream_name: STREAM.name,
               group_id: STREAM.viewerGroup,
-              item_id: obsId,
+              id: `raw-${obsId}`,
+              type: "raw_observation",
               data: {
-                type: "compressed",
-                observation: synthetic,
+                type: "raw",
+                observation: raw,
                 sessionId: payload.sessionId,
               },
             },
-          });
-        }
-
-        logger.info("Observation captured", {
-          obsId,
-          sessionId: payload.sessionId,
-          hook: payload.hookType,
-          compress: isAutoCompressEnabled() ? "llm" : "synthetic",
+            action: TriggerAction.Void(),
+          }),
+        ]).then((streamResults) => {
+          for (const result of streamResults) {
+            if (result.status === "rejected") {
+              logger.warn("Non-fatal raw observation stream publish failure", {
+                observationId: obsId,
+                sessionId: payload.sessionId,
+                error:
+                  result.reason instanceof Error
+                    ? result.reason.message
+                    : String(result.reason),
+              });
+            }
+          }
         });
-        return { observationId: obsId };
+      }
+
+      void sdk
+        .trigger({
+          function_id: "iii::durable::publish",
+          payload: {
+            topic: observationProjectionQueue(obsId),
+            data: {
+              observationId: obsId,
+              sessionId: payload.sessionId,
+            },
+          },
+          action: TriggerAction.Void(),
+        })
+        .catch((error) => {
+          logger.warn("Observation projection dispatch failed", {
+            observationId: obsId,
+            sessionId: payload.sessionId,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        });
+
+      logger.info("Observation captured", {
+        obsId,
+        sessionId: payload.sessionId,
+        hook: payload.hookType,
+        compress: isAutoCompressEnabled() ? "llm" : "synthetic",
       });
-    },
-  );
+      return {
+        observationId: obsId,
+        captureId: projection.captureId,
+        ...(isNewCapture
+          ? {}
+          : { deduplicated: true, projectionQueued: true }),
+      };
+    });
+  });
 }

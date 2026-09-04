@@ -1043,6 +1043,7 @@
   <div class="tab-bar" id="tab-bar">
     <button class="active" data-tab="dashboard" aria-current="page">Dashboard</button>
     <button data-tab="graph">Graph</button>
+    <button data-tab="rejected">Rejected</button>
     <button data-tab="memories">Memories</button>
     <button data-tab="timeline">Timeline</button>
     <button data-tab="sessions">Sessions</button>
@@ -1060,6 +1061,7 @@
 
   <div id="view-dashboard" class="view active"></div>
   <div id="view-graph" class="view"></div>
+  <div id="view-rejected" class="view"></div>
   <div id="view-memories" class="view"></div>
   <div id="view-lessons" class="view"></div>
   <div id="view-actions" class="view"></div>
@@ -1130,9 +1132,24 @@
       applyTheme(true, false);
     }
 
+    // One entry per graph-schema NODE_TYPES member (15). Mid-tone hexes so the
+    // same value stays legible on the light and the dark canvas; unknown types
+    // still fall back to grey at every call site.
     var NODE_COLORS = {
       file: '#2D6A4F', function: '#1D4E89', concept: '#B8860B', error: '#CC0000',
-      decision: '#6B3FA0', pattern: '#2563EB', library: '#C2410C', person: '#111111'
+      decision: '#6B3FA0', pattern: '#2563EB', library: '#C2410C', person: '#111111',
+      project: '#0E7490', preference: '#9D174D', location: '#4D7C0F',
+      organization: '#7C2D12', event: '#A21CAF', task: '#0891B2', feature: '#B45309'
+    };
+    // One entry per graph-schema EDGE_TYPES member (23). Used for edge strokes,
+    // the edge legend and the hover tooltip; unknown types fall back to grey.
+    var EDGE_COLORS = {
+      uses: '#1D4E89', imports: '#2563EB', modifies: '#B8860B', causes: '#CC0000',
+      fixes: '#2D6A4F', depends_on: '#6B3FA0', related_to: '#666666', works_at: '#7C2D12',
+      prefers: '#9D174D', blocked_by: '#C2410C', caused_by: '#B91C1C', optimizes_for: '#0891B2',
+      rejected: '#991B1B', avoids: '#A16207', located_in: '#4D7C0F', succeeded_by: '#A21CAF',
+      implements: '#0E7490', part_of: '#4338CA', contains: '#5B21B6', documents: '#0F766E',
+      defines: '#B45309', validates: '#15803D', tests: '#65A30D'
     };
     var OP_BADGES = {
       observe: 'badge-blue', compress: 'badge-cyan', remember: 'badge-green',
@@ -1158,13 +1175,14 @@
       task: '&#9745;', other: '&#128196;'
     };
     var CB_STATE_COLORS = { closed: 'badge-green', open: 'badge-red', 'half-open': 'badge-yellow' };
-    var TAB_IDS = ['dashboard', 'graph', 'memories', 'timeline', 'sessions', 'lessons', 'actions', 'crystals', 'audit', 'activity', 'profile', 'replay'];
+    var TAB_IDS = ['dashboard', 'graph', 'rejected', 'memories', 'timeline', 'sessions', 'lessons', 'actions', 'crystals', 'audit', 'activity', 'profile', 'replay'];
     var VIEWER_TOKEN_STORAGE_KEY = 'agentmemory-viewer-token';
 
     var state = {
       activeTab: 'dashboard',
       dashboard: { loaded: false, health: null, sessions: [], memories: [], graphStats: null, recentAudit: [], lessons: [], crystals: [] },
       graph: { loaded: false, nodes: [], edges: [], stats: null, filters: {}, selectedNode: null, queryError: null, truncated: false, totalNodes: 0, totalEdges: 0 },
+      rejected: { loaded: false, items: [], total: 0, cap: 0, byReason: {}, byKind: null, reasonFilter: '', kindFilter: '', error: null },
       memories: { loaded: false, items: [], search: '', typeFilter: '', selectedId: null },
       timeline: { loaded: false, observations: [], sessionId: '', minImportance: 0, page: 0, pageSize: 50 },
       sessions: { loaded: false, items: [], selectedId: null },
@@ -1189,6 +1207,19 @@
     function formatTime(ts) {
       if (!ts) return '';
       try { return new Date(ts).toLocaleString(); } catch { return ts; }
+    }
+    // Rejected assertions are read as "how long ago", with the exact ISO stamp
+    // kept in the cell's title attribute.
+    function relativeTime(ts) {
+      if (!ts) return '';
+      var then = new Date(ts).getTime();
+      if (!then || isNaN(then)) return String(ts);
+      var secs = Math.round((Date.now() - then) / 1000);
+      if (secs < 0) return 'just now';
+      if (secs < 60) return secs + 's ago';
+      if (secs < 3600) return Math.floor(secs / 60) + 'm ago';
+      if (secs < 86400) return Math.floor(secs / 3600) + 'h ago';
+      return Math.floor(secs / 86400) + 'd ago';
     }
     function shortTime(ts) {
       if (!ts) return '';
@@ -1451,6 +1482,7 @@
       switch(tab) {
         case 'dashboard': await loadDashboard(); break;
         case 'graph': await loadGraph(); break;
+        case 'rejected': await loadRejected(); break;
         case 'memories': await loadMemories(); break;
         case 'timeline': await loadTimeline(); break;
         case 'sessions': await loadSessions(); break;
@@ -1467,7 +1499,23 @@
       }
     }
 
+    var dashboardLoading = false;
+    function mergeDashboardResults(d, results) {
+      if (results[0]) d.health = results[0];
+      if (results[1]) d.sessions = results[1].sessions || [];
+      if (results[2]) d.memories = results[2].memories || [];
+      if (results[3]) d.graphStats = results[3];
+      if (results[4]) d.recentAudit = results[4].entries || [];
+      if (results[5]) d.semantic = results[5].facts || results[5].semantic || [];
+      if (results[6]) d.procedural = results[6].procedures || results[6].procedural || [];
+      if (results[7]) d.relations = results[7].relations || [];
+      if (results[8]) d.lessons = results[8].lessons || [];
+      if (results[9]) d.crystals = results[9].crystals || [];
+    }
+
     async function loadDashboard() {
+      if (dashboardLoading) return;
+      dashboardLoading = true;
       var el = document.getElementById('view-dashboard');
       if (!state.dashboard.loaded) el.innerHTML = '<div class="loading">Loading dashboard...</div>';
       try {
@@ -1483,16 +1531,7 @@
           apiGet('lessons'),
           apiGet('crystals')
         ]);
-        state.dashboard.health = results[0];
-        state.dashboard.sessions = (results[1] && results[1].sessions) || [];
-        state.dashboard.memories = (results[2] && results[2].memories) || [];
-        state.dashboard.graphStats = results[3];
-        state.dashboard.recentAudit = (results[4] && results[4].entries) || [];
-        state.dashboard.semantic = (results[5] && results[5].facts) || (results[5] && results[5].semantic) || [];
-        state.dashboard.procedural = (results[6] && results[6].procedures) || (results[6] && results[6].procedural) || [];
-        state.dashboard.lessons = (results[8] && results[8].lessons) || [];
-        state.dashboard.crystals = (results[9] && results[9].crystals) || [];
-        state.dashboard.relations = (results[7] && results[7].relations) || [];
+        mergeDashboardResults(state.dashboard, results);
         state.dashboard.loaded = true;
         renderDashboard();
       } catch (err) {
@@ -1513,6 +1552,8 @@
           'violations, please open an issue with the agentmemory version ' +
           '(top-right of the viewer) and the violation text.' +
           '</span></div>';
+      } finally {
+        dashboardLoading = false;
       }
     }
 
@@ -1549,7 +1590,13 @@
       var crystalCount = (d.crystals || []).length;
       html += '<div class="stat-card" data-action="goto-tab" data-tab="lessons" role="link" tabindex="0"><div class="label">Lessons</div><div class="value">' + lessonCount + '</div><div class="sub">confidence-scored</div></div>';
       html += '<div class="stat-card" data-action="goto-tab" data-tab="crystals" role="link" tabindex="0"><div class="label">Crystals</div><div class="value">' + crystalCount + '</div><div class="sub">action digests</div></div>';
-      html += '<div class="stat-card" data-action="goto-tab" data-tab="graph" role="link" tabindex="0"><div class="label">Graph Nodes</div><div class="value">' + nodeCount + '</div><div class="sub">' + edgeCount + ' edges</div></div>';
+      // graph-schema: `rejected` is absent on pre-schema snapshots — the sub text
+      // and the card only mention it when the stats payload carries a number.
+      var rejectedCount = typeof gs.rejected === 'number' ? gs.rejected : null;
+      html += '<div class="stat-card" data-action="goto-tab" data-tab="graph" role="link" tabindex="0"><div class="label">Graph Nodes</div><div class="value">' + nodeCount + '</div><div class="sub">' + edgeCount + ' edges' + (rejectedCount !== null ? ' · ' + rejectedCount + ' rejected' : '') + '</div></div>';
+      if (rejectedCount !== null) {
+        html += '<div class="stat-card" data-action="goto-tab" data-tab="rejected" role="link" tabindex="0"><div class="label">Rejected</div><div class="value">' + rejectedCount + '</div><div class="sub">assertions refused</div></div>';
+      }
       html += '<div class="stat-card"><div class="label">Health</div><div class="value"><div class="health-bar"><span class="health-dot ' + dotClass + '"></span> ' + esc(healthStatus) + '</div></div>';
       html += '<div class="sub">' + esc(snap.connectionState || 'unknown') + '</div></div>';
       var totalCalls = fMetrics.reduce(function(a, m) { return a + (m.totalCalls || 0); }, 0);
@@ -1781,8 +1828,7 @@
 
     var dashboardTimer = null;
     function refreshDashboard() {
-      state.dashboard.loaded = false;
-      loadDashboard();
+      return loadDashboard();
     }
     function startDashboardAutoRefresh() {
       if (dashboardTimer) clearInterval(dashboardTimer);
@@ -1883,9 +1929,13 @@
       initGraph();
     }
 
+    // One entry per NODE_COLORS key; only the four shapes drawNode() knows how to
+    // draw (rect / circle / diamond / hexagon) are used.
     var NODE_SHAPES = {
       file: 'rect', function: 'circle', concept: 'circle', error: 'diamond',
-      decision: 'diamond', pattern: 'circle', library: 'hexagon', person: 'circle'
+      decision: 'diamond', pattern: 'circle', library: 'hexagon', person: 'circle',
+      project: 'hexagon', preference: 'diamond', location: 'rect',
+      organization: 'hexagon', event: 'diamond', task: 'rect', feature: 'circle'
     };
     var graphSearchTerm = '';
 
@@ -1933,6 +1983,15 @@
       html += '<div style="text-align:center;flex:1;"><span style="font-size:28px;font-weight:900;font-family:var(--font-display);color:var(--ink);line-height:1;">' + nodeCount + '</span><div style="font-size:8px;color:var(--ink-faint);text-transform:uppercase;letter-spacing:0.12em;font-family:var(--font-ui);font-weight:600;margin-top:4px;">Nodes</div></div>';
       html += '<div style="width:1px;background:var(--border-light);"></div>';
       html += '<div style="text-align:center;flex:1;"><span style="font-size:28px;font-weight:900;font-family:var(--font-display);color:var(--ink);line-height:1;">' + edgeCount + '</span><div style="font-size:8px;color:var(--ink-faint);text-transform:uppercase;letter-spacing:0.12em;font-family:var(--font-ui);font-weight:600;margin-top:4px;">Edges</div></div>';
+      // graph-schema: rejected is absent on pre-schema snapshots — show 0 rather
+      // than "undefined". Stale nodes are counted from the loaded subgraph, which
+      // is already in memory (no extra request).
+      var rejectedCount = typeof gs.rejected === 'number' ? gs.rejected : 0;
+      var staleCount = state.graph.nodes.filter(function(n) { return n && n.stale === true; }).length;
+      html += '<div style="width:1px;background:var(--border-light);"></div>';
+      html += '<div style="text-align:center;flex:1;"><span style="font-size:28px;font-weight:900;font-family:var(--font-display);color:var(--ink);line-height:1;">' + rejectedCount + '</span><div style="font-size:8px;color:var(--ink-faint);text-transform:uppercase;letter-spacing:0.12em;font-family:var(--font-ui);font-weight:600;margin-top:4px;">Rejected</div></div>';
+      html += '<div style="width:1px;background:var(--border-light);"></div>';
+      html += '<div style="text-align:center;flex:1;"><span style="font-size:28px;font-weight:900;font-family:var(--font-display);color:var(--ink);line-height:1;">' + staleCount + '</span><div style="font-size:8px;color:var(--ink-faint);text-transform:uppercase;letter-spacing:0.12em;font-family:var(--font-ui);font-weight:600;margin-top:4px;">Stale</div></div>';
       html += '</div>';
 
       html += '<h3 style="margin-top:12px;font-size:10px;text-transform:uppercase;letter-spacing:0.12em;color:var(--ink-muted);font-family:var(--font-ui);font-weight:700;">Filter by Type</h3>';
@@ -1944,6 +2003,21 @@
       if (state.graph.nodes.length > 0 && state.graph.edges.length === 0) {
         html += '<div style="margin:10px 0;padding:10px 12px;border:1px solid var(--border-light);background:var(--bg-subtle);font-size:11px;color:var(--ink-muted);line-height:1.5;">Entities extracted, no relations between them yet. Nodes are grouped by kind; edges appear as extraction sees entities acting on each other across more sessions (larger models find them faster).</div>';
       }
+      // graph-schema: edge-type legend. Only the relationship types actually
+      // present in the loaded subgraph are listed, each in the colour renderGraph
+      // strokes it with.
+      var edgeTypesInUse = {};
+      state.graph.edges.forEach(function(e) { if (e && e.type) edgeTypesInUse[e.type] = (edgeTypesInUse[e.type] || 0) + 1; });
+      var edgeTypeList = Object.keys(edgeTypesInUse).sort();
+      if (edgeTypeList.length > 0) {
+        html += '<h3 style="margin-top:16px;font-size:10px;text-transform:uppercase;letter-spacing:0.12em;color:var(--ink-muted);font-family:var(--font-ui);font-weight:700;">Relationship Types</h3>';
+        html += '<div id="edge-legend">';
+        edgeTypeList.forEach(function(t) {
+          html += '<div class="graph-legend-item"><span class="filter-dot" style="background:' + (EDGE_COLORS[t] || '#666666') + '"></span>' + esc(t) + '<span style="margin-left:auto;font-family:var(--font-mono);color:var(--ink-faint);">' + edgeTypesInUse[t] + '</span></div>';
+        });
+        html += '</div>';
+      }
+
       html += '<div class="graph-legend" style="display:none"><h3>Legend</h3>';
       var shapeLabels = { rect: '&#9645;', circle: '&#9679;', diamond: '&#9670;', hexagon: '&#11042;' };
       var shownShapes = {};
@@ -2097,7 +2171,8 @@
         var tooltip = document.getElementById('graph-tooltip');
         if (tooltip) {
           if (hoverNode && !graphSim.dragNode && !isPanning) {
-            var conns = graphSim.edges.filter(function(ed) { return ed.sourceNodeId === hoverNode.id || ed.targetNodeId === hoverNode.id; }).length;
+            var incident = graphSim.edges.filter(function(ed) { return ed.sourceNodeId === hoverNode.id || ed.targetNodeId === hoverNode.id; });
+            var conns = incident.length;
             var ttHtml = '<div class="tt-name">' + esc(hoverNode.name) + '</div>';
             ttHtml += '<div class="tt-type" style="color:' + (NODE_COLORS[hoverNode.type] || '#666') + '">' + esc(hoverNode.type) + '</div>';
             if (hoverNode.properties) {
@@ -2107,6 +2182,12 @@
               });
             }
             ttHtml += '<div class="tt-conns">' + conns + ' connection' + (conns !== 1 ? 's' : '') + '</div>';
+            // graph-schema: name the relationships, not just how many. `type · weight`
+            // in the same colour the edge is stroked with.
+            incident.slice(0, 4).forEach(function(ed) {
+              var w = typeof ed.weight === 'number' ? ed.weight.toFixed(2) : '—';
+              ttHtml += '<div class="tt-prop" style="color:' + (EDGE_COLORS[ed.type] || '#666666') + '">' + esc(ed.type || 'related_to') + ' &middot; ' + esc(w) + '</div>';
+            });
             tooltip.innerHTML = ttHtml;
             var rect = canvas.getBoundingClientRect();
             tooltip.style.left = (e.clientX - rect.left + 12) + 'px';
@@ -2165,19 +2246,83 @@
       var panel = document.getElementById('selected-node-panel');
       if (!panel) return;
       var color = NODE_COLORS[simNode.type] || '#666666';
+      // graphSim nodes carry only the fields the layout needs; the ontology
+      // fields (aliases, merge lineage, stale, provenance) live on the record
+      // returned by graph/query.
+      var record = state.graph.nodes.filter(function(n) { return n && n.id === simNode.id; })[0] || simNode;
       var html = '<div class="selected-node-info">';
       html += '<h4 style="color:' + color + '">' + esc(simNode.name) + '</h4>';
-      html += '<div class="prop">Type: ' + esc(simNode.type) + '</div>';
+      html += '<div class="tag-list"><span class="tag" style="border-color:' + color + ';color:' + color + '">' + esc(simNode.type) + '</span>';
+      if (record.stale === true) html += '<span class="tag" style="border-color:var(--ink-faint);color:var(--ink-faint);">stale</span>';
+      html += '</div>';
+      if (record.mergedInto) {
+        html += '<div class="prop">Merged into: <span style="font-family:var(--font-mono);">' + esc(record.mergedInto) + '</span></div>';
+      }
+      var mergedFrom = record.mergedFrom || [];
+      if (mergedFrom.length > 0) {
+        html += '<div class="prop">Merged from (' + mergedFrom.length + '): <span style="font-family:var(--font-mono);">' + esc(mergedFrom.slice(0, 5).join(', ')) + (mergedFrom.length > 5 ? ' …' : '') + '</span></div>';
+      }
+      var aliases = record.aliases || [];
+      if (aliases.length > 0) {
+        html += '<div class="prop">Aliases</div><div class="tag-list">';
+        aliases.forEach(function(a) { html += '<span class="tag">' + esc(a) + '</span>'; });
+        html += '</div>';
+      }
+      var obsIds = record.sourceObservationIds || [];
+      if (obsIds.length > 0) {
+        html += '<div class="prop">Observations (' + obsIds.length + '): <span style="font-family:var(--font-mono);">' + esc(obsIds.slice(0, 3).join(', ')) + (obsIds.length > 3 ? ' …' : '') + '</span></div>';
+      }
       if (simNode.properties) {
         Object.keys(simNode.properties).forEach(function(k) {
           html += '<div class="prop">' + esc(k) + ': ' + esc(truncate(simNode.properties[k], 50)) + '</div>';
         });
       }
-      var conns = graphSim.edges.filter(function(e) { return e.sourceNodeId === simNode.id || e.targetNodeId === simNode.id; }).length;
-      html += '<div class="prop">Connections: ' + conns + '</div>';
+      var incident = graphSim.edges.filter(function(e) { return e.sourceNodeId === simNode.id || e.targetNodeId === simNode.id; });
+      html += '<div class="prop">Connections: ' + incident.length + '</div>';
+      html += renderNodeRelationships(simNode, incident);
       html += '<button class="btn btn-primary" style="margin-top:8px;width:100%;" data-action="expand-node" data-node-id="' + esc(simNode.id) + '">Expand neighbors</button>';
       html += '</div>';
       panel.innerHTML = html;
+    }
+
+    // graph-schema relationship view: the selected node's edges grouped by
+    // relationship type, each row carrying direction, the neighbour's name +
+    // type badge, and the edge weight.
+    function renderNodeRelationships(simNode, incident) {
+      if (!incident || incident.length === 0) {
+        return '<div class="prop" style="font-style:italic;color:var(--ink-faint);">No relationships yet.</div>';
+      }
+      var byId = {};
+      state.graph.nodes.forEach(function(n) { if (n) byId[n.id] = n; });
+      graphSim.nodes.forEach(function(n) { if (n && !byId[n.id]) byId[n.id] = n; });
+
+      var groups = {};
+      incident.forEach(function(e) {
+        var type = e.type || 'related_to';
+        if (!groups[type]) groups[type] = [];
+        var outgoing = e.sourceNodeId === simNode.id;
+        var otherId = outgoing ? e.targetNodeId : e.sourceNodeId;
+        groups[type].push({ outgoing: outgoing, other: byId[otherId], otherId: otherId, weight: e.weight });
+      });
+
+      var html = '<div class="prop" style="margin-top:8px;font-weight:700;color:var(--ink);">Relationships</div>';
+      Object.keys(groups).sort().forEach(function(type) {
+        var edgeColor = EDGE_COLORS[type] || '#666666';
+        html += '<div style="margin-top:6px;"><span class="filter-dot" style="background:' + edgeColor + '"></span> <span style="font-size:11px;font-family:var(--font-mono);color:' + edgeColor + ';">' + esc(type) + '</span> <span style="font-size:10px;color:var(--ink-faint);">(' + groups[type].length + ')</span></div>';
+        groups[type].forEach(function(row) {
+          var neighborType = row.other && row.other.type ? row.other.type : 'unknown';
+          var neighborName = row.other && row.other.name ? row.other.name : row.otherId;
+          var neighborColor = NODE_COLORS[neighborType] || '#666666';
+          var weight = typeof row.weight === 'number' ? row.weight.toFixed(2) : '—';
+          html += '<div class="prop" style="padding-left:12px;display:flex;align-items:center;gap:6px;">';
+          html += '<span style="font-family:var(--font-mono);color:' + edgeColor + ';">' + (row.outgoing ? '&rarr;' : '&larr;') + '</span>';
+          html += '<span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + esc(truncate(String(neighborName), 28)) + '</span>';
+          html += '<span class="tag" style="border-color:' + neighborColor + ';color:' + neighborColor + '">' + esc(neighborType) + '</span>';
+          html += '<span style="margin-left:auto;font-family:var(--font-mono);color:var(--ink-faint);font-size:10px;">' + esc(weight) + '</span>';
+          html += '</div>';
+        });
+      });
+      return html;
     }
 
     async function expandNode(nodeId) {
@@ -2453,8 +2598,9 @@
         var cpx = (s.x + t.x) / 2 + offsetX;
         var cpy = (s.y + t.y) / 2 + offsetY;
 
-        // Colored edges based on source node type
-        var edgeColor = NODE_COLORS[s.type] || '#666666';
+        // graph-schema: edges are coloured by relationship type so the ontology
+        // reads off the canvas; unknown types fall back to the old source-node hue.
+        var edgeColor = EDGE_COLORS[e.type] || NODE_COLORS[s.type] || '#666666';
         var edgeAlpha;
         if (edgeDimmed) {
           edgeAlpha = 0.06;
@@ -3358,7 +3504,7 @@
           '<div class="empty-icon">&#128161;</div>' +
           '<div class="empty-title">No lessons yet</div>' +
           '<div class="empty-lead">Lessons are short imperative rules (always/never/prefer/avoid) learned from past work &mdash; things you corrected once that the agent should never repeat. Confidence grows when they hold and decays when unused.</div>' +
-          '<pre class="empty-cmd"># Save a lesson explicitly\nmemory_lesson_save { rule, reason, confidence }\n\n# Or: Replay tab &rarr; Import JSONL auto-extracts lessons\n# from your past Claude Code sessions</pre>' +
+          '<pre class="empty-cmd"># Save a lesson explicitly\nmemory_lesson_save { content, context, confidence }\n\n# Or: Replay tab &rarr; Import JSONL auto-extracts lessons\n# from your past Claude Code sessions</pre>' +
           '<div><a class="empty-link" href="https://github.com/rohitg00/agentmemory#lessons" target="_blank" rel="noopener">Lesson decay &amp; scoring &rarr;</a></div>' +
           '</div>';
       } else {
@@ -3449,7 +3595,7 @@
           '<div class="empty-title">No actions tracked yet</div>' +
           '<div class="empty-lead">Actions are follow-ups the agent surfaced during a session: <em>decisions to revisit</em>, <em>files to inspect</em>, <em>tasks blocked on input</em>. They show up here with status pending &rarr; active &rarr; done/blocked so nothing slips through between sessions.</div>' +
           '<div class="empty-lead" style="margin-top:0;">Three ways to create them:</div>' +
-          '<pre class="empty-cmd"># 1. MCP tool (from any agent)\nmemory_action_create { title, description, priority }\n\n# 2. Curl\ncurl -X POST http://localhost:3111/agentmemory/actions \\\n  -H \'Content-Type: application/json\' \\\n  -d \'{"title":"ship v1","priority":"high"}\'\n\n# 3. Hooks auto-extract from long session bodies</pre>' +
+          '<pre class="empty-cmd"># 1. MCP tool (from any agent)\nmemory_action_create { title, description, priority }\n\n# 2. Curl\ncurl -X POST http://localhost:3111/agentmemory/actions \\\n  -H \'Content-Type: application/json\' \\\n  -d \'{"title":"ship v1","priority":10}\'\n\n# Agents create actions explicitly with the MCP tool or REST API</pre>' +
           '<div><a class="empty-link" href="https://github.com/rohitg00/agentmemory#actions" target="_blank" rel="noopener">Action lifecycle docs &rarr;</a></div>' +
           '</div>';
       } else {
@@ -3535,7 +3681,7 @@
           '<div class="empty-icon">&#128142;</div>' +
           '<div class="empty-title">No crystals yet</div>' +
           '<div class="empty-lead">Crystals are frozen snapshots of completed work &mdash; one session’s narrative, key outcomes, files touched, and lessons surfaced, kept after raw observations are pruned so the next session gets fast context.</div>' +
-          '<pre class="empty-cmd"># Auto: import a JSONL transcript\n#   Replay tab &rarr; Import JSONL\n\n# Manual: crystallize a specific session\nmemory_crystallize { sessionId }</pre>' +
+          '<pre class="empty-cmd"># Auto: import a JSONL transcript\n#   Replay tab &rarr; Import JSONL\n\n# Manual: crystallize completed action IDs\nmemory_crystallize { actionIds, project, sessionId }</pre>' +
           '<div><a class="empty-link" href="https://github.com/rohitg00/agentmemory#crystals" target="_blank" rel="noopener">Crystal pipeline &rarr;</a></div>' +
           '</div>';
       } else {
@@ -3654,6 +3800,87 @@
     function toggleAuditDetail(idx) {
       var el = document.getElementById('audit-detail-' + idx);
       if (el) el.classList.toggle('open');
+    }
+
+    // graph-schema: assertions the extraction seam refused (unknown type, empty
+    // canonical name, dangling endpoint, ...). Records are kept verbatim up to a
+    // server-side cap; the counter keeps counting past it.
+    async function loadRejected() {
+      var el = document.getElementById('view-rejected');
+      if (!state.rejected.loaded) el.innerHTML = '<div class="loading">Loading rejected assertions...</div>';
+      var result = await apiGet('graph/rejected?limit=200');
+      if (!result) {
+        state.rejected.error = 'Could not load rejected assertions.';
+      } else {
+        state.rejected.error = null;
+        state.rejected.items = result.rejected || [];
+        state.rejected.total = typeof result.total === 'number' ? result.total : state.rejected.items.length;
+        state.rejected.cap = result.cap || 0;
+        state.rejected.byReason = result.byReason || {};
+        state.rejected.byKind = result.byKind || null;
+      }
+      state.rejected.loaded = true;
+      renderRejected();
+    }
+
+    function renderRejected() {
+      var el = document.getElementById('view-rejected');
+      var r = state.rejected;
+      if (r.error) {
+        el.innerHTML = '<div class="card"><div class="empty-state"><div class="empty-icon">&#9888;</div><p>' + esc(r.error) + '</p></div></div>';
+        return;
+      }
+      var byKind = r.byKind || { node: 0, edge: 0 };
+      var filtered = r.items.filter(function(x) {
+        if (r.kindFilter && x.kind !== r.kindFilter) return false;
+        if (r.reasonFilter && x.reason !== r.reasonFilter) return false;
+        return true;
+      });
+
+      var html = '<div class="card" style="margin-bottom:14px;">';
+      html += '<div class="card-title">Rejected assertions</div>';
+      html += '<div style="font-size:12px;color:var(--ink-muted);">' + r.total + ' in store (cap ' + r.cap + ') &middot; ' + (byKind.node || 0) + ' node' + ((byKind.node || 0) !== 1 ? 's' : '') + ' &middot; ' + (byKind.edge || 0) + ' edge' + ((byKind.edge || 0) !== 1 ? 's' : '') + '</div>';
+      html += '</div>';
+
+      html += '<div class="toolbar">';
+      html += '<select id="rejected-reason-filter" data-action="rejected-reason-filter"><option value="">All reasons</option>';
+      Object.keys(r.byReason).sort().forEach(function(reason) {
+        html += '<option value="' + esc(reason) + '"' + (r.reasonFilter === reason ? ' selected' : '') + '>' + esc(reason) + ' (' + r.byReason[reason] + ')</option>';
+      });
+      html += '</select>';
+      html += '<select id="rejected-kind-filter" data-action="rejected-kind-filter"><option value="">All kinds</option>';
+      ['node', 'edge'].forEach(function(kind) {
+        html += '<option value="' + kind + '"' + (r.kindFilter === kind ? ' selected' : '') + '>' + kind + '</option>';
+      });
+      html += '</select></div>';
+
+      html += '<div class="card">';
+      if (filtered.length === 0) {
+        html += '<div class="empty-state"><div class="empty-icon">&#128203;</div><p>No rejected assertions</p><p style="font-size:12px;color:var(--ink-faint);font-style:italic;">Every extracted node and edge passed the closed-vocabulary checks.</p></div>';
+      } else {
+        html += '<table><thead><tr><th>Kind</th><th>Reason</th><th>Record</th><th>Captured</th></tr></thead><tbody>';
+        filtered.forEach(function(x) {
+          var rec = x.record || {};
+          var detail;
+          if (x.kind === 'node') {
+            detail = esc(rec.name || rec.id || '') + ' <span style="color:var(--ink-faint);font-family:var(--font-mono);">' + esc(rec.type || '') + '</span>';
+          } else {
+            var src = rec.sourceName || rec.sourceNodeId || '';
+            var tgt = rec.targetName || rec.targetNodeId || '';
+            detail = '<span style="color:var(--ink-faint);font-family:var(--font-mono);">' + esc(rec.type || '') + '</span> ' + esc(truncate(String(src), 28)) + ' &rarr; ' + esc(truncate(String(tgt), 28));
+          }
+          html += '<tr>';
+          html += '<td><span class="badge ' + (x.kind === 'node' ? 'badge-blue' : 'badge-purple') + '">' + esc(x.kind) + '</span></td>';
+          html += '<td style="font-family:var(--font-mono);font-size:11px;">' + esc(x.reason) + '</td>';
+          html += '<td>' + detail + '</td>';
+          html += '<td title="' + esc(x.capturedAt || '') + '" style="font-size:11px;color:var(--ink-faint);">' + esc(relativeTime(x.capturedAt)) + '</td>';
+          html += '</tr>';
+        });
+        html += '</tbody></table>';
+      }
+      html += '</div>';
+
+      el.innerHTML = html;
     }
 
     async function loadProfile() {
@@ -3799,8 +4026,7 @@
       pollTimer = setInterval(function() {
         tick++;
         if (state.activeTab === 'dashboard') {
-          state.dashboard.loaded = false;
-          loadDashboard();
+          refreshDashboard();
         } else if (state.activeTab === 'memories') {
           state.memories.loaded = false;
           loadMemories();
@@ -3964,8 +4190,7 @@
         }
       }
       if (state.activeTab === 'dashboard') {
-        state.dashboard.loaded = false;
-        loadDashboard();
+        refreshDashboard();
       }
       if (state.activeTab === 'activity' && msg.observation) {
         state.activity.observations.unshift(msg.observation);
@@ -4042,9 +4267,9 @@
           kind: 'info',
           icon: '&#9881;',
           title: 'Running in BM25-only mode',
-          keyLabel: 'OPENAI_API_KEY',
-          desc: 'Semantic vector search is off. BM25 keyword search is active and good for exact matches.',
-          enable: 'export OPENAI_API_KEY=sk-...\n# or VOYAGE_API_KEY, COHERE_API_KEY, OLLAMA_HOST',
+          keyLabel: 'EMBEDDING_PROVIDER',
+          desc: 'Semantic vector search is off. BM25 keyword search is active. Set local embeddings to add on-device semantic vector search.',
+          enable: 'EMBEDDING_PROVIDER=local\n# add this to ~/.agentmemory/.env, then restart agentmemory',
           docs: 'https://github.com/rohitg00/agentmemory#embedding-providers',
           dismissKey: '__embedding_none',
         });
@@ -4138,6 +4363,25 @@
       if (!card) return;
       e.preventDefault();
       card.click();
+    });
+
+    // Delegated change handling for data-action selects (CSP forbids inline
+    // handlers, and the Rejected tab re-renders its own toolbar on every filter).
+    document.addEventListener('change', function(e) {
+      if (!(e.target instanceof Element)) return;
+      var select = e.target.closest('[data-action]');
+      if (!select) return;
+      var changeAction = select.getAttribute('data-action');
+      if (changeAction === 'rejected-reason-filter') {
+        state.rejected.reasonFilter = select.value;
+        renderRejected();
+        return;
+      }
+      if (changeAction === 'rejected-kind-filter') {
+        state.rejected.kindFilter = select.value;
+        renderRejected();
+        return;
+      }
     });
 
     document.addEventListener('click', function(e) {

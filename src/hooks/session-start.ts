@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-import { resolveProject, hookCwd } from "./_project.js";
+import { resolveProjectPayload, hookCwd } from "./_project.js";
+import { createHookDelivery, hookSessionId } from "./_delivery.js";
 
 // Inlined from ./sdk-guard so each hook bundles to a single self-contained
 // .mjs (matches the pattern used by every other hook entry in tsdown.config).
@@ -68,43 +69,49 @@ async function main() {
   if (!data || typeof data !== "object") return;
   if (isSdkChildContext(data)) return;
 
-  const sessionId =
-    ((data.session_id || data.sessionId || data.conversation_id) as string) ||
-    `ses_${Date.now().toString(36)}`;
+  const sessionId = hookSessionId(data);
+  if (!sessionId) return;
   const cwd = hookCwd(data) || process.cwd();
-  const project = resolveProject(cwd);
-
-  const url = `${REST_URL}/agentmemory/session/start`;
-  const init: RequestInit = {
-    method: "POST",
-    headers: authHeaders(),
-    body: JSON.stringify({ sessionId, project, cwd }),
+  const projectPayload = resolveProjectPayload(cwd);
+  const rawAgentId = data.agent_id ?? data.agentId;
+  const agentId = typeof rawAgentId === "string" && rawAgentId.trim()
+    ? rawAgentId.trim().slice(0, 128)
+    : undefined;
+  const startBody = {
+    sessionId,
+    ...projectPayload,
+    cwd,
+    ...(agentId ? { agentId } : {}),
+    includeContext: false,
   };
+  const delivery = createHookDelivery({ timeoutMs: REGISTER_TIMEOUT_MS });
+
+  await delivery.deliver("/agentmemory/session/start", startBody);
 
   if (!INJECT_CONTEXT) {
-    // Pure telemetry path: caller never reads the response, so don't
-    // block on it. AbortSignal.timeout caps the wait the event loop
-    // gives the pending socket before exit.
-    fetch(url, {
-      ...init,
-      signal: AbortSignal.timeout(REGISTER_TIMEOUT_MS),
-    }).catch(() => {});
     return;
   }
 
   try {
-    const res = await fetch(url, {
-      ...init,
+    const res = await fetch(`${REST_URL}/agentmemory/context`, {
+      method: "POST",
+      headers: authHeaders(),
+      body: JSON.stringify({
+        sessionId,
+        project: projectPayload.project,
+        ...(agentId ? { agentId } : {}),
+      }),
       signal: AbortSignal.timeout(INJECT_TIMEOUT_MS),
     });
-    if (res.ok) {
+    if (!res.ok) return;
+    try {
       const result = (await res.json()) as { context?: string };
-      if (result.context) {
-        process.stdout.write(contextPayload(data, result.context));
-      }
+      if (result.context) process.stdout.write(contextPayload(data, result.context));
+    } catch {
+      // Context injection is optional and must not block session capture.
     }
   } catch {
-    // silently fail -- don't block Claude Code startup
+    // Context injection is optional and must not block session capture.
   }
 }
 

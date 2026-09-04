@@ -15,13 +15,43 @@ import {
 } from "../prompts/compression.js";
 import { VISION_DESCRIPTION_PROMPT } from "../prompts/vision.js";
 import { getXmlTag, getXmlChildren } from "../prompts/xml.js";
-import { getSearchIndex, vectorIndexAddGuarded } from "./search.js";
+import {
+  getSearchIndex,
+  scheduleIndexSave,
+  vectorIndexAddGuarded,
+} from "./search.js";
 import { CompressOutputSchema } from "../eval/schemas.js";
 import { validateOutput } from "../eval/validator.js";
 import { scoreCompression } from "../eval/quality.js";
 import { compressWithRetry } from "../eval/self-correct.js";
 import type { MetricsStore } from "../eval/metrics-store.js";
 import { logger } from "../logger.js";
+import { observationRetrievalMetadata } from "../state/retrieval-scope.js";
+import { isProviderCapacityError } from "../providers/resilient.js";
+import { ProjectionCoordinator } from "./projection-coordinator.js";
+
+export type CompressionRequest = {
+  observationId: string;
+  sessionId: string;
+  raw: RawObservation;
+};
+
+export type CompressionResult =
+  | {
+      success: true;
+      compressed: CompressedObservation;
+      qualityScore: number;
+    }
+  | {
+      success: false;
+      error: string;
+      retryable?: boolean;
+      deferred?: boolean;
+    };
+
+export type CompressionCore = (
+  data: CompressionRequest,
+) => Promise<CompressionResult>;
 
 const VALID_TYPES = new Set<string>([
   "file_read",
@@ -69,13 +99,9 @@ export function registerCompressFunction(
   kv: StateKV,
   provider: MemoryProvider,
   metricsStore?: MetricsStore,
-): void {
-  sdk.registerFunction("mem::compress", 
-    async (data: {
-      observationId: string;
-      sessionId: string;
-      raw: RawObservation;
-    }) => {
+  coordinator = new ProjectionCoordinator(),
+): CompressionCore {
+  const core: CompressionCore = async (data) => {
       const startMs = Date.now();
 
       let imageDescription: string | undefined;
@@ -166,6 +192,11 @@ export function registerCompressFunction(
           ...(imageDescription ? { imageDescription } : {}),
           ...(data.raw.imageData ? { imageRef: data.raw.imageData } : {}),
           ...(data.raw.agentId ? { agentId: data.raw.agentId } : {}),
+          ...(data.raw.sourceClient ? { sourceClient: data.raw.sourceClient } : {}),
+          ...(data.raw.projectId ? { projectId: data.raw.projectId } : {}),
+          ...(data.raw.projectName ? { projectName: data.raw.projectName } : {}),
+          visibility: data.raw.visibility ?? "project",
+          sourceKind: "observation",
           ...(data.raw.origin ? { origin: data.raw.origin } : {}),
         };
 
@@ -191,7 +222,9 @@ export function registerCompressFunction(
           compressed.sessionId,
           compressed.title + " " + (compressed.narrative || ""),
           { kind: "observation", logId: compressed.id },
+          observationRetrievalMetadata(compressed),
         );
+        scheduleIndexSave();
 
         const streamResults = await Promise.allSettled([
           sdk.trigger({
@@ -257,12 +290,32 @@ export function registerCompressFunction(
         if (metricsStore) {
           await metricsStore.record("mem::compress", latencyMs, false);
         }
+        if (isProviderCapacityError(err)) {
+          logger.warn("Compression deferred while provider capacity is full", {
+            obsId: data.observationId,
+          });
+          return {
+            success: false,
+            error: "provider_capacity_timeout",
+            retryable: true,
+          };
+        }
         logger.error("Compression failed", {
           obsId: data.observationId,
           error: msg,
         });
         return { success: false, error: "compression_failed" };
       }
-    },
-  );
+  };
+
+  sdk.registerFunction("mem::compress", async (data: CompressionRequest) => {
+    const run = await coordinator.run(
+      { stage: "compression", sourceId: data.observationId },
+      () => core(data),
+    );
+    return run.accepted
+      ? run.value
+      : { success: false, deferred: true, error: run.error };
+  });
+  return core;
 }

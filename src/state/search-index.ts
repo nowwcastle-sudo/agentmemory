@@ -1,13 +1,33 @@
-import type { CompressedObservation } from "../types.js";
+import type {
+  CompressedObservation,
+  GraphSourceKind,
+  GraphSourceLocator,
+  GraphVisibility,
+  RetrievalScope,
+} from "../types.js";
 import { stem } from "./stemmer.js";
 import { getSynonyms } from "./synonyms.js";
 import { segmentCjk, hasCjk } from "./cjk-segmenter.js";
+import {
+  matchesRetrievalScope,
+  observationRetrievalMetadata,
+} from "./retrieval-scope.js";
 
 interface IndexEntry {
   obsId: string;
   sessionId: string;
   termCount: number;
+  sourceKind?: GraphSourceKind;
+  projectId?: string;
+  actorAgentId?: string;
+  visibility?: GraphVisibility;
 }
+
+type PersistedIndexDocument = [
+  string,
+  IndexEntry,
+  Array<[string, number]>,
+];
 
 export class SearchIndex {
   private entries: Map<string, IndexEntry> = new Map();
@@ -29,10 +49,17 @@ export class SearchIndex {
       termCount++;
     }
 
+    const metadata = observationRetrievalMetadata(obs);
     this.entries.set(obs.id, {
       obsId: obs.id,
       sessionId: obs.sessionId,
       termCount,
+      ...(metadata.sourceKind ? { sourceKind: metadata.sourceKind } : {}),
+      ...(metadata.projectId ? { projectId: metadata.projectId } : {}),
+      ...(metadata.actorAgentId
+        ? { actorAgentId: metadata.actorAgentId }
+        : {}),
+      ...(metadata.visibility ? { visibility: metadata.visibility } : {}),
     });
     this.docTermCounts.set(obs.id, termFreq);
     this.totalDocLength += termCount;
@@ -77,13 +104,23 @@ export class SearchIndex {
   search(
     query: string,
     limit = 20,
-  ): Array<{ obsId: string; sessionId: string; score: number }> {
+    scope?: RetrievalScope,
+  ): Array<{
+    obsId: string;
+    sessionId: string;
+    score: number;
+    source: GraphSourceLocator;
+  }> {
     const rawTerms = this.tokenize(query.toLowerCase());
     if (rawTerms.length === 0) return [];
 
-    const N = this.entries.size;
+    const scopedEntries = Array.from(this.entries.values()).filter((entry) =>
+      matchesRetrievalScope(entry, scope),
+    );
+    const N = scopedEntries.length;
     if (N === 0) return [];
-    const avgDocLen = this.totalDocLength / N;
+    const avgDocLen =
+      scopedEntries.reduce((total, entry) => total + entry.termCount, 0) / N;
 
     const queryTerms: Array<{ term: string; weight: number }> = [];
     const seen = new Set<string>();
@@ -106,10 +143,14 @@ export class SearchIndex {
     for (const { term, weight } of queryTerms) {
       const matchingDocs = this.invertedIndex.get(term);
       if (matchingDocs) {
-        const df = matchingDocs.size;
+        const scopedDocs = Array.from(matchingDocs).filter((obsId) =>
+          matchesRetrievalScope(this.entries.get(obsId)!, scope),
+        );
+        const df = scopedDocs.length;
+        if (df === 0) continue;
         const idf = Math.log((N - df + 0.5) / (df + 0.5) + 1);
 
-        for (const obsId of matchingDocs) {
+        for (const obsId of scopedDocs) {
           const entry = this.entries.get(obsId)!;
           const docTerms = this.docTermCounts.get(obsId);
           const tf = docTerms?.get(term) || 0;
@@ -131,10 +172,14 @@ export class SearchIndex {
         if (indexTerm === term) continue;
 
         const obsIds = this.invertedIndex.get(indexTerm)!;
-        const prefixDf = obsIds.size;
+        const scopedObsIds = Array.from(obsIds).filter((obsId) =>
+          matchesRetrievalScope(this.entries.get(obsId)!, scope),
+        );
+        const prefixDf = scopedObsIds.length;
+        if (prefixDf === 0) continue;
         const prefixIdf =
           Math.log((N - prefixDf + 0.5) / (prefixDf + 0.5) + 1) * 0.5;
-        for (const obsId of obsIds) {
+        for (const obsId of scopedObsIds) {
           const entry = this.entries.get(obsId)!;
           const docTerms = this.docTermCounts.get(obsId);
           const tf = docTerms?.get(indexTerm) || 0;
@@ -153,7 +198,12 @@ export class SearchIndex {
     return Array.from(scores.entries())
       .map(([obsId, score]) => {
         const entry = this.entries.get(obsId)!;
-        return { obsId, sessionId: entry.sessionId, score };
+        return {
+          obsId,
+          sessionId: entry.sessionId,
+          score,
+          source: this.entryLocator(entry),
+        };
       })
       .sort((a, b) => b.score - a.score)
       .slice(0, limit);
@@ -192,20 +242,16 @@ export class SearchIndex {
   }
 
   serialize(): string {
-    const entries = Array.from(this.entries.entries());
-    const inverted = Array.from(this.invertedIndex.entries()).map(
-      ([term, ids]) => [term, Array.from(ids)] as [string, string[]],
-    );
-    const docTerms = Array.from(this.docTermCounts.entries()).map(
-      ([id, counts]) =>
-        [id, Array.from(counts.entries())] as [string, [string, number][]],
+    const documents = Array.from(this.entries.entries()).map(
+      ([id, entry]) => [
+        id,
+        entry,
+        Array.from(this.docTermCounts.get(id)?.entries() ?? []),
+      ] as PersistedIndexDocument,
     );
     return JSON.stringify({
-      v: 2,
-      entries,
-      inverted,
-      docTerms,
-      totalDocLength: this.totalDocLength,
+      v: 3,
+      documents,
     });
   }
 
@@ -213,6 +259,24 @@ export class SearchIndex {
     try {
       const idx = new SearchIndex();
       const data = JSON.parse(json);
+      if (data?.v === 3 && Array.isArray(data.documents)) {
+        for (const [
+          key,
+          entry,
+          persistedCounts,
+        ] of data.documents as PersistedIndexDocument[]) {
+          const counts = new Map(persistedCounts);
+          idx.entries.set(key, entry);
+          idx.docTermCounts.set(key, counts);
+          idx.totalDocLength += entry.termCount;
+          for (const term of counts.keys()) {
+            const postingList = idx.invertedIndex.get(term) ?? new Set<string>();
+            postingList.add(key);
+            idx.invertedIndex.set(term, postingList);
+          }
+        }
+        return idx;
+      }
       if (!data?.entries || !data?.inverted || !data?.docTerms) return idx;
       for (const [key, val] of data.entries) {
         idx.entries.set(key, val);
@@ -277,5 +341,19 @@ export class SearchIndex {
       else hi = mid;
     }
     return lo;
+  }
+
+  private entryLocator(entry: IndexEntry): GraphSourceLocator {
+    return {
+      sourceKind: entry.sourceKind ??
+        (entry.obsId.startsWith("mem_") ? "memory" : "observation"),
+      sourceId: entry.obsId,
+      sessionId: entry.sessionId,
+      ...(entry.projectId ? { projectId: entry.projectId } : {}),
+      ...(entry.actorAgentId
+        ? { actorAgentId: entry.actorAgentId }
+        : {}),
+      ...(entry.visibility ? { visibility: entry.visibility } : {}),
+    };
   }
 }

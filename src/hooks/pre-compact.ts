@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-import { resolveProject, hookCwd } from "./_project.js";
+import { resolveProjectPayload, hookCwd } from "./_project.js";
+import { defaultHookDelivery, hookSessionId, stableHookCaptureId } from "./_delivery.js";
 
 function isSdkChildContext(payload: unknown): boolean {
   if (process.env["AGENTMEMORY_SDK_CHILD"] === "1") return true;
@@ -32,27 +33,39 @@ async function main() {
   if (!data || typeof data !== "object") return;
   if (isSdkChildContext(data)) return;
 
-  const sessionId = ((data.session_id || data.sessionId || data.conversation_id) as string) || "unknown";
-  const project = resolveProject(hookCwd(data));
+  const sessionId = hookSessionId(data);
+  if (!sessionId) return;
+  const cwd = hookCwd(data) || process.cwd();
+  const projectPayload = resolveProjectPayload(cwd);
+  const delivery = defaultHookDelivery();
+
+  await delivery.deliver("/agentmemory/observe", {
+    captureId: stableHookCaptureId(
+      sessionId,
+      "pre_compact",
+      data.turn_id ?? data.trigger ?? "pre-compact",
+    ),
+    hookType: "pre_compact",
+    sessionId,
+    ...projectPayload,
+    cwd,
+    ...(typeof data.agent_id === "string" ? { agentId: data.agent_id } : {}),
+    timestamp: new Date().toISOString(),
+    data: {
+      trigger: data.trigger,
+      turn_id: data.turn_id,
+    },
+  });
 
   if (process.env["CLAUDE_MEMORY_BRIDGE"] === "true") {
-    try {
-      await fetch(`${REST_URL}/agentmemory/claude-bridge/sync`, {
-        method: "POST",
-        headers: authHeaders(),
-        body: JSON.stringify({}),
-        signal: AbortSignal.timeout(5000),
-      });
-    } catch {
-      // best-effort
-    }
+    await delivery.deliver("/agentmemory/claude-bridge/sync", {});
   }
 
   try {
     const res = await fetch(`${REST_URL}/agentmemory/context`, {
       method: "POST",
       headers: authHeaders(),
-      body: JSON.stringify({ sessionId, project, budget: 1500 }),
+      body: JSON.stringify({ sessionId, project: projectPayload.project, budget: 1500 }),
       signal: AbortSignal.timeout(5000),
     });
 

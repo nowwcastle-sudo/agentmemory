@@ -69,7 +69,8 @@ function buildGraphClusters(
   const conceptNodeIds = new Set(conceptNodes.map((n) => n.id));
 
   for (const seed of sorted) {
-    if (visited.has(seed.id) || clusters.length >= maxClusters) break;
+    if (visited.has(seed.id)) continue;
+    if (clusters.length >= maxClusters) break;
 
     const cluster: string[] = [];
     const queue = [seed.id];
@@ -133,7 +134,8 @@ function buildJaccardClusters(
   const clusters: string[][] = [];
 
   for (const concept of conceptList) {
-    if (visited.has(concept) || clusters.length >= maxClusters) break;
+    if (visited.has(concept)) continue;
+    if (clusters.length >= maxClusters) break;
 
     const cluster = [concept];
     visited.add(concept);
@@ -166,8 +168,15 @@ export function registerReflectFunctions(
   provider: MemoryProvider,
 ): void {
   sdk.registerFunction("mem::reflect", 
-    async (data: { maxClusters?: number; project?: string }) => {
-      const maxClusters = Math.min(data?.maxClusters ?? 10, 20);
+    async (data: {
+      maxClusters?: number;
+      offset?: number;
+      project?: string;
+      strict?: boolean;
+      previousSourceFingerprint?: string;
+    }) => {
+      const maxClusters = Math.max(1, Math.min(data?.maxClusters ?? 10, 20));
+      const offset = Math.max(0, Math.floor(data?.offset ?? 0));
       const maxInsightsPerCluster = 5;
       const maxTotal = 50;
 
@@ -185,25 +194,61 @@ export function registerReflectFunctions(
         activeLessons = activeLessons.filter((l) => l.project === data.project);
       }
 
-      let conceptClusters = buildGraphClusters(
+      let allConceptClusters = buildGraphClusters(
         graphNodes,
         graphEdges,
-        maxClusters,
+        20,
       );
 
-      const usedFallback = conceptClusters.length === 0;
+      const usedFallback = allConceptClusters.length === 0;
       if (usedFallback) {
-        conceptClusters = buildJaccardClusters(
+        allConceptClusters = buildJaccardClusters(
           semanticMemories,
           activeLessons,
-          maxClusters,
+          20,
         );
       }
+      const sourceFingerprint = fingerprintId(
+        "maintenance-reflect",
+        JSON.stringify({
+          project: data?.project,
+          clusters: allConceptClusters,
+          semantic: semanticMemories
+            .map((item) => [item.id, item.updatedAt])
+            .sort((a, b) => String(a[0]).localeCompare(String(b[0]))),
+          lessons: activeLessons
+            .map((item) => [item.id, item.updatedAt])
+            .sort((a, b) => String(a[0]).localeCompare(String(b[0]))),
+          crystals: crystals
+            .map((item) => item.id)
+            .sort((a, b) => a.localeCompare(b)),
+        }),
+      );
+      if (
+        offset === 0 &&
+        data?.previousSourceFingerprint === sourceFingerprint
+      ) {
+        return {
+          success: true,
+          skipped: true,
+          reason: "source unchanged",
+          sourceFingerprint,
+        };
+      }
+      const conceptClusters = allConceptClusters.slice(
+        offset,
+        offset + maxClusters,
+      );
+      const nextOffset =
+        offset + conceptClusters.length < allConceptClusters.length
+          ? offset + conceptClusters.length
+          : undefined;
 
       let newInsights = 0;
       let reinforced = 0;
       let clustersSkipped = 0;
       let totalInsights = 0;
+      let firstError: string | undefined;
 
       for (const conceptNames of conceptClusters) {
         if (totalInsights >= maxTotal) break;
@@ -308,7 +353,10 @@ export function registerReflectFunctions(
             clusterCount++;
             totalInsights++;
           }
-        } catch {
+        } catch (error) {
+          firstError =
+            firstError ??
+            (error instanceof Error ? error.message : String(error));
           continue;
         }
       }
@@ -324,12 +372,15 @@ export function registerReflectFunctions(
       } catch {}
 
       return {
-        success: true,
+        success: !(data?.strict && firstError),
+        ...(data?.strict && firstError ? { error: firstError } : {}),
         newInsights,
         reinforced,
         clustersProcessed: conceptClusters.length - clustersSkipped,
         clustersSkipped,
         usedFallback,
+        sourceFingerprint,
+        ...(nextOffset !== undefined ? { nextOffset } : {}),
       };
     },
   );

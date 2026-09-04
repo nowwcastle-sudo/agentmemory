@@ -7,6 +7,8 @@ import {
   ADAPTERS,
   knownAgents,
   resolveAdapter,
+  runAdapter,
+  runConnect,
 } from "../src/cli/connect/index.js";
 import type { ConnectAdapter } from "../src/cli/connect/types.js";
 
@@ -78,6 +80,101 @@ describe("agentmemory connect — dispatcher", () => {
     }
   });
 
+  it("uses staged probes for Claude Code, Codex, and Hermes", () => {
+    for (const name of ["claude-code", "codex", "hermes"]) {
+      expect(typeof resolveAdapter(name)?.probe, `${name} probe`).toBe("function");
+    }
+  });
+
+  it("does not run an installer when a staged probe is config-only", async () => {
+    const install = vi.fn();
+    const adapter: ConnectAdapter = {
+      name: "config-only",
+      displayName: "Config Only",
+      category: "native",
+      detect: () => true,
+      probe: () => ({
+        presence: "config-only",
+        usable: false,
+        wiring: "unwired",
+        activation: "not-checked",
+        durability: "not-checked",
+        reason: "executable-not-found",
+      }),
+      install,
+    };
+
+    await expect(
+      runAdapter(adapter, { dryRun: true, force: false }),
+    ).resolves.toEqual({ kind: "skipped", reason: "executable-not-found" });
+    expect(install).not.toHaveBeenCalled();
+  });
+
+  it("disables external version execution only for dry-run staged probes", async () => {
+    const probe = vi.fn(() => ({
+      presence: "executable" as const,
+      usable: true,
+      executablePath: "C:\\fake\\agent.exe",
+      wiring: "unwired" as const,
+      activation: "not-checked" as const,
+      durability: "not-checked" as const,
+    }));
+    const install = vi.fn(async () => ({ kind: "installed" as const }));
+    const adapter: ConnectAdapter = {
+      name: "probe-options",
+      displayName: "Probe Options",
+      category: "native",
+      detect: () => true,
+      probe,
+      install,
+    };
+
+    await runAdapter(adapter, {
+      dryRun: true,
+      force: false,
+      guidelines: false,
+    });
+    expect(probe).toHaveBeenLastCalledWith({ executeVersion: false });
+
+    await runAdapter(adapter, {
+      dryRun: false,
+      force: false,
+      guidelines: false,
+    });
+    expect(probe).toHaveBeenLastCalledWith({ executeVersion: true });
+  });
+
+  it("keeps --all dry-run discovery and installation probes execution-free", async () => {
+    const original = [...ADAPTERS];
+    const probe = vi.fn(() => ({
+      presence: "executable" as const,
+      usable: true,
+      executablePath: "C:\\fake\\agent.exe",
+      wiring: "unwired" as const,
+      activation: "not-checked" as const,
+      durability: "not-checked" as const,
+    }));
+    const adapter: ConnectAdapter = {
+      name: "all-dry-run",
+      displayName: "All Dry Run",
+      category: "native",
+      detect: () => true,
+      probe,
+      install: vi.fn(async () => ({ kind: "installed" as const })),
+    };
+
+    ADAPTERS.splice(0, ADAPTERS.length, adapter);
+    try {
+      await runConnect(["--all", "--dry-run", "--no-guidelines"]);
+      expect(probe).toHaveBeenCalledTimes(2);
+      for (const call of probe.mock.calls) {
+        expect(call).toEqual([{ executeVersion: false }]);
+      }
+    } finally {
+      ADAPTERS.splice(0, ADAPTERS.length, ...original);
+    }
+  });
+
   it("every adapter declares a category so onboarding never needs a separate list (#872)", () => {
     for (const a of ADAPTERS) {
       expect(
@@ -92,13 +189,16 @@ describe("agentmemory connect — claude-code adapter (mock filesystem)", () => 
   let tmpHome: string;
   let originalHome: string | undefined;
   let originalUserprofile: string | undefined;
+  let originalPath: string | undefined;
 
   beforeEach(() => {
     tmpHome = mkdtempSync(join(tmpdir(), "am-connect-"));
     originalHome = process.env["HOME"];
     originalUserprofile = process.env["USERPROFILE"];
+    originalPath = process.env["PATH"];
     process.env["HOME"] = tmpHome;
     process.env["USERPROFILE"] = tmpHome;
+    process.env["PATH"] = "";
     vi.resetModules();
   });
 
@@ -108,6 +208,8 @@ describe("agentmemory connect — claude-code adapter (mock filesystem)", () => 
     if (originalUserprofile !== undefined)
       process.env["USERPROFILE"] = originalUserprofile;
     else delete process.env["USERPROFILE"];
+    if (originalPath !== undefined) process.env["PATH"] = originalPath;
+    else delete process.env["PATH"];
     rmSync(tmpHome, { recursive: true, force: true });
     vi.resetModules();
   });
@@ -131,7 +233,11 @@ describe("agentmemory connect — claude-code adapter (mock filesystem)", () => 
     );
 
     const a = await loadAdapter();
-    expect(a.detect()).toBe(true);
+    expect(a.probe?.()).toMatchObject({
+      presence: "config-only",
+      usable: false,
+    });
+    expect(a.detect()).toBe(false);
 
     const first = await a.install({ dryRun: false, force: false });
     expect(first.kind).toBe("installed");
@@ -485,13 +591,7 @@ describe("agentmemory connect — copilot-cli adapter (mock filesystem)", () => 
   });
 });
 
-describe("agentmemory connect — stub adapters log + return stub", () => {
-  it("hermes adapter returns stub regardless of detect", async () => {
-    const { adapter } = await import("../src/cli/connect/hermes.js");
-    const result = await adapter.install({ dryRun: false, force: false });
-    expect(result.kind).toBe("stub");
-  });
-
+describe("agentmemory connect — remaining stub adapters log + return stub", () => {
   it("openhuman adapter returns stub", async () => {
     const { adapter } = await import("../src/cli/connect/openhuman.js");
     const result = await adapter.install({ dryRun: false, force: false });

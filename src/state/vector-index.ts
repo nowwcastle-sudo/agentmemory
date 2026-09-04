@@ -1,3 +1,12 @@
+import type {
+  GraphSourceKind,
+  GraphSourceLocator,
+  GraphVisibility,
+  RetrievalMetadata,
+  RetrievalScope,
+} from "../types.js";
+import { matchesRetrievalScope } from "./retrieval-scope.js";
+
 // Pass byteOffset + byteLength explicitly so the round-trip survives
 // Node's Buffer pool. Buffer.from(b64, "base64") returns a slice of a
 // shared 8KB pool (poolSize), and `new Float32Array(buf.buffer)` ignores
@@ -35,11 +44,34 @@ function cosineSimilarity(a: Float32Array, b: Float32Array): number {
 }
 
 export class VectorIndex {
-  private vectors: Map<string, { embedding: Float32Array; sessionId: string }> =
-    new Map();
+  private vectors: Map<
+    string,
+    {
+      embedding: Float32Array;
+      sessionId: string;
+      sourceKind?: GraphSourceKind;
+      projectId?: string;
+      actorAgentId?: string;
+      visibility?: GraphVisibility;
+    }
+  > = new Map();
 
-  add(obsId: string, sessionId: string, embedding: Float32Array): void {
-    this.vectors.set(obsId, { embedding, sessionId });
+  add(
+    obsId: string,
+    sessionId: string,
+    embedding: Float32Array,
+    metadata: RetrievalMetadata = {},
+  ): void {
+    this.vectors.set(obsId, {
+      embedding,
+      sessionId,
+      ...(metadata.sourceKind ? { sourceKind: metadata.sourceKind } : {}),
+      ...(metadata.projectId ? { projectId: metadata.projectId } : {}),
+      ...(metadata.actorAgentId
+        ? { actorAgentId: metadata.actorAgentId }
+        : {}),
+      ...(metadata.visibility ? { visibility: metadata.visibility } : {}),
+    });
   }
 
   remove(obsId: string): void {
@@ -49,24 +81,38 @@ export class VectorIndex {
   search(
     query: Float32Array,
     limit = 20,
-  ): Array<{ obsId: string; sessionId: string; score: number }> {
+    scope?: RetrievalScope,
+  ): Array<{
+    obsId: string;
+    sessionId: string;
+    score: number;
+    source: GraphSourceLocator;
+  }> {
     const results: Array<{
       obsId: string;
       sessionId: string;
       score: number;
+      source: GraphSourceLocator;
     }> = [];
     let minScore = -Infinity;
 
     for (const [obsId, entry] of this.vectors) {
+      if (!matchesRetrievalScope(entry, scope)) continue;
       const score = cosineSimilarity(query, entry.embedding);
+      const result = {
+        obsId,
+        sessionId: entry.sessionId,
+        score,
+        source: this.entryLocator(obsId, entry),
+      };
       if (results.length < limit) {
-        results.push({ obsId, sessionId: entry.sessionId, score });
+        results.push(result);
         if (results.length === limit) {
           results.sort((a, b) => a.score - b.score);
           minScore = results[0].score;
         }
       } else if (score > minScore) {
-        results[0] = { obsId, sessionId: entry.sessionId, score };
+        results[0] = result;
         results.sort((a, b) => a.score - b.score);
         minScore = results[0].score;
       }
@@ -110,25 +156,54 @@ export class VectorIndex {
   restoreFrom(other: VectorIndex): void {
     const src = (other as any).vectors as Map<
       string,
-      { embedding: Float32Array; sessionId: string }
+      {
+        embedding: Float32Array;
+        sessionId: string;
+        sourceKind?: GraphSourceKind;
+        projectId?: string;
+        actorAgentId?: string;
+        visibility?: GraphVisibility;
+      }
     >;
     this.vectors = new Map();
     for (const [obsId, entry] of src) {
       this.vectors.set(obsId, {
         embedding: new Float32Array(entry.embedding),
         sessionId: entry.sessionId,
+        ...(entry.sourceKind ? { sourceKind: entry.sourceKind } : {}),
+        ...(entry.projectId ? { projectId: entry.projectId } : {}),
+        ...(entry.actorAgentId
+          ? { actorAgentId: entry.actorAgentId }
+          : {}),
+        ...(entry.visibility ? { visibility: entry.visibility } : {}),
       });
     }
   }
 
   serialize(): string {
-    const data: Array<[string, { embedding: string; sessionId: string }]> = [];
+    const data: Array<[
+      string,
+      {
+        embedding: string;
+        sessionId: string;
+        sourceKind?: GraphSourceKind;
+        projectId?: string;
+        actorAgentId?: string;
+        visibility?: GraphVisibility;
+      },
+    ]> = [];
     for (const [obsId, entry] of this.vectors) {
       data.push([
         obsId,
         {
           embedding: float32ToBase64(entry.embedding),
           sessionId: entry.sessionId,
+          ...(entry.sourceKind ? { sourceKind: entry.sourceKind } : {}),
+          ...(entry.projectId ? { projectId: entry.projectId } : {}),
+          ...(entry.actorAgentId
+            ? { actorAgentId: entry.actorAgentId }
+            : {}),
+          ...(entry.visibility ? { visibility: entry.visibility } : {}),
         },
       ]);
     }
@@ -157,11 +232,47 @@ export class VectorIndex {
         idx.vectors.set(obsId, {
           embedding: base64ToFloat32(entry.embedding),
           sessionId: entry.sessionId,
+          ...(entry.sourceKind === "observation" || entry.sourceKind === "memory"
+            ? { sourceKind: entry.sourceKind }
+            : {}),
+          ...(typeof entry.projectId === "string"
+            ? { projectId: entry.projectId }
+            : {}),
+          ...(typeof entry.actorAgentId === "string"
+            ? { actorAgentId: entry.actorAgentId }
+            : {}),
+          ...(entry.visibility === "project" ||
+          entry.visibility === "agent_private"
+            ? { visibility: entry.visibility }
+            : {}),
         });
       } catch {
         continue;
       }
     }
     return idx;
+  }
+
+  private entryLocator(
+    obsId: string,
+    entry: {
+      sessionId: string;
+      sourceKind?: GraphSourceKind;
+      projectId?: string;
+      actorAgentId?: string;
+      visibility?: GraphVisibility;
+    },
+  ): GraphSourceLocator {
+    return {
+      sourceKind: entry.sourceKind ??
+        (obsId.startsWith("mem_") ? "memory" : "observation"),
+      sourceId: obsId,
+      sessionId: entry.sessionId,
+      ...(entry.projectId ? { projectId: entry.projectId } : {}),
+      ...(entry.actorAgentId
+        ? { actorAgentId: entry.actorAgentId }
+        : {}),
+      ...(entry.visibility ? { visibility: entry.visibility } : {}),
+    };
   }
 }

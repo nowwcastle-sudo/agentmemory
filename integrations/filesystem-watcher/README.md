@@ -31,6 +31,8 @@ agentmemory-fs-watcher
 
 Every file change inside the watched roots becomes a `post_tool_use` observation whose `data.changeKind` is `file_change` or `file_delete`. The first 4 KB of each text file is included as `data.content` so retrieval can match by substring; larger files are truncated with `data.truncated: true`. Binary files are not read (set `AGENTMEMORY_FS_WATCH_ALLOW_BINARY=1` to override).
 
+Each observation is written to a local outbox before delivery. Failed requests remain queued and are replayed oldest-first on startup, before later observations, and every 15 seconds. An entry is removed only after the server returns HTTP 2xx. The outbox stores observation payloads but never stores the bearer secret.
+
 Session id and project are required by the observe endpoint — set them via env, or the watcher generates a per-process `fs-watcher-<ts>-<rand>` session id and uses the first root's directory name as the project.
 
 Requires Node.js **>=20 LTS**. Recursive `fs.watch` needs Node 19.1.0+ on Linux; Node 20 is the minimum supported LTS line.
@@ -44,6 +46,7 @@ Requires Node.js **>=20 LTS**. Recursive `fs.watch` needs Node 19.1.0+ on Linux;
 | `AGENTMEMORY_FS_WATCH_ALLOW_BINARY` | `0` | `1` to include binary files in the preview read |
 | `AGENTMEMORY_URL` | `http://localhost:3111` | agentmemory server URL |
 | `AGENTMEMORY_SECRET` | — | Bearer token, required if the server has `AGENTMEMORY_SECRET` set |
+| `AGENTMEMORY_OUTBOX_DIR` | `~/.agentmemory/outbox/filesystem-watcher` | Durable delivery outbox directory |
 | `AGENTMEMORY_PROJECT` | — | Optional project label attached to each observation |
 | `AGENTMEMORY_SESSION_ID` | — | Optional session id to attribute observations to |
 

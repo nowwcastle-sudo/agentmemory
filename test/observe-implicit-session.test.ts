@@ -1,4 +1,5 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi } from "vitest";
+import { registerObserveFunction } from "../src/functions/observe.js";
 
 vi.mock("../src/logger.js", () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
@@ -57,12 +58,7 @@ function mockSdk() {
 }
 
 describe("observe implicit session create (#638)", () => {
-  beforeEach(() => {
-    vi.resetModules();
-  });
-
   it("creates the session on first observe when project+cwd present and session record missing", async () => {
-    const { registerObserveFunction } = await import("../src/functions/observe.js");
     const sdk = mockSdk();
     const kv = mockKV();
     registerObserveFunction(sdk as never, kv as never);
@@ -91,7 +87,6 @@ describe("observe implicit session create (#638)", () => {
   });
 
   it("does not implicit-create when project+cwd missing (test-payload back-compat)", async () => {
-    const { registerObserveFunction } = await import("../src/functions/observe.js");
     const sdk = mockSdk();
     const kv = mockKV();
     registerObserveFunction(sdk as never, kv as never);
@@ -109,7 +104,6 @@ describe("observe implicit session create (#638)", () => {
   });
 
   it("does not overwrite an existing session when one already exists", async () => {
-    const { registerObserveFunction } = await import("../src/functions/observe.js");
     const sdk = mockSdk();
     const kv = mockKV();
     registerObserveFunction(sdk as never, kv as never);
@@ -123,6 +117,11 @@ describe("observe implicit session create (#638)", () => {
       observationCount: 7,
       firstPrompt: "original first prompt",
     });
+    for (let i = 1; i <= 7; i++) {
+      await kv.set("mem:obs:ses_existing", `obs_existing_${i}`, {
+        id: `obs_existing_${i}`,
+      });
+    }
 
     await sdk.trigger("mem::observe", {
       sessionId: "ses_existing",

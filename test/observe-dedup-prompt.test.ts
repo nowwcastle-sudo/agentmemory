@@ -1,5 +1,7 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { mockKV, mockSdk } from "./helpers/mocks.js";
+import { registerObserveFunction } from "../src/functions/observe.js";
+import { DedupMap } from "../src/functions/dedup.js";
 
 vi.mock("../src/logger.js", () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
@@ -17,13 +19,7 @@ function observePayload(hookType: string, data: unknown) {
 }
 
 describe("observe dedup for hooks without tool_input (#1173)", () => {
-  beforeEach(() => {
-    vi.resetModules();
-  });
-
   it("records consecutive prompt_submit observations with different prompts", async () => {
-    const { registerObserveFunction } = await import("../src/functions/observe.js");
-    const { DedupMap } = await import("../src/functions/dedup.js");
     const sdk = mockSdk({ looseTrigger: true });
     const kv = mockKV();
     registerObserveFunction(sdk as never, kv as never, new DedupMap());
@@ -43,8 +39,6 @@ describe("observe dedup for hooks without tool_input (#1173)", () => {
   });
 
   it("records two prompt_submit observations whose data is distinct primitive strings", async () => {
-    const { registerObserveFunction } = await import("../src/functions/observe.js");
-    const { DedupMap } = await import("../src/functions/dedup.js");
     const sdk = mockSdk({ looseTrigger: true });
     const kv = mockKV();
     registerObserveFunction(sdk as never, kv as never, new DedupMap());
@@ -64,8 +58,6 @@ describe("observe dedup for hooks without tool_input (#1173)", () => {
   });
 
   it("still dedups an identical prompt_submit within the TTL window", async () => {
-    const { registerObserveFunction } = await import("../src/functions/observe.js");
-    const { DedupMap } = await import("../src/functions/dedup.js");
     const sdk = mockSdk({ looseTrigger: true });
     const kv = mockKV();
     registerObserveFunction(sdk as never, kv as never, new DedupMap());
@@ -85,8 +77,6 @@ describe("observe dedup for hooks without tool_input (#1173)", () => {
   });
 
   it("keeps tool_input as the dedup key for tool hooks (response changes still dedup)", async () => {
-    const { registerObserveFunction } = await import("../src/functions/observe.js");
-    const { DedupMap } = await import("../src/functions/dedup.js");
     const sdk = mockSdk({ looseTrigger: true });
     const kv = mockKV();
     registerObserveFunction(sdk as never, kv as never, new DedupMap());

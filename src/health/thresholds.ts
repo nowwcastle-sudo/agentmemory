@@ -8,6 +8,9 @@ interface ThresholdConfig {
   memoryWarnPercent: number;
   memoryCriticalPercent: number;
   memoryRssFloorBytes: number;
+  kvLatencyWarnMs: number;
+  pipelineBacklogWarnMs: number;
+  nowMs: number;
 }
 
 const DEFAULTS: ThresholdConfig = {
@@ -18,6 +21,9 @@ const DEFAULTS: ThresholdConfig = {
   memoryWarnPercent: 80,
   memoryCriticalPercent: 95,
   memoryRssFloorBytes: 512 * 1024 * 1024,
+  kvLatencyWarnMs: 2000,
+  pipelineBacklogWarnMs: 5 * 60 * 1000,
+  nowMs: 0,
 };
 
 export function evaluateHealth(
@@ -38,6 +44,20 @@ export function evaluateHealth(
     critical = true;
   } else if (snapshot.connectionState === "reconnecting") {
     alerts.push("connection_reconnecting");
+    degraded = true;
+  }
+
+  if (snapshot.kvConnectivity?.status === "error") {
+    alerts.push("kv_connectivity_error");
+    critical = true;
+  } else if (
+    snapshot.kvConnectivity?.status === "ok" &&
+    typeof snapshot.kvConnectivity.latencyMs === "number" &&
+    snapshot.kvConnectivity.latencyMs > cfg.kvLatencyWarnMs
+  ) {
+    alerts.push(
+      `kv_latency_warn_${Math.round(snapshot.kvConnectivity.latencyMs)}ms`,
+    );
     degraded = true;
   }
 
@@ -74,6 +94,44 @@ export function evaluateHealth(
     degraded = true;
   } else if (memPercent > cfg.memoryWarnPercent) {
     notes.push(`memory_heap_tight_${Math.round(memPercent)}%_rss${memMb}mb`);
+  }
+
+  const pipeline = snapshot.pipeline;
+  if (pipeline) {
+    for (const stage of ["compression", "summary", "graph"] as const) {
+      const backlog = pipeline[stage];
+      if (backlog.failed > 0) {
+        alerts.push(`${stage}_projection_failed_${backlog.failed}`);
+        degraded = true;
+      }
+      if (
+        typeof backlog.oldestPendingAgeMs === "number" &&
+        backlog.oldestPendingAgeMs > cfg.pipelineBacklogWarnMs
+      ) {
+        alerts.push(`${stage}_backlog_stale`);
+        degraded = true;
+      }
+    }
+    if (pipeline.graphSnapshot.dirty) {
+      alerts.push("graph_snapshot_dirty");
+      degraded = true;
+    }
+    const nowMs = cfg.nowMs > 0 ? cfg.nowMs : Date.now();
+    const dirtySince = pipeline.index.dirtySince
+      ? Date.parse(pipeline.index.dirtySince)
+      : Number.NaN;
+    if (
+      pipeline.index.dirty &&
+      Number.isFinite(dirtySince) &&
+      nowMs - dirtySince > cfg.pipelineBacklogWarnMs
+    ) {
+      alerts.push("index_snapshot_stale");
+      degraded = true;
+    }
+    if (pipeline.index.lastFailureAt && pipeline.index.dirty) {
+      alerts.push("index_snapshot_failed");
+      degraded = true;
+    }
   }
 
   const status = critical ? "critical" : degraded ? "degraded" : "healthy";

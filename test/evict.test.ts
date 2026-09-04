@@ -11,13 +11,6 @@ vi.mock("../src/logger.js", () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
 }));
 
-// The recovered-session consolidation pass is gated on isConsolidationEnabled
-// (keyless installs skip it); force it on so these tests exercise the pass.
-vi.mock("../src/config.js", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("../src/config.js")>()),
-  isConsolidationEnabled: () => true,
-}));
-
 type Store = Map<string, Map<string, unknown>>;
 type Handler = (payload: unknown) => unknown | Promise<unknown>;
 
@@ -42,11 +35,11 @@ function makeObservation(sessionId: string): CompressedObservation {
     sessionId,
     timestamp: daysAgo(31),
     type: "decision",
-    title: "Chose sqlite storage",
-    facts: ["Use sqlite for local state"],
-    narrative: "The session chose sqlite for local state.",
-    concepts: ["sqlite"],
-    files: ["src/state/kv.ts"],
+    title: "Chose durable local storage",
+    facts: ["Keep the session until enrichment succeeds"],
+    narrative: "The session chose durable local storage.",
+    concepts: ["durability"],
+    files: ["src/functions/evict.ts"],
     importance: 8,
   };
 }
@@ -58,7 +51,7 @@ function makeRawObservation(sessionId: string): RawObservation {
     timestamp: daysAgo(31),
     hookType: "post_tool_use",
     toolName: "Edit",
-    raw: { file_path: "src/state/kv.ts" },
+    raw: { file_path: "src/functions/evict.ts" },
   };
 }
 
@@ -75,9 +68,7 @@ function mockKV(store: Store, listFailures: Set<string> = new Set()) {
       store.get(scope)?.delete(key);
     },
     list: async <T>(scope: string): Promise<T[]> => {
-      if (listFailures.has(scope)) {
-        throw new Error(`list failed for ${scope}`);
-      }
+      if (listFailures.has(scope)) throw new Error(`list failed for ${scope}`);
       const entries = store.get(scope);
       return entries ? (Array.from(entries.values()) as T[]) : [];
     },
@@ -111,6 +102,7 @@ function storeForObservations(
   return new Map([
     [KV.sessions, new Map([[session.id, session]])],
     [KV.summaries, new Map()],
+    [KV.sessionProjections, new Map()],
     [
       KV.observations(session.id),
       new Map(observations.map((observation) => [observation.id, observation])),
@@ -125,105 +117,106 @@ function storeForObservedSession(sessionId: string): Store {
 }
 
 describe("mem::evict stale sessions", () => {
-  it("runs session recovery before deleting a stale observed session", async () => {
+  it("queues terminal recovery first and deletes only after a later succeeded sweep", async () => {
     const sessionId = "ses_stale";
     const store = storeForObservedSession(sessionId);
     const kv = mockKV(store);
     const { sdk, calls } = mockSdk();
 
     registerEvictFunction(sdk as never, kv as never);
-    sdk.registerFunction("event::session::stopped", async (payload) => {
-      // Recovery must pass skipConsolidation so the per-session fan-out is
-      // suppressed (evict runs a single corpus-wide pass afterwards).
-      expect(payload).toEqual({ sessionId, skipConsolidation: true });
+    sdk.registerFunction("event::session::ended", async (payload) => {
+      expect(payload).toEqual({ sessionId, evictAfterSuccess: true });
       expect(await kv.get(KV.sessions, sessionId)).toMatchObject({
         id: sessionId,
       });
-      return { success: true };
+      return { success: true, projectionQueued: true };
     });
-    sdk.registerFunction("mem::consolidate-pipeline", () => ({
-      success: true,
-    }));
-    sdk.registerFunction("mem::auto-crystallize", () => ({ success: true }));
+
+    const first = (await sdk.trigger({
+      function_id: "mem::evict",
+      payload: {},
+    })) as { staleSessions: number };
+
+    expect(first.staleSessions).toBe(0);
+    expect(await kv.get(KV.sessions, sessionId)).toMatchObject({ id: sessionId });
+    expect(await kv.list(KV.audit)).toHaveLength(0);
+    expect(calls.map((call) => call.function_id)).toContain(
+      "event::session::ended",
+    );
+
+    await kv.set(KV.sessionProjections, sessionId, {
+      sessionId,
+      status: "succeeded",
+      attempts: 1,
+      observationCount: 1,
+      updatedAt: new Date().toISOString(),
+      sourceFingerprint: "sha256:terminal",
+      evictAfterSuccess: true,
+    });
+    const second = (await sdk.trigger({
+      function_id: "mem::evict",
+      payload: {},
+    })) as { staleSessions: number };
+
+    expect(second.staleSessions).toBe(1);
+    expect(await kv.get(KV.sessions, sessionId)).toBeNull();
+    const audits = await kv.list<{ details: { reason: string } }>(KV.audit);
+    expect(audits[0].details.reason).toBe(
+      "stale_session_projection_succeeded_then_evicted",
+    );
+  });
+
+  it("queues every stale session without inline consolidation amplification", async () => {
+    const ids = ["ses_a", "ses_b", "ses_c"];
+    const store: Store = new Map([
+      [KV.sessions, new Map(ids.map((id) => [id, makeSession(id)]))],
+      [KV.summaries, new Map()],
+      [KV.sessionProjections, new Map()],
+      [KV.config, new Map()],
+      [KV.audit, new Map()],
+    ]);
+    for (const id of ids) {
+      store.set(KV.observations(id), new Map([["obs_1", makeObservation(id)]]));
+    }
+    const kv = mockKV(store);
+    const { sdk, calls } = mockSdk();
+    const endedPayloads: unknown[] = [];
+
+    registerEvictFunction(sdk as never, kv as never);
+    sdk.registerFunction("event::session::ended", (payload) => {
+      endedPayloads.push(payload);
+      return { success: true, projectionQueued: true };
+    });
 
     const result = (await sdk.trigger({
       function_id: "mem::evict",
       payload: {},
     })) as { staleSessions: number };
 
-    expect(result.staleSessions).toBe(1);
-    expect(await kv.get(KV.sessions, sessionId)).toBeNull();
-    const audits = await kv.list<{
-      details: { reason: string };
-    }>(KV.audit);
-    expect(audits[0].details.reason).toBe(
-      "stale_session_recovered_then_evicted",
-    );
-    expect(calls.map((call) => call.function_id)).toContain(
-      "event::session::stopped",
-    );
-    expect(calls.map((call) => call.function_id)).toContain(
-      "mem::consolidate-pipeline",
-    );
-  });
-
-  it("bounds consolidation to one pass regardless of how many stale sessions are recovered", async () => {
-    // Regression (P1): before the skipConsolidation guard, N recovered
-    // sessions each triggered a forced full-corpus consolidate + crystallize
-    // via the session::stopped fan-out, on top of evict's final pass — an
-    // N+1 amplification of an expensive LLM path. Recovery must stay O(1).
-    const ids = ["ses_a", "ses_b", "ses_c"];
-    const store: Store = new Map([
-      [
-        KV.sessions,
-        new Map(ids.map((id) => [id, makeSession(id)])),
-      ],
-      [KV.summaries, new Map()],
-      [KV.config, new Map()],
-      [KV.audit, new Map()],
-    ]);
+    expect(result.staleSessions).toBe(0);
+    expect(endedPayloads).toHaveLength(3);
     for (const id of ids) {
-      store.set(
-        KV.observations(id),
-        new Map([["obs_1", makeObservation(id)]]),
-      );
+      expect(endedPayloads).toContainEqual({
+        sessionId: id,
+        evictAfterSuccess: true,
+      });
+      expect(await kv.get(KV.sessions, id)).toMatchObject({ id });
     }
-    const kv = mockKV(store);
-    const { sdk, calls } = mockSdk();
-
-    registerEvictFunction(sdk as never, kv as never);
-    const stoppedPayloads: unknown[] = [];
-    sdk.registerFunction("event::session::stopped", (payload) => {
-      stoppedPayloads.push(payload);
-      return { success: true };
-    });
-    sdk.registerFunction("mem::consolidate-pipeline", () => ({ success: true }));
-    sdk.registerFunction("mem::auto-crystallize", () => ({ success: true }));
-
-    await sdk.trigger({ function_id: "mem::evict", payload: {} });
-
-    // session::stopped fires once per recovered session, each suppressing its
-    // own fan-out...
-    expect(stoppedPayloads).toHaveLength(3);
-    for (const p of stoppedPayloads) {
-      expect(p).toMatchObject({ skipConsolidation: true });
-    }
-    // ...and the corpus-wide consolidation + crystallization run exactly once.
-    const fnIds = calls.map((c) => c.function_id);
-    expect(fnIds.filter((f) => f === "mem::consolidate-pipeline")).toHaveLength(1);
-    expect(fnIds.filter((f) => f === "mem::auto-crystallize")).toHaveLength(1);
+    const fnIds = calls.map((call) => call.function_id);
+    expect(fnIds).not.toContain("mem::consolidate-pipeline");
+    expect(fnIds).not.toContain("mem::auto-crystallize");
   });
 
-  it("keeps a stale observed session when recovery fails", async () => {
+  it("keeps a stale observed session when terminal queueing fails", async () => {
     const sessionId = "ses_unrecovered";
     const store = storeForObservedSession(sessionId);
     const kv = mockKV(store);
     const { sdk, calls } = mockSdk();
 
     registerEvictFunction(sdk as never, kv as never);
-    sdk.registerFunction("event::session::stopped", () => ({
+    sdk.registerFunction("event::session::ended", () => ({
       success: false,
-      error: "no_provider",
+      error: "queue_unavailable",
     }));
 
     const result = (await sdk.trigger({
@@ -232,14 +225,9 @@ describe("mem::evict stale sessions", () => {
     })) as { staleSessions: number };
 
     expect(result.staleSessions).toBe(0);
-    expect(await kv.get(KV.sessions, sessionId)).toMatchObject({
-      id: sessionId,
-    });
+    expect(await kv.get(KV.sessions, sessionId)).toMatchObject({ id: sessionId });
     expect(calls.map((call) => call.function_id)).toContain(
-      "event::session::stopped",
-    );
-    expect(calls.map((call) => call.function_id)).not.toContain(
-      "mem::consolidate-pipeline",
+      "event::session::ended",
     );
   });
 
@@ -250,9 +238,7 @@ describe("mem::evict stale sessions", () => {
     const { sdk, calls } = mockSdk();
 
     registerEvictFunction(sdk as never, kv as never);
-    sdk.registerFunction("event::session::stopped", () => ({
-      success: true,
-    }));
+    sdk.registerFunction("event::session::ended", () => ({ success: true }));
 
     const result = (await sdk.trigger({
       function_id: "mem::evict",
@@ -260,26 +246,20 @@ describe("mem::evict stale sessions", () => {
     })) as { staleSessions: number };
 
     expect(result.staleSessions).toBe(0);
-    expect(await kv.get(KV.sessions, sessionId)).toMatchObject({
-      id: sessionId,
-    });
+    expect(await kv.get(KV.sessions, sessionId)).toMatchObject({ id: sessionId });
     expect(calls.map((call) => call.function_id)).not.toContain(
-      "event::session::stopped",
+      "event::session::ended",
     );
   });
 
   it("keeps a stale session that only has raw observations", async () => {
     const sessionId = "ses_raw_only";
-    const store = storeForObservations(sessionId, [
-      makeRawObservation(sessionId),
-    ]);
+    const store = storeForObservations(sessionId, [makeRawObservation(sessionId)]);
     const kv = mockKV(store);
     const { sdk, calls } = mockSdk();
 
     registerEvictFunction(sdk as never, kv as never);
-    sdk.registerFunction("event::session::stopped", () => ({
-      success: true,
-    }));
+    sdk.registerFunction("event::session::ended", () => ({ success: true }));
 
     const result = (await sdk.trigger({
       function_id: "mem::evict",
@@ -287,11 +267,9 @@ describe("mem::evict stale sessions", () => {
     })) as { staleSessions: number };
 
     expect(result.staleSessions).toBe(0);
-    expect(await kv.get(KV.sessions, sessionId)).toMatchObject({
-      id: sessionId,
-    });
+    expect(await kv.get(KV.sessions, sessionId)).toMatchObject({ id: sessionId });
     expect(calls.map((call) => call.function_id)).not.toContain(
-      "event::session::stopped",
+      "event::session::ended",
     );
   });
 });

@@ -6,6 +6,7 @@ import { getAllTools } from "./tools-registry.js";
 import { getStandalonePersistPath } from "../config.js";
 import { VERSION } from "../version.js";
 import { generateId } from "../state/schema.js";
+import { matchesRetrievalScope } from "../state/retrieval-scope.js";
 import {
   resolveHandle,
   invalidateHandle,
@@ -107,6 +108,7 @@ interface Validated {
   files?: string[];
   project?: string;
   agentId?: string;
+  visibility?: "project" | "agent_private";
   query?: string;
   limit?: number;
   format?: string;
@@ -139,6 +141,15 @@ function validate(toolName: string, args: Record<string, unknown>): Validated {
       if (typeof args["agentId"] === "string" && args["agentId"].trim()) {
         v.agentId = args["agentId"].trim();
       }
+      if (
+        args["visibility"] === "project" ||
+        args["visibility"] === "agent_private"
+      ) {
+        v.visibility = args["visibility"];
+      }
+      if (v.visibility === "agent_private" && !v.agentId) {
+        throw new Error("agent_private visibility requires agentId");
+      }
       return v;
     }
     case "memory_recall":
@@ -159,6 +170,12 @@ function validate(toolName: string, args: Record<string, unknown>): Validated {
       } else if (typeof budget === "string" && budget.trim()) {
         const n = Number(budget);
         if (Number.isFinite(n) && n > 0) v.tokenBudget = Math.floor(n);
+      }
+      if (typeof args["project"] === "string" && args["project"].trim()) {
+        v.project = args["project"].trim();
+      }
+      if (typeof args["agentId"] === "string" && args["agentId"].trim()) {
+        v.agentId = args["agentId"].trim();
       }
       return v;
     }
@@ -199,6 +216,7 @@ async function handleProxy(
           files: v.files,
           ...(v.project !== undefined && { project: v.project }),
           ...(v.agentId !== undefined && { agentId: v.agentId }),
+          ...(v.visibility !== undefined && { visibility: v.visibility }),
         }),
       });
       return textResponse(result);
@@ -210,6 +228,8 @@ async function handleProxy(
         format: v.format ?? "full",
       };
       if (v.tokenBudget != null) body["token_budget"] = v.tokenBudget;
+      if (v.project !== undefined) body["project"] = v.project;
+      if (v.agentId !== undefined) body["agentId"] = v.agentId;
       const result = await handle.call("/agentmemory/search", {
         method: "POST",
         body: JSON.stringify(body),
@@ -220,6 +240,8 @@ async function handleProxy(
       const body: Record<string, unknown> = { query: v.query, limit: v.limit };
       if (v.format != null) body["format"] = v.format;
       if (v.tokenBudget != null) body["token_budget"] = v.tokenBudget;
+      if (v.project !== undefined) body["project"] = v.project;
+      if (v.agentId !== undefined) body["agentId"] = v.agentId;
       const result = await handle.call("/agentmemory/smart-search", {
         method: "POST",
         body: JSON.stringify(body),
@@ -271,6 +293,9 @@ async function handleLocal(
         content: v.content,
         concepts: v.concepts,
         files: v.files,
+        ...(v.project !== undefined && { project: v.project }),
+        ...(v.agentId !== undefined && { agentId: v.agentId }),
+        visibility: v.visibility ?? "project",
         createdAt: isoNow,
         updatedAt: isoNow,
         strength: 7,
@@ -288,7 +313,22 @@ async function handleLocal(
       const limit = v.limit ?? DEFAULT_LIMIT;
       const all =
         await kvInstance.list<Record<string, unknown>>("mem:memories");
+      const scope = v.project !== undefined || v.agentId !== undefined
+        ? { projectId: v.project, actorAgentId: v.agentId }
+        : undefined;
       const results = all
+        .filter((m) => matchesRetrievalScope({
+          ...(typeof m["project"] === "string"
+            ? { projectId: m["project"] }
+            : {}),
+          ...(typeof m["agentId"] === "string"
+            ? { actorAgentId: m["agentId"] }
+            : {}),
+          ...(m["visibility"] === "project" ||
+          m["visibility"] === "agent_private"
+            ? { visibility: m["visibility"] }
+            : {}),
+        }, scope))
         .filter((m) => {
           const text = [
             typeof m["title"] === "string" ? m["title"] : "",

@@ -11,6 +11,8 @@ vi.mock("../src/state/schema.js", () => ({
     observations: (sessionId: string) => `obs:${sessionId}`,
     audit: "audit",
   },
+  fingerprintId: (prefix: string, content: string) =>
+    `${prefix}:${content}`,
 }));
 
 vi.mock("../src/eval/schemas.js", () => ({
@@ -30,11 +32,14 @@ vi.mock("../src/functions/audit.js", () => ({
 }));
 
 import { registerSummarizeFunction } from "../src/functions/summarize.js";
+import { ProjectionCoordinator } from "../src/functions/projection-coordinator.js";
 import type {
   CompressedObservation,
   Session,
   MemoryProvider,
 } from "../src/types.js";
+import { NoopProvider } from "../src/providers/noop.js";
+import { ResilientProvider } from "../src/providers/resilient.js";
 
 function mockKV() {
   const store = new Map<string, Map<string, unknown>>();
@@ -102,6 +107,12 @@ function makeProvider(responses: string[]): MemoryProvider & {
   };
 }
 
+class ExplodingNoopProvider extends NoopProvider {
+  override async summarize(): Promise<string> {
+    throw new Error("wrapped noop must not be called");
+  }
+}
+
 function summaryXml(opts: {
   title: string;
   narrative?: string;
@@ -141,9 +152,15 @@ async function setupHandler(opts: {
     const o = makeObs(i, opts.sessionId);
     await kv.set(`obs:${opts.sessionId}`, o.id, o);
   }
-  registerSummarizeFunction(sdk as any, kv as any, opts.provider);
+  const core = registerSummarizeFunction(
+    sdk as any,
+    kv as any,
+    opts.provider,
+    undefined,
+    new ProjectionCoordinator(),
+  );
   const handler = sdk.functions.get("mem::summarize")!;
-  return { handler, kv };
+  return { core, handler, kv };
 }
 
 describe("mem::summarize chunking", () => {
@@ -156,6 +173,59 @@ describe("mem::summarize chunking", () => {
 
   afterEach(() => {
     process.env = { ...ORIGINAL_ENV };
+  });
+
+  it("returns one core whose persisted result matches the public wrapper", async () => {
+    const direct = await setupHandler({
+      sessionId: "ses_core_direct",
+      obsCount: 1,
+      provider: makeProvider([summaryXml({ title: "Shared summary core" })]),
+    });
+    const wrapped = await setupHandler({
+      sessionId: "ses_core_wrapped",
+      obsCount: 1,
+      provider: makeProvider([summaryXml({ title: "Shared summary core" })]),
+    });
+
+    const directResult: any = await direct.core({
+      sessionId: "ses_core_direct",
+    });
+    const wrappedResult: any = await wrapped.handler({
+      sessionId: "ses_core_wrapped",
+    });
+
+    expect(directResult).toMatchObject({
+      success: true,
+      qualityScore: 100,
+      summary: { title: "Shared summary core", observationCount: 1 },
+    });
+    expect(wrappedResult).toMatchObject({
+      success: true,
+      qualityScore: 100,
+      summary: { title: "Shared summary core", observationCount: 1 },
+    });
+    expect(await direct.kv.get("summaries", "ses_core_direct")).toMatchObject({
+      title: "Shared summary core",
+      observationCount: 1,
+    });
+    expect(await wrapped.kv.get("summaries", "ses_core_wrapped")).toMatchObject({
+      title: "Shared summary core",
+      observationCount: 1,
+    });
+  });
+
+  it("skips a resilient-wrapped noop provider without calling it", async () => {
+    const provider = new ResilientProvider(new ExplodingNoopProvider());
+    const { handler, kv } = await setupHandler({
+      sessionId: "ses_wrapped_noop",
+      obsCount: 1,
+      provider,
+    });
+
+    const result: any = await handler({ sessionId: "ses_wrapped_noop" });
+
+    expect(result).toMatchObject({ success: false, error: "no_provider" });
+    expect(await kv.get("summaries", "ses_wrapped_noop")).toBeNull();
   });
 
   it("small session takes the single-call path (no chunking, no reduce)", async () => {
@@ -478,5 +548,187 @@ describe("mem::summarize chunking", () => {
 
     expect(result.success).toBe(false);
     expect(result.error).toBe("parse_failed");
+  });
+
+  it("skips an unchanged source only after a successful summary checkpoint", async () => {
+    const provider = makeProvider([summaryXml({ title: "stable" })]);
+    const { handler, kv } = await setupHandler({
+      sessionId: "ses_stable",
+      obsCount: 1,
+      provider,
+    });
+
+    const first: any = await handler({ sessionId: "ses_stable" });
+    const second: any = await handler({ sessionId: "ses_stable" });
+
+    expect(first.success).toBe(true);
+    expect(second).toMatchObject({ success: true, deduplicated: true });
+    expect(provider.calls).toHaveLength(1);
+    expect(await kv.get("summaries", "ses_stable")).toMatchObject({
+      sourceFingerprint: expect.any(String),
+    });
+  });
+
+  it("re-summarizes changed content even when observation count is unchanged", async () => {
+    const provider = makeProvider([
+      summaryXml({ title: "before" }),
+      summaryXml({ title: "after" }),
+    ]);
+    const { handler, kv } = await setupHandler({
+      sessionId: "ses_changed",
+      obsCount: 1,
+      provider,
+    });
+    await handler({ sessionId: "ses_changed" });
+    const changed = makeObs(0, "ses_changed");
+    changed.narrative = "the source changed without changing the row count";
+    await kv.set("obs:ses_changed", changed.id, changed);
+
+    const result: any = await handler({ sessionId: "ses_changed" });
+
+    expect(result.success).toBe(true);
+    expect(result.summary.title).toBe("after");
+    expect(provider.calls).toHaveLength(2);
+  });
+
+  it("does not checkpoint a failed summary and retries the same source", async () => {
+    const provider = makeProvider([
+      "invalid first attempt",
+      "invalid second attempt",
+      summaryXml({ title: "recovered" }),
+    ]);
+    const { handler, kv } = await setupHandler({
+      sessionId: "ses_summary_retry",
+      obsCount: 1,
+      provider,
+    });
+
+    const first: any = await handler({ sessionId: "ses_summary_retry" });
+    expect(first).toMatchObject({ success: false, error: "parse_failed" });
+    expect(await kv.get("summaries", "ses_summary_retry")).toBeNull();
+
+    const second: any = await handler({ sessionId: "ses_summary_retry" });
+    expect(second).toMatchObject({ success: true });
+    expect(second.summary.title).toBe("recovered");
+  });
+
+  it("summarizes a 500-observation default session with one bounded provider call", async () => {
+    const provider = makeProvider([
+      summaryXml({
+        title: "bounded large session",
+        narrative: "The whole session was summarized without replaying every raw narrative.",
+      }),
+    ]);
+    const { handler, kv } = await setupHandler({
+      sessionId: "ses_bounded_500",
+      obsCount: 500,
+      provider,
+    });
+    const longNarrative = "x".repeat(400);
+    for (let i = 0; i < 500; i++) {
+      const observation = makeObs(i, "ses_bounded_500");
+      observation.title = `obs ${i} ${"t".repeat(400)}`;
+      observation.narrative = longNarrative;
+      observation.facts = Array.from({ length: 5 }, (_, fact) =>
+        `fact ${fact} ${"f".repeat(400)}`,
+      );
+      observation.files = Array.from({ length: 12 }, (_, file) =>
+        `src/${"p".repeat(220)}/file_${i}_${file}.ts`,
+      );
+      observation.concepts = Array.from({ length: 12 }, (_, concept) =>
+        `concept-${i}-${concept}-${"c".repeat(160)}`,
+      );
+      await kv.set("obs:ses_bounded_500", observation.id, observation);
+    }
+
+    const result: any = await handler({ sessionId: "ses_bounded_500" });
+
+    expect(result).toMatchObject({ success: true });
+    expect(provider.calls).toHaveLength(1);
+    expect(provider.calls[0].user.length).toBeLessThanOrEqual(24_000);
+    expect(await kv.get("summaries", "ses_bounded_500")).toMatchObject({
+      coveredObservationIds: Array.from({ length: 500 }, (_, i) => `obs_${i}`).sort(),
+    });
+  });
+
+  it("merges only new observation ids into the previous successful summary", async () => {
+    const provider = makeProvider([
+      summaryXml({ title: "first checkpoint", narrative: "initial work" }),
+      summaryXml({ title: "second checkpoint", narrative: "initial work plus the delta" }),
+    ]);
+    const { handler, kv } = await setupHandler({
+      sessionId: "ses_incremental",
+      obsCount: 3,
+      provider,
+    });
+    await handler({ sessionId: "ses_incremental" });
+    for (let i = 3; i < 5; i++) {
+      const observation = makeObs(i, "ses_incremental");
+      await kv.set("obs:ses_incremental", observation.id, observation);
+    }
+
+    const result: any = await handler({ sessionId: "ses_incremental" });
+
+    expect(result).toMatchObject({ success: true });
+    expect(provider.calls).toHaveLength(2);
+    expect(provider.calls[1].user).toContain("Mode: incremental");
+    expect(provider.calls[1].user).toContain("Delta observations: 2");
+    expect(provider.calls[1].user).toContain("first checkpoint");
+    expect(provider.calls[1].user).toContain("obs 3");
+    expect(provider.calls[1].user).toContain("obs 4");
+    expect(await kv.get("summaries", "ses_incremental")).toMatchObject({
+      coveredObservationIds: ["obs_0", "obs_1", "obs_2", "obs_3", "obs_4"],
+    });
+  });
+
+  it("rebuilds one bounded digest when a covered observation changes", async () => {
+    const provider = makeProvider([
+      summaryXml({ title: "before rebuild" }),
+      summaryXml({ title: "after rebuild" }),
+    ]);
+    const { handler, kv } = await setupHandler({
+      sessionId: "ses_rebuild",
+      obsCount: 3,
+      provider,
+    });
+    await handler({ sessionId: "ses_rebuild" });
+    const changed = makeObs(1, "ses_rebuild");
+    changed.narrative = "a covered source changed after the last successful checkpoint";
+    await kv.set("obs:ses_rebuild", changed.id, changed);
+
+    const result: any = await handler({ sessionId: "ses_rebuild" });
+
+    expect(result).toMatchObject({ success: true });
+    expect(provider.calls).toHaveLength(2);
+    expect(provider.calls[1].user).toContain("Mode: rebuild");
+    expect(provider.calls[1].user).toContain("before rebuild");
+    expect(provider.calls[1].user.length).toBeLessThanOrEqual(24_000);
+  });
+
+  it("keeps the previous successful checkpoint when replacement output cannot be parsed", async () => {
+    const provider = makeProvider([
+      summaryXml({ title: "stable checkpoint" }),
+      "invalid replacement one",
+      "invalid replacement two",
+    ]);
+    const { handler, kv } = await setupHandler({
+      sessionId: "ses_preserve_checkpoint",
+      obsCount: 2,
+      provider,
+    });
+    await handler({ sessionId: "ses_preserve_checkpoint" });
+    const before = await kv.get("summaries", "ses_preserve_checkpoint");
+    const added = makeObs(2, "ses_preserve_checkpoint");
+    await kv.set("obs:ses_preserve_checkpoint", added.id, added);
+
+    const result: any = await handler({ sessionId: "ses_preserve_checkpoint" });
+    const after = await kv.get("summaries", "ses_preserve_checkpoint");
+
+    expect(result).toMatchObject({ success: false, error: "parse_failed" });
+    expect(after).toEqual(before);
+    expect(before).toMatchObject({
+      sourceFingerprint: expect.any(String),
+      coveredObservationIds: ["obs_0", "obs_1"],
+    });
   });
 });

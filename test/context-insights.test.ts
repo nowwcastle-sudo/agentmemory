@@ -1,0 +1,163 @@
+import { describe, it, expect, beforeEach, vi } from "vitest";
+import { registerContextFunction } from "../src/functions/context.js";
+import { KV } from "../src/state/schema.js";
+import type { Insight, ProjectProfile } from "../src/types.js";
+
+function mockKV() {
+  const store = new Map<string, Map<string, unknown>>();
+  return {
+    get: async <T>(scope: string, key: string): Promise<T | null> => {
+      return (store.get(scope)?.get(key) as T) ?? null;
+    },
+    set: async <T>(scope: string, key: string, data: T): Promise<T> => {
+      if (!store.has(scope)) store.set(scope, new Map());
+      store.get(scope)!.set(key, data);
+      return data;
+    },
+    delete: async (scope: string, key: string): Promise<void> => {
+      store.get(scope)?.delete(key);
+    },
+    list: async <T>(scope: string): Promise<T[]> => {
+      if (!store.has(scope)) return [];
+      return Array.from(store.get(scope)!.values()) as T[];
+    },
+  };
+}
+
+type ContextHandler = (data: {
+  sessionId: string;
+  project: string;
+  budget?: number;
+}) => Promise<{ context: string; blocks: number; tokens: number }>;
+
+function wireContext(kv: ReturnType<typeof mockKV>, budget = 4000) {
+  let handler: ContextHandler | undefined;
+  const sdk = {
+    registerFunction: vi.fn((id: string, cb: ContextHandler) => {
+      if (id === "mem::context") handler = cb;
+    }),
+  } as unknown as import("iii-sdk").ISdk;
+  registerContextFunction(sdk, kv as never, budget);
+  if (!handler) throw new Error("mem::context not registered");
+  return handler;
+}
+
+function makeInsight(over: Partial<Insight> = {}): Insight {
+  const now = new Date().toISOString();
+  return {
+    id: over.id ?? `insight_${Math.random().toString(36).slice(2)}`,
+    title: over.title ?? "default insight title",
+    content: over.content ?? "default insight content",
+    confidence: over.confidence ?? 0.8,
+    reinforcements: over.reinforcements ?? 0,
+    sourceConceptCluster: over.sourceConceptCluster ?? [],
+    sourceMemoryIds: over.sourceMemoryIds ?? [],
+    sourceLessonIds: over.sourceLessonIds ?? [],
+    sourceCrystalIds: over.sourceCrystalIds ?? [],
+    project: over.project,
+    tags: over.tags ?? [],
+    createdAt: over.createdAt ?? now,
+    updatedAt: over.updatedAt ?? now,
+    lastReinforcedAt: over.lastReinforcedAt,
+    lastDecayedAt: over.lastDecayedAt,
+    decayRate: over.decayRate ?? 0.05,
+    deleted: over.deleted,
+  };
+}
+
+async function seedInsight(kv: ReturnType<typeof mockKV>, partial: Partial<Insight>) {
+  const insight = makeInsight(partial);
+  await kv.set(KV.insights, insight.id, insight);
+  return insight;
+}
+
+async function seedProfile(kv: ReturnType<typeof mockKV>, project: string, concepts: string[]) {
+  const profile: ProjectProfile = {
+    project,
+    updatedAt: new Date().toISOString(),
+    topConcepts: concepts.map((concept, i) => ({ concept, frequency: 10 - i })),
+    topFiles: [],
+    conventions: [],
+    commonErrors: [],
+    recentActivity: [],
+    sessionCount: 1,
+    totalObservations: 1,
+  };
+  await kv.set(KV.profiles, project, profile);
+}
+
+describe("mem::context — insights auto-injection (ontology-lite follow-up)", () => {
+  let kv: ReturnType<typeof mockKV>;
+  let handler: ContextHandler;
+
+  beforeEach(() => {
+    kv = mockKV();
+    handler = wireContext(kv);
+  });
+
+  it("includes an 'Insights' block carrying title and content", async () => {
+    await seedInsight(kv, {
+      id: "insight_a",
+      title: "canonical-key-marker",
+      content: "normalize names before dedup",
+      confidence: 0.9,
+    });
+    const result = await handler({ sessionId: "ses_a", project: "/tmp/proj" });
+    expect(result.context).toContain("## Insights");
+    expect(result.context).toContain("canonical-key-marker");
+    expect(result.context).toContain("normalize names before dedup");
+  });
+
+  it("omits the block when there are no insights, and ignores deleted ones", async () => {
+    let result = await handler({ sessionId: "ses_empty", project: "/tmp/proj" });
+    expect(result.context).not.toContain("## Insights");
+
+    await seedInsight(kv, { id: "insight_deleted", title: "deleted-insight-marker", deleted: true });
+    result = await handler({ sessionId: "ses_deleted", project: "/tmp/proj" });
+    expect(result.context).not.toContain("## Insights");
+    expect(result.context).not.toContain("deleted-insight-marker");
+  });
+
+  it("caps the block at five insights ordered by score", async () => {
+    for (let i = 0; i < 7; i++) {
+      await seedInsight(kv, {
+        id: `insight_${i}`,
+        title: `cap-marker-${i}`,
+        confidence: 0.5 + i * 0.05, // 0.50 .. 0.80
+      });
+    }
+    const result = await handler({ sessionId: "ses_cap", project: "/tmp/proj" });
+    for (const i of [6, 5, 4, 3, 2]) expect(result.context).toContain(`cap-marker-${i}`);
+    for (const i of [1, 0]) expect(result.context).not.toContain(`cap-marker-${i}`);
+  });
+
+  it("ranks insights whose concept cluster overlaps the project profile above higher-confidence unrelated ones", async () => {
+    await seedProfile(kv, "/tmp/proj", ["graph schema", "TypeScript"]);
+    await seedInsight(kv, {
+      id: "insight_related",
+      title: "related-insight-marker",
+      confidence: 0.8,
+      sourceConceptCluster: ["Graph Schema", "validation"],
+    });
+    await seedInsight(kv, {
+      id: "insight_unrelated",
+      title: "unrelated-insight-marker",
+      confidence: 0.85,
+      sourceConceptCluster: ["cooking"],
+    });
+    const result = await handler({ sessionId: "ses_rank", project: "/tmp/proj" });
+    const related = result.context.indexOf("related-insight-marker");
+    const unrelated = result.context.indexOf("unrelated-insight-marker");
+    expect(related).toBeGreaterThan(-1);
+    expect(unrelated).toBeGreaterThan(-1);
+    expect(related).toBeLessThan(unrelated);
+  });
+
+  it("excludes insights scoped to another project and keeps global ones", async () => {
+    await seedInsight(kv, { id: "insight_other", title: "other-project-insight", project: "/tmp/other" });
+    await seedInsight(kv, { id: "insight_global", title: "global-insight-marker", project: undefined });
+    const result = await handler({ sessionId: "ses_scope", project: "/tmp/proj" });
+    expect(result.context).not.toContain("other-project-insight");
+    expect(result.context).toContain("global-insight-marker");
+  });
+});

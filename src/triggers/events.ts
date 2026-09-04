@@ -1,43 +1,46 @@
 import { TriggerAction, type ISdk } from "iii-sdk";
-import type { CompressedObservation, HookPayload, Session } from "../types.js";
+import type {
+  HookPayload,
+  ObservationProjection,
+  RawObservation,
+  Session,
+} from "../types.js";
 import { KV, STREAM } from "../state/schema.js";
 import { StateKV } from "../state/kv.js";
-import { isReflectEnabled } from "../functions/slots.js";
-import {
-  getAgentId,
-  getConsolidationCooldownMs,
-  isConsolidationEnabled,
-} from "../config.js";
+import { getAgentId } from "../config.js";
 import { logger } from "../logger.js";
+import {
+  completeActiveSession,
+  isValidSessionRow,
+} from "../state/session-lifecycle.js";
 
-// Global marker recording when corpus consolidation last ran, used to debounce
-// the per-turn session-stop fan-out.
-const CONSOLIDATION_MARKER_KEY = "consolidation:lastRun";
-
-async function consolidationDueUnserialized(kv: StateKV): Promise<boolean> {
-  const cooldownMs = getConsolidationCooldownMs();
-  if (cooldownMs <= 0) return true; // debounce disabled
-  const now = Date.now();
-  const marker = await kv
-    .get<{ at?: number }>(KV.config, CONSOLIDATION_MARKER_KEY)
-    .catch(() => null);
-  const lastAt = typeof marker?.at === "number" ? marker.at : 0;
-  if (now - lastAt < cooldownMs) return false;
-  await kv.set(KV.config, CONSOLIDATION_MARKER_KEY, { at: now }).catch(() => {});
-  return true;
-}
-
-// Concurrent session-stop events would otherwise interleave the marker
-// read-check-write above and both pass the cooldown. Serialize the whole
-// check through an in-process chain so exactly one concurrent caller wins.
-let consolidationCheckChain: Promise<unknown> = Promise.resolve();
-
-function consolidationDue(kv: StateKV): Promise<boolean> {
-  const result = consolidationCheckChain.then(() =>
-    consolidationDueUnserialized(kv),
+async function settleSessionObservationProjections(
+  sdk: ISdk,
+  kv: StateKV,
+  sessionId: string,
+): Promise<void> {
+  const rawObservations = await kv.list<RawObservation>(
+    KV.rawObservations(sessionId),
   );
-  consolidationCheckChain = result.catch(() => false);
-  return result;
+  for (const raw of rawObservations) {
+    const projection = await kv.get<ObservationProjection>(
+      KV.observationProjections,
+      raw.id,
+    );
+    if (!projection || projection.status === "succeeded") continue;
+    try {
+      await sdk.trigger({
+        function_id: "mem::queue-observation-projection",
+        payload: { observationId: raw.id, sessionId },
+      });
+    } catch (err) {
+      logger.warn("Observation projection settle failed", {
+        observationId: raw.id,
+        sessionId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
 }
 
 export function registerEventTriggers(sdk: ISdk, kv: StateKV): void {
@@ -48,12 +51,17 @@ export function registerEventTriggers(sdk: ISdk, kv: StateKV): void {
       project: string;
       cwd: string;
       agentId?: string;
+      sourceClient?: string;
     }) => {
       const requestAgentId =
         typeof data.agentId === "string" && data.agentId.trim().length > 0
           ? data.agentId.trim().slice(0, 128)
           : undefined;
       const agentId = requestAgentId ?? getAgentId();
+      const sourceClient =
+        typeof data.sourceClient === "string" && data.sourceClient.trim().length > 0
+          ? data.sourceClient.trim().slice(0, 64)
+          : undefined;
       const session: Session = {
         id: data.sessionId,
         project: data.project,
@@ -62,6 +70,7 @@ export function registerEventTriggers(sdk: ISdk, kv: StateKV): void {
         status: "active",
         observationCount: 0,
         ...(agentId ? { agentId } : {}),
+        ...(sourceClient ? { sourceClient } : {}),
       };
       await kv.set(KV.sessions, data.sessionId, session);
       const contextResult = await sdk.trigger<
@@ -93,58 +102,9 @@ export function registerEventTriggers(sdk: ISdk, kv: StateKV): void {
     config: { topic: "agentmemory.observation" },
   });
 
-  sdk.registerFunction("event::session::stopped", async (data: { sessionId: string; skipConsolidation?: boolean }) => {
-    const summary = await sdk.trigger({ function_id: "mem::summarize", payload: data });
-    const fireVoid = (function_id: string, payload: unknown) =>
-      sdk
-        .trigger({ function_id, payload, action: TriggerAction.Void() })
-        .catch((err) =>
-          logger.warn(function_id + " trigger failed", {
-            sessionId: data.sessionId,
-            error: err instanceof Error ? err.message : String(err),
-          }),
-        );
-    if (isReflectEnabled()) {
-      fireVoid("mem::slot-reflect", { sessionId: data.sessionId });
-    }
-    // Unconditional: mem::graph-extract gates its LLM pass internally.
-    try {
-      const observations = await kv.list<CompressedObservation>(
-        KV.observations(data.sessionId),
-      );
-      const compressed = observations.filter((o) => o.title);
-      if (compressed.length > 0) {
-        fireVoid("mem::graph-extract", { observations: compressed });
-      }
-    } catch (err) {
-      logger.warn("graph-extract trigger failed", {
-        sessionId: data.sessionId,
-        error: err instanceof Error ? err.message : String(err),
-      });
-    }
-    // Crystals + lessons consolidation. The stop lifecycle is the single
-    // source of truth: event::session::stopped fires for ALL agents (the
-    // client-side session-end hook no longer drives consolidation directly).
-    // Gated so keyless/zero-LLM users don't fire no-op LLM calls.
-    //
-    // skipConsolidation suppresses the fan-out when this handler is driven
-    // by eviction's stale-session recovery: evict calls session::stopped
-    // once per recovered session, then runs ONE final consolidation pass.
-    // Without this guard, N recovered sessions launch N concurrent forced
-    // full-corpus consolidations plus N crystallizations.
-    //
-    // Debounce: /session/end is posted by the per-turn Stop hook, so this
-    // handler fires on every agent turn. consolidate-pipeline + auto-crystallize
-    // are full-corpus LLM work with no internal "nothing changed" guard, so
-    // firing them every turn is a cost/latency storm for connected agents.
-    // Bound the global corpus consolidation to once per cooldown window.
-    if (isConsolidationEnabled() && !data.skipConsolidation) {
-      if (await consolidationDue(kv)) {
-        fireVoid("mem::consolidate-pipeline", { tier: "all", force: true });
-        fireVoid("mem::auto-crystallize", { olderThanDays: 0 });
-      }
-    }
-    return summary;
+  sdk.registerFunction("event::session::stopped", async (data: { sessionId: string }) => {
+    await settleSessionObservationProjections(sdk, kv, data.sessionId);
+    return { success: true, checkpointed: true };
   });
   sdk.registerTrigger({
     type: "durable:subscriber",
@@ -154,12 +114,44 @@ export function registerEventTriggers(sdk: ISdk, kv: StateKV): void {
 
   sdk.registerFunction(
     "event::session::ended",
-    async (data: { sessionId: string }) => {
-      await kv.update(KV.sessions, data.sessionId, [
-        { type: "set", path: "endedAt", value: new Date().toISOString() },
-        { type: "set", path: "status", value: "completed" },
-      ]);
-      return { success: true };
+    async (data: {
+      sessionId: string;
+      transitionConfirmed?: boolean;
+      evictAfterSuccess?: boolean;
+    }) => {
+      let completion;
+      if (data.transitionConfirmed === true) {
+        const session = await kv.get<Session>(KV.sessions, data.sessionId);
+        completion = isValidSessionRow(session) && session.status === "completed"
+          ? { transitioned: true as const, session }
+          : { transitioned: false as const, reason: "session_not_found" as const };
+      } else {
+        completion = await completeActiveSession(kv, data.sessionId);
+      }
+      const recoverCompletedEviction =
+        data.evictAfterSuccess === true &&
+        !completion.transitioned &&
+        completion.reason === "already_completed";
+      if (!completion.transitioned && !recoverCompletedEviction) {
+        return { success: true, ...completion };
+      }
+
+      await settleSessionObservationProjections(sdk, kv, data.sessionId);
+      const projection = (await sdk.trigger({
+        function_id: "mem::queue-session-projection",
+        payload: {
+          sessionId: data.sessionId,
+          ...(data.evictAfterSuccess ? { evictAfterSuccess: true } : {}),
+        },
+      })) as { success?: boolean; error?: string } | null;
+      if (!projection?.success) {
+        return {
+          success: false,
+          ...completion,
+          error: projection?.error || "session_projection_queue_failed",
+        };
+      }
+      return { success: true, ...completion, ...projection };
     },
   );
   sdk.registerTrigger({

@@ -126,6 +126,10 @@ export function registerMcpEndpoints(
               limit: typeof args.limit === "number" ? args.limit : 10,
               format,
               token_budget: tokenBudget,
+              project:
+                typeof args.project === "string" && args.project.trim()
+                  ? args.project.trim()
+                  : undefined,
               agentId: recallAgentId,
             } });
             const text =
@@ -190,6 +194,11 @@ export function registerMcpEndpoints(
               typeof args.agentId === "string" && args.agentId.trim().length > 0
                 ? (args.agentId as string).trim()
                 : undefined;
+            const visibility =
+              args.visibility === "project" ||
+              args.visibility === "agent_private"
+                ? args.visibility
+                : undefined;
 
             const result = await sdk.trigger({ function_id: "mem::remember", payload: {
               content: args.content,
@@ -198,6 +207,7 @@ export function registerMcpEndpoints(
               files,
               ...(project !== undefined && { project }),
               ...(saveAgentId !== undefined && { agentId: saveAgentId }),
+              ...(visibility !== undefined && { visibility }),
             } });
             return {
               status_code: 200,
@@ -284,6 +294,14 @@ export function registerMcpEndpoints(
                 query: args.query,
                 expandIds,
                 limit,
+                project:
+                  typeof args.project === "string" && args.project.trim()
+                    ? args.project.trim()
+                    : undefined,
+                agentId:
+                  typeof args.agentId === "string" && args.agentId.trim()
+                    ? args.agentId.trim()
+                    : undefined,
               },
             });
             return {
@@ -445,6 +463,8 @@ export function registerMcpEndpoints(
                 nodeType?: string;
                 maxDepth?: number;
                 query?: string;
+                project?: string;
+                agentId?: string;
               } = {};
               const startNodeId = asNonEmptyString(args.startNodeId);
               const nodeType = asNonEmptyString(args.nodeType);
@@ -454,6 +474,10 @@ export function registerMcpEndpoints(
               if (nodeType) payload.nodeType = nodeType;
               if (query) payload.query = query;
               if (maxDepth !== undefined) payload.maxDepth = Math.max(1, Math.min(8, maxDepth));
+              const project = asNonEmptyString(args.project);
+              const agentId = asNonEmptyString(args.agentId);
+              if (project) payload.project = project;
+              if (agentId) payload.agentId = agentId;
               const result = await sdk.trigger({
                 function_id: "mem::graph-query",
                 payload,

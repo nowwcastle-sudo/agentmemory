@@ -1,4 +1,3 @@
-import { platform } from "node:os";
 import * as p from "@clack/prompts";
 import pc from "picocolors";
 import type { ConnectAdapter, ConnectOptions, ConnectResult } from "./types.js";
@@ -87,11 +86,15 @@ export async function runAdapter(
   adapter: ConnectAdapter,
   opts: ConnectOptions,
 ): Promise<ConnectResult> {
-  if (!adapter.detect()) {
+  const probe = adapter.probe?.({ executeVersion: !opts.dryRun });
+  const usable = probe ? probe.usable : adapter.detect();
+  if (!usable) {
+    const reason = probe?.reason ??
+      (probe?.presence === "config-only" ? "config-only" : "not-detected");
     p.log.warn(
-      `${adapter.displayName}: not detected on this machine (skipping).${adapter.docs ? ` Docs: ${adapter.docs}` : ""}`,
+      `${adapter.displayName}: unavailable (${reason}; skipping).${adapter.docs ? ` Docs: ${adapter.docs}` : ""}`,
     );
-    return { kind: "skipped", reason: "not-detected" };
+    return { kind: "skipped", reason };
   }
   p.log.step(`Wiring ${adapter.displayName}…`);
   if (adapter.protocolNote) {
@@ -136,23 +139,15 @@ export async function runAdapter(
 export async function runConnect(args: string[]): Promise<void> {
   const { dryRun, force, all, withHooks, guidelines, positional } =
     parseFlags(args);
-  const allowWindowsAdapter =
-    positional.length === 1 && positional[0]?.toLowerCase() === "copilot-cli";
-  if (platform() === "win32" && !allowWindowsAdapter) {
-    p.intro("agentmemory connect");
-    p.log.warn(
-      "Windows: automated `connect` is not supported yet. See https://github.com/rohitg00/agentmemory#other-agents for manual install steps.",
-    );
-    p.outro("Windows: manual install required — see docs");
-    return;
-  }
 
   const opts: ConnectOptions = { dryRun, force, withHooks, guidelines };
 
   p.intro("agentmemory connect");
 
   if (positional.length === 0 && !all) {
-    const detected = ADAPTERS.filter((a) => a.detect());
+    const detected = ADAPTERS.filter((a) =>
+      a.probe?.({ executeVersion: !dryRun }).usable ?? a.detect()
+    );
     if (detected.length === 0) {
       p.log.error("No supported agents detected on this machine.");
       p.outro(`Supported: ${knownAgents().join(", ")}`);
@@ -178,7 +173,9 @@ export async function runConnect(args: string[]): Promise<void> {
   }
 
   if (all) {
-    const detected = ADAPTERS.filter((a) => a.detect());
+    const detected = ADAPTERS.filter((a) =>
+      a.probe?.({ executeVersion: !dryRun }).usable ?? a.detect()
+    );
     if (detected.length === 0) {
       p.log.error("No supported agents detected on this machine.");
       process.exit(1);

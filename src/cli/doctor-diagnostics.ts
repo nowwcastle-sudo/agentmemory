@@ -16,6 +16,10 @@
 //   agentmemory doctor --all       # apply every available fix without prompting (CI)
 //   agentmemory doctor --dry-run   # show what each fix WOULD do; execute nothing
 
+import { parseEnvFile } from "../env-file.js";
+
+export { parseEnvFile } from "../env-file.js";
+
 export type DiagnosticStatus = {
   ok: boolean;
   /** Short status detail (one line). Shown alongside the check name. */
@@ -94,27 +98,6 @@ const PROVIDER_KEY_NAMES = [
   "OPENROUTER_API_KEY",
   "MINIMAX_API_KEY",
 ] as const;
-
-export function parseEnvFile(content: string): Record<string, string> {
-  const out: Record<string, string> = {};
-  for (const rawLine of content.split(/\r?\n/)) {
-    const line = rawLine.trim();
-    if (!line || line.startsWith("#")) continue;
-    const eq = line.indexOf("=");
-    if (eq < 0) continue;
-    const key = line.slice(0, eq).trim();
-    let value = line.slice(eq + 1).trim();
-    // Strip surrounding quotes.
-    if (
-      (value.startsWith('"') && value.endsWith('"')) ||
-      (value.startsWith("'") && value.endsWith("'"))
-    ) {
-      value = value.slice(1, -1);
-    }
-    out[key] = value;
-  }
-  return out;
-}
 
 /** Returns the list of provider keys that look real (non-placeholder). */
 export function realProviderKeys(env: Record<string, string>): string[] {
