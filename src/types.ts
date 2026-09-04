@@ -78,6 +78,15 @@ export interface ObservationProjection {
   lastError?: string;
 }
 
+export type SessionProjectionTerminalOutcome =
+  | "summary_written"
+  | "skipped_automatic_enrichment"
+  | "skipped_no_provider";
+
+export type SessionProjectionTerminalReason =
+  | "automatic_enrichment_disabled"
+  | "no_provider";
+
 export interface SessionProjection {
   sessionId: string;
   status: "pending" | "running" | "succeeded" | "failed";
@@ -87,6 +96,8 @@ export interface SessionProjection {
   sourceFingerprint?: string;
   lastError?: string;
   evictAfterSuccess?: boolean;
+  terminalOutcome?: SessionProjectionTerminalOutcome;
+  terminalReason?: SessionProjectionTerminalReason;
 }
 
 export type MaintenanceProjectionStage =

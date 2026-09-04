@@ -38,6 +38,7 @@ describe("loadEnvFile", () => {
     process.env["HOME"] = sandboxHome;
     process.env["USERPROFILE"] = sandboxHome;
     delete process.env["AGENTMEMORY_AUTO_COMPRESS"];
+    delete process.env["AGENTMEMORY_AUTO_SUMMARIZE"];
     delete process.env["AGENTMEMORY_DROP_STALE_INDEX"];
     delete process.env["CONSOLIDATION_ENABLED"];
     delete process.env["GRAPH_EXTRACTION_ENABLED"];
@@ -101,6 +102,18 @@ describe("loadEnvFile", () => {
     writeEnv("AGENTMEMORY_DROP_STALE_INDEX=true");
     const cfg = await freshConfig();
     expect(cfg.isDropStaleIndexEnabled()).toBe(true);
+  });
+
+  it("keeps automatic session summaries enabled when the flag is unset", async () => {
+    writeEnv("");
+    const cfg = await freshConfig();
+    expect(cfg.isAutoSummarizeEnabled()).toBe(true);
+  });
+
+  it("disables automatic session summaries only for explicit false", async () => {
+    writeEnv("AGENTMEMORY_AUTO_SUMMARIZE=FaLsE");
+    const cfg = await freshConfig();
+    expect(cfg.isAutoSummarizeEnabled()).toBe(false);
   });
 });
 

@@ -8,4 +8,8 @@ describe(".env.example feature flags", () => {
     expect(example).toContain("AGENTMEMORY_SLOTS=true");
     expect(example).not.toContain("AGENTMEMORY_SLOTS=memory");
   });
+
+  it("documents automatic session enrichment as disabled for this deployment", () => {
+    expect(example).toContain("AGENTMEMORY_AUTO_SUMMARIZE=false");
+  });
 });

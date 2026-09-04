@@ -11,6 +11,7 @@ import { summarySourceFingerprint } from "../src/state/source-fingerprint.js";
 import { mockKV, mockSdk } from "./helpers/mocks.js";
 import {
   getConsolidationCooldownMs,
+  isAutoSummarizeEnabled,
   isConsolidationEnabled,
 } from "../src/config.js";
 import { isReflectEnabled } from "../src/functions/slots.js";
@@ -23,6 +24,7 @@ vi.mock("../src/logger.js", () => ({
 vi.mock("../src/config.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../src/config.js")>()),
   isConsolidationEnabled: vi.fn(() => false),
+  isAutoSummarizeEnabled: vi.fn(() => true),
   getConsolidationCooldownMs: vi.fn(() => 300000),
 }));
 
@@ -67,10 +69,31 @@ async function seedSession(
   await kv.set(KV.observations(session.id), observation.id, observation);
 }
 
+function makeSummary(
+  session: Session,
+  observation: CompressedObservation,
+  sourceFingerprint = summarySourceFingerprint([observation]),
+): SessionSummary {
+  return {
+    sessionId: session.id,
+    project: session.project,
+    createdAt: "2026-08-31T00:06:00.000Z",
+    title: "Durable projection",
+    narrative: "A bounded summary was created.",
+    keyDecisions: ["Use a terminal queue"],
+    filesModified: observation.files,
+    concepts: observation.concepts,
+    observationCount: 1,
+    sourceFingerprint,
+    coveredObservationIds: [observation.id],
+  };
+}
+
 describe("durable terminal session projection", () => {
   beforeEach(() => {
     vi.useFakeTimers();
     vi.mocked(isConsolidationEnabled).mockReturnValue(false);
+    vi.mocked(isAutoSummarizeEnabled).mockReturnValue(true);
     vi.mocked(getConsolidationCooldownMs).mockReturnValue(300000);
     vi.mocked(isReflectEnabled).mockReturnValue(false);
   });
@@ -158,6 +181,7 @@ describe("durable terminal session projection", () => {
       status: "succeeded",
       attempts: 1,
       sourceFingerprint: summarySourceFingerprint([observation]),
+      terminalOutcome: "summary_written",
     });
 
     const repeated = await sdk.trigger("mem::queue-session-projection", {
@@ -210,6 +234,274 @@ describe("durable terminal session projection", () => {
     expect(graphCore).not.toHaveBeenCalled();
   });
 
+  it("succeeds without automatic enrichment when automatic summaries are disabled", async () => {
+    vi.mocked(isAutoSummarizeEnabled).mockReturnValue(false);
+    vi.mocked(isConsolidationEnabled).mockReturnValue(true);
+    vi.mocked(isReflectEnabled).mockReturnValue(true);
+    const sdk = mockSdk({ looseTrigger: true });
+    const kv = mockKV();
+    const session = makeSession("ses_auto_summary_off");
+    const observation = makeObservation(session.id);
+    const summarize = vi.fn(async () => ({ success: true }));
+    const graph = vi.fn(async () => ({ success: true }));
+    await seedSession(kv, session, observation);
+    registerSessionProjectionFunction(
+      sdk as never,
+      kv as never,
+      summarize,
+      graph,
+      new ProjectionCoordinator(),
+    );
+    const trigger = vi.spyOn(sdk, "trigger");
+
+    await sdk.trigger("mem::queue-session-projection", {
+      sessionId: session.id,
+    });
+    await kv.set(KV.projectionFailed("summary"), session.id, {
+      id: session.id,
+      stage: "summary",
+      since: "2026-08-31T00:05:00.000Z",
+      updatedAt: "2026-08-31T00:05:00.000Z",
+      lastError: "stale_failure",
+    });
+    const result = await sdk.trigger("mem::project-session", {
+      sessionId: session.id,
+    });
+
+    expect(result).toMatchObject({
+      success: true,
+      skipped: true,
+      reason: "automatic_enrichment_disabled",
+    });
+    expect(await kv.get(KV.sessionProjections, session.id)).toMatchObject({
+      status: "succeeded",
+      terminalOutcome: "skipped_automatic_enrichment",
+      terminalReason: "automatic_enrichment_disabled",
+      observationCount: 1,
+      sourceFingerprint: summarySourceFingerprint([observation]),
+    });
+    expect(summarize).not.toHaveBeenCalled();
+    expect(graph).not.toHaveBeenCalled();
+    expect(await kv.list(KV.projectionPending("summary"))).toHaveLength(0);
+    expect(await kv.list(KV.projectionFailed("summary"))).toHaveLength(0);
+    expect(await kv.get("mem:maintenance:projections", "global")).toBeNull();
+    expect(
+      trigger.mock.calls.some(
+        ([request]) =>
+          typeof request !== "string" &&
+          request.function_id === "mem::slot-reflect",
+      ),
+    ).toBe(false);
+    await expect(
+      sdk.trigger("mem::project-session", { sessionId: session.id }),
+    ).resolves.toMatchObject({
+      success: true,
+      skipped: true,
+      reason: "automatic_enrichment_disabled",
+      deduplicated: true,
+    });
+    expect(await kv.get(KV.sessionProjections, session.id)).toMatchObject({
+      attempts: 1,
+      terminalOutcome: "skipped_automatic_enrichment",
+      terminalReason: "automatic_enrichment_disabled",
+    });
+    await kv.set(KV.summaries, session.id, makeSummary(session, observation));
+    await expect(
+      sdk.trigger("mem::project-session", { sessionId: session.id }),
+    ).resolves.toMatchObject({ success: true });
+    expect(summarize).not.toHaveBeenCalled();
+    expect(graph).toHaveBeenCalledTimes(1);
+    expect(await kv.get(KV.sessionProjections, session.id)).toMatchObject({
+      status: "succeeded",
+      terminalOutcome: "summary_written",
+    });
+    expect(await kv.get(KV.sessionProjections, session.id)).not.toHaveProperty(
+      "terminalReason",
+    );
+  });
+
+  it("records exact no-provider as a successful skipped terminal outcome", async () => {
+    vi.mocked(isConsolidationEnabled).mockReturnValue(true);
+    vi.mocked(isReflectEnabled).mockReturnValue(true);
+    const sdk = mockSdk({ looseTrigger: true });
+    const kv = mockKV();
+    const session = makeSession("ses_no_provider");
+    const observation = makeObservation(session.id);
+    const summarize = vi.fn(async () => ({
+      success: false as const,
+      error: "no_provider",
+    }));
+    const graph = vi.fn(async () => ({ success: true }));
+    await seedSession(kv, session, observation);
+    registerSessionProjectionFunction(
+      sdk as never,
+      kv as never,
+      summarize,
+      graph,
+      new ProjectionCoordinator(),
+    );
+
+    await sdk.trigger("mem::queue-session-projection", {
+      sessionId: session.id,
+    });
+    const result = await sdk.trigger("mem::project-session", {
+      sessionId: session.id,
+    });
+
+    expect(result).toMatchObject({
+      success: true,
+      skipped: true,
+      reason: "no_provider",
+    });
+    expect(await kv.get(KV.sessionProjections, session.id)).toMatchObject({
+      status: "succeeded",
+      terminalOutcome: "skipped_no_provider",
+      terminalReason: "no_provider",
+      observationCount: 1,
+      sourceFingerprint: summarySourceFingerprint([observation]),
+    });
+    expect(graph).not.toHaveBeenCalled();
+    expect(await kv.list(KV.projectionPending("summary"))).toHaveLength(0);
+    expect(await kv.list(KV.projectionFailed("summary"))).toHaveLength(0);
+    expect(await kv.get("mem:maintenance:projections", "global")).toBeNull();
+    await expect(
+      sdk.trigger("mem::project-session", { sessionId: session.id }),
+    ).resolves.toMatchObject({
+      success: true,
+      skipped: true,
+      reason: "no_provider",
+      deduplicated: true,
+    });
+    expect(summarize).toHaveBeenCalledTimes(1);
+    expect(await kv.get(KV.sessionProjections, session.id)).toMatchObject({
+      attempts: 1,
+      terminalOutcome: "skipped_no_provider",
+      terminalReason: "no_provider",
+    });
+  });
+
+  it("promotes a matching stored summary only after provider-free graph success", async () => {
+    const sdk = mockSdk({ looseTrigger: true });
+    const kv = mockKV();
+    const session = makeSession("ses_existing_summary");
+    const observation = makeObservation(session.id);
+    const summary = makeSummary(session, observation);
+    const summarize = vi.fn(async () => ({ success: true }));
+    const graph = vi.fn(async () => ({ success: true }));
+    await seedSession(kv, session, observation);
+    await kv.set(KV.summaries, session.id, summary);
+    registerSessionProjectionFunction(
+      sdk as never,
+      kv as never,
+      summarize,
+      graph,
+      new ProjectionCoordinator(),
+    );
+
+    await sdk.trigger("mem::queue-session-projection", {
+      sessionId: session.id,
+    });
+    const result = await sdk.trigger("mem::project-session", {
+      sessionId: session.id,
+    });
+
+    expect(result).toMatchObject({ success: true });
+    expect(await kv.get(KV.sessionProjections, session.id)).toMatchObject({
+      status: "succeeded",
+      terminalOutcome: "summary_written",
+      observationCount: 1,
+      sourceFingerprint: summary.sourceFingerprint,
+    });
+    expect(summarize).not.toHaveBeenCalled();
+    expect(graph).toHaveBeenCalledTimes(1);
+    expect(await kv.get(KV.sessionProjections, session.id)).not.toHaveProperty(
+      "terminalReason",
+    );
+  });
+
+  it("does not deduplicate a written-summary projection when its stored summary fingerprint differs", async () => {
+    const sdk = mockSdk({ looseTrigger: true });
+    const kv = mockKV();
+    const session = makeSession("ses_mismatched_dedup");
+    const observation = makeObservation(session.id);
+    const currentFingerprint = summarySourceFingerprint([observation]);
+    const summarize = vi.fn(async () => ({
+      success: false as const,
+      error: "provider_unavailable",
+    }));
+    const graph = vi.fn(async () => ({ success: true }));
+    await seedSession(kv, session, observation);
+    await kv.set(KV.summaries, session.id, makeSummary(session, observation, "stale"));
+    await kv.set(KV.sessionProjections, session.id, {
+      sessionId: session.id,
+      status: "succeeded",
+      attempts: 1,
+      observationCount: 1,
+      sourceFingerprint: currentFingerprint,
+      terminalOutcome: "summary_written",
+      updatedAt: "2026-08-31T00:06:00.000Z",
+    });
+    registerSessionProjectionFunction(
+      sdk as never,
+      kv as never,
+      summarize,
+      graph,
+      new ProjectionCoordinator(),
+    );
+
+    const result = await sdk.trigger("mem::project-session", {
+      sessionId: session.id,
+    });
+
+    expect(result).toMatchObject({ success: false });
+    expect(summarize).toHaveBeenCalledTimes(1);
+    expect(await kv.get(KV.sessionProjections, session.id)).toMatchObject({
+      status: "failed",
+      attempts: 2,
+    });
+    expect(await kv.get(KV.sessionProjections, session.id)).not.toHaveProperty(
+      "terminalOutcome",
+    );
+  });
+
+  it("fails closed when provider success stores a summary for a different source fingerprint", async () => {
+    const sdk = mockSdk({ looseTrigger: true });
+    const kv = mockKV();
+    const session = makeSession("ses_stale_provider_summary");
+    const observation = makeObservation(session.id);
+    const graph = vi.fn(async () => ({ success: true }));
+    await seedSession(kv, session, observation);
+    const summarize = vi.fn(async () => {
+      await kv.set(
+        KV.summaries,
+        session.id,
+        makeSummary(session, observation, "stale-provider-fingerprint"),
+      );
+      return { success: true };
+    });
+    registerSessionProjectionFunction(
+      sdk as never,
+      kv as never,
+      summarize,
+      graph,
+      new ProjectionCoordinator(),
+    );
+
+    await sdk.trigger("mem::queue-session-projection", {
+      sessionId: session.id,
+    });
+    const result = await sdk.trigger("mem::project-session", {
+      sessionId: session.id,
+    });
+
+    expect(result).toMatchObject({ success: false });
+    expect(graph).not.toHaveBeenCalled();
+    expect(await kv.get(KV.sessionProjections, session.id)).toMatchObject({
+      status: "failed",
+      attempts: 1,
+    });
+  });
+
   it("keeps the session and previous summary when summary projection fails", async () => {
     const sdk = mockSdk({ looseTrigger: true });
     const kv = mockKV();
@@ -255,15 +547,18 @@ describe("durable terminal session projection", () => {
       attempts: 1,
       evictAfterSuccess: true,
     });
+    expect(
+      await kv.get(KV.sessionProjections, session.id),
+    ).not.toHaveProperty("terminalOutcome");
   });
 
-  it("does not mark semantic graph failure as terminal success", async () => {
+  it("retries graph-only after semantic graph failure leaves a matching summary", async () => {
     const sdk = mockSdk({ looseTrigger: true });
     const kv = mockKV();
     const session = makeSession("ses_graph_failed");
     const observation = makeObservation(session.id);
     await seedSession(kv, session, observation);
-    sdk.registerFunction("mem::summarize", async () => {
+    const summarize = vi.fn(async () => {
       const summary: SessionSummary = {
         sessionId: session.id,
         project: session.project,
@@ -280,10 +575,15 @@ describe("durable terminal session projection", () => {
       await kv.set(KV.summaries, session.id, summary);
       return { success: true, summary };
     });
-    sdk.registerFunction("mem::project-graph-sources", async () => ({
-      success: false,
-      error: "semantic_graph_unavailable",
-    }));
+    const graph = vi
+      .fn()
+      .mockResolvedValueOnce({
+        success: false,
+        error: "semantic_graph_unavailable",
+      })
+      .mockResolvedValue({ success: true });
+    sdk.registerFunction("mem::summarize", summarize);
+    sdk.registerFunction("mem::project-graph-sources", graph);
     registerSessionProjectionFunction(sdk as never, kv as never);
 
     await sdk.trigger("mem::queue-session-projection", {
@@ -297,6 +597,17 @@ describe("durable terminal session projection", () => {
     expect(await kv.get(KV.sessionProjections, session.id)).toMatchObject({
       status: "failed",
       attempts: 1,
+    });
+    const retry = await sdk.trigger("mem::project-session", {
+      sessionId: session.id,
+    });
+    expect(retry).toMatchObject({ success: true });
+    expect(summarize).toHaveBeenCalledTimes(1);
+    expect(graph).toHaveBeenCalledTimes(2);
+    expect(await kv.get(KV.sessionProjections, session.id)).toMatchObject({
+      status: "succeeded",
+      attempts: 2,
+      terminalOutcome: "summary_written",
     });
   });
 

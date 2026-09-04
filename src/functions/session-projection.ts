@@ -6,7 +6,10 @@ import type {
   SessionProjection,
   SessionSummary,
 } from "../types.js";
-import { isConsolidationEnabled } from "../config.js";
+import {
+  isAutoSummarizeEnabled,
+  isConsolidationEnabled,
+} from "../config.js";
 import { logger } from "../logger.js";
 import { withKeyedLock } from "../state/keyed-mutex.js";
 import { StateKV } from "../state/kv.js";
@@ -152,12 +155,53 @@ export function registerSessionProjectionFunction(
         }
         const observations = await compressedObservations(kv, data.sessionId);
         const sourceFingerprint = summarySourceFingerprint(observations);
+        const currentSummary = await kv.get<SessionSummary>(
+          KV.summaries,
+          data.sessionId,
+        );
+        const summaryMatches =
+          currentSummary?.sourceFingerprint === sourceFingerprint;
+        const skippedOutcome =
+          previous.terminalOutcome === "skipped_automatic_enrichment" ||
+          previous.terminalOutcome === "skipped_no_provider";
         if (
           previous.status === "succeeded" &&
-          previous.sourceFingerprint === sourceFingerprint
+          previous.sourceFingerprint === sourceFingerprint &&
+          previous.terminalOutcome === "summary_written" &&
+          summaryMatches
         ) {
+          if (previous.terminalReason !== undefined) {
+            const succeeded = { ...previous };
+            delete succeeded.terminalReason;
+            await kv.set(KV.sessionProjections, data.sessionId, succeeded);
+          }
           await markProjectionSucceeded(kv, "summary", data.sessionId);
           return { success: true, deduplicated: true };
+        }
+        if (
+          previous.status === "succeeded" &&
+          previous.sourceFingerprint === sourceFingerprint &&
+          skippedOutcome &&
+          !summaryMatches
+        ) {
+          const terminalReason =
+            previous.terminalOutcome === "skipped_no_provider"
+              ? "no_provider"
+              : "automatic_enrichment_disabled";
+          if (previous.terminalReason !== terminalReason) {
+            await kv.set(KV.sessionProjections, data.sessionId, {
+              ...previous,
+              terminalReason,
+              updatedAt: new Date().toISOString(),
+            });
+          }
+          await markProjectionSucceeded(kv, "summary", data.sessionId);
+          return {
+            success: true,
+            skipped: true,
+            reason: terminalReason,
+            deduplicated: true,
+          };
         }
 
         const running: SessionProjection = {
@@ -169,6 +213,8 @@ export function registerSessionProjectionFunction(
           updatedAt: new Date().toISOString(),
         };
         delete running.lastError;
+        delete running.terminalOutcome;
+        delete running.terminalReason;
         await kv.set(KV.sessionProjections, data.sessionId, running);
         await markProjectionPending(
           kv,
@@ -177,24 +223,61 @@ export function registerSessionProjectionFunction(
           previous.updatedAt,
         );
 
+        const persistSkipped = async (
+          terminalOutcome:
+            | "skipped_automatic_enrichment"
+            | "skipped_no_provider",
+          terminalReason: "automatic_enrichment_disabled" | "no_provider",
+        ) => {
+          const succeeded: SessionProjection = {
+            ...previous,
+            status: "succeeded",
+            attempts: running.attempts,
+            observationCount: running.observationCount,
+            sourceFingerprint,
+            terminalOutcome,
+            terminalReason,
+            updatedAt: new Date().toISOString(),
+          };
+          delete succeeded.lastError;
+          await kv.set(KV.sessionProjections, data.sessionId, succeeded);
+          await markProjectionSucceeded(kv, "summary", data.sessionId);
+          return { success: true, skipped: true, reason: terminalReason };
+        };
+
         try {
-          const summaryResult = summarizeSessionCore
-            ? await summarizeSessionCore({ sessionId: data.sessionId })
-            : ((await sdk.trigger({
-                function_id: "mem::summarize",
-                payload: { sessionId: data.sessionId },
-              })) as SummarizeSessionResult | null);
-          if (!summaryResult?.success) {
-            throw new Error(
-              summaryResult?.error || "summary did not report success",
+          let summary = summaryMatches ? currentSummary : null;
+          if (!summary) {
+            if (!isAutoSummarizeEnabled()) {
+              return await persistSkipped(
+                "skipped_automatic_enrichment",
+                "automatic_enrichment_disabled",
+              );
+            }
+            const summaryResult = summarizeSessionCore
+              ? await summarizeSessionCore({ sessionId: data.sessionId })
+              : ((await sdk.trigger({
+                  function_id: "mem::summarize",
+                  payload: { sessionId: data.sessionId },
+                })) as SummarizeSessionResult | null);
+            if (
+              summaryResult?.success === false &&
+              summaryResult.error === "no_provider"
+            ) {
+              return await persistSkipped("skipped_no_provider", "no_provider");
+            }
+            if (!summaryResult?.success) {
+              throw new Error(
+                summaryResult?.error || "summary did not report success",
+              );
+            }
+            summary = await kv.get<SessionSummary>(
+              KV.summaries,
+              data.sessionId,
             );
-          }
-          const summary = await kv.get<SessionSummary>(
-            KV.summaries,
-            data.sessionId,
-          );
-          if (!summary?.sourceFingerprint) {
-            throw new Error("successful summary state missing fingerprint");
+            if (summary?.sourceFingerprint !== sourceFingerprint) {
+              throw new Error("successful summary state fingerprint mismatch");
+            }
           }
 
           const graphRequest: GraphSourceProjectionRequest = {
@@ -224,6 +307,7 @@ export function registerSessionProjectionFunction(
             status: "succeeded",
             observationCount: summary.observationCount,
             sourceFingerprint: summary.sourceFingerprint,
+            terminalOutcome: "summary_written",
             updatedAt: new Date().toISOString(),
           };
           await kv.set(KV.sessionProjections, data.sessionId, succeeded);
@@ -314,22 +398,45 @@ export function registerSessionProjectionFunction(
           KV.sessionProjections,
           data.sessionId,
         );
+        const summary = await kv.get<SessionSummary>(KV.summaries, data.sessionId);
+        const summaryMatches = summary?.sourceFingerprint === sourceFingerprint;
+        const skippedOutcome =
+          previous?.terminalOutcome === "skipped_automatic_enrichment" ||
+          previous?.terminalOutcome === "skipped_no_provider";
         const evictAfterSuccess =
           previous?.evictAfterSuccess === true ||
           data.evictAfterSuccess === true;
 
         if (
           previous?.status === "succeeded" &&
-          previous.sourceFingerprint === sourceFingerprint
+          previous.sourceFingerprint === sourceFingerprint &&
+          ((skippedOutcome && !summaryMatches) ||
+            (previous.terminalOutcome === "summary_written" && summaryMatches))
         ) {
-          if (evictAfterSuccess !== previous.evictAfterSuccess) {
-            await kv.set(KV.sessionProjections, data.sessionId, {
+          if (
+            evictAfterSuccess !== previous.evictAfterSuccess ||
+            (!skippedOutcome && previous.terminalReason !== undefined)
+          ) {
+            const deduplicated = {
               ...previous,
               evictAfterSuccess,
               updatedAt: new Date().toISOString(),
-            });
+            };
+            if (!skippedOutcome) delete deduplicated.terminalReason;
+            await kv.set(KV.sessionProjections, data.sessionId, deduplicated);
           }
           await markProjectionSucceeded(kv, "summary", data.sessionId);
+          if (skippedOutcome) {
+            return {
+              success: true,
+              skipped: true,
+              reason:
+                previous.terminalOutcome === "skipped_no_provider"
+                  ? "no_provider"
+                  : "automatic_enrichment_disabled",
+              deduplicated: true,
+            };
+          }
           return { success: true, deduplicated: true };
         }
         if (

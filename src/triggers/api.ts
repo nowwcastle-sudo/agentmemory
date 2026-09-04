@@ -2015,10 +2015,15 @@ export function registerApiTriggers(
 
   sdk.registerFunction("api::consolidate-pipeline",
     async (req: ApiRequest<{ tier?: string }>): Promise<Response> => {
+      const secretErr = requireConfiguredSecret(secret, "consolidation");
+      if (secretErr) return secretErr;
       const authErr = checkAuth(req, secret);
       if (authErr) return authErr;
       try {
-        const result = await sdk.trigger({ function_id: "mem::consolidate-pipeline", payload: req.body || {},
+        const result = await sdk.trigger({ function_id: "mem::consolidate-pipeline", payload: {
+          tier: req.body?.tier,
+          force: true,
+        },
          });
         return { status_code: 200, body: result };
       } catch {

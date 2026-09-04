@@ -105,7 +105,10 @@ export function registerEvictFunction(sdk: ISdk, kv: StateKV): void {
       const summaries = await kv
         .list<SessionSummary>(KV.summaries)
         .catch(() => []);
-      const summaryIds = new Set(summaries.map((s) => s.sessionId));
+      const summaryBySession = new Map(
+        summaries.map((summary) => [summary.sessionId, summary]),
+      );
+      const summaryIds = new Set(summaryBySession.keys());
       const sessionProjections = await kv
         .list<SessionProjection>(KV.sessionProjections)
         .catch(() => []);
@@ -123,17 +126,21 @@ export function registerEvictFunction(sdk: ISdk, kv: StateKV): void {
         if (age <= staleDays) continue;
 
         const projection = projectionBySession.get(session.id);
+        const summary = summaryBySession.get(session.id);
+        const projectionFingerprint = projection?.sourceFingerprint;
         const enrichmentSucceeded =
           projection?.status === "succeeded" &&
-          projection.evictAfterSuccess === true;
-        if (dryRun) {
-          if (enrichmentSucceeded || !summaryIds.has(session.id)) {
-            stats.staleSessions++;
-          }
-          continue;
-        }
-
+          projection.evictAfterSuccess === true &&
+          (projection.terminalOutcome === "summary_written" ||
+            projection.terminalOutcome === undefined) &&
+          typeof projectionFingerprint === "string" &&
+          projectionFingerprint.length > 0 &&
+          summary?.sourceFingerprint === projectionFingerprint;
         if (enrichmentSucceeded) {
+          if (dryRun) {
+            stats.staleSessions++;
+            continue;
+          }
           try {
             await kv.delete(KV.sessions, session.id);
             stats.staleSessions++;
@@ -152,6 +159,7 @@ export function registerEvictFunction(sdk: ISdk, kv: StateKV): void {
           });
           continue;
         }
+        if (projection) continue;
         if (summaryIds.has(session.id)) continue;
 
         const observations = await kv
@@ -171,13 +179,18 @@ export function registerEvictFunction(sdk: ISdk, kv: StateKV): void {
           isCompressedObservation,
         );
         if (hasCompressedObservations) {
-          await recoverStaleSession(sdk, session.id);
+          if (!dryRun) await recoverStaleSession(sdk, session.id);
           continue;
         }
         if (observations.length > 0) {
           logger.warn("Stale session has no compressed observations", {
             sessionId: session.id,
           });
+          continue;
+        }
+
+        if (dryRun) {
+          stats.staleSessions++;
           continue;
         }
 
