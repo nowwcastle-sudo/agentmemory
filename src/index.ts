@@ -27,6 +27,7 @@ import { HybridSearch } from "./state/hybrid-search.js";
 import { IndexPersistence } from "./state/index-persistence.js";
 import { registerPrivacyFunction } from "./functions/privacy.js";
 import { registerObserveFunction } from "./functions/observe.js";
+import { registerObservationProjectionFunction } from "./functions/observation-projection.js";
 import { registerImageQuotaCleanup } from "./functions/image-quota-cleanup.js";
 import { registerVisionSearchFunctions } from "./functions/vision-search.js";
 import { registerSlotsFunctions, isSlotsEnabled, isReflectEnabled } from "./functions/slots.js";
@@ -59,6 +60,8 @@ import { registerExportImportFunction } from "./functions/export-import.js";
 import { registerEnrichFunction } from "./functions/enrich.js";
 import { registerClaudeBridgeFunction } from "./functions/claude-bridge.js";
 import { registerGraphFunction } from "./functions/graph.js";
+import { registerGraphSourceProjectionFunction } from "./functions/graph-source-projection.js";
+import { ProjectionCoordinator } from "./functions/projection-coordinator.js";
 import { registerGraphImportFunction } from "./functions/graph-import.js";
 import { registerConsolidationPipelineFunction } from "./functions/consolidation-pipeline.js";
 import { registerTeamFunction } from "./functions/team.js";
@@ -91,6 +94,8 @@ import { registerTemporalGraphFunctions } from "./functions/temporal-graph.js";
 import { registerRetentionFunctions } from "./functions/retention.js";
 import { registerCompressFileFunction } from "./functions/compress-file.js";
 import { registerReplayFunctions } from "./functions/replay.js";
+import { registerSessionProjectionFunction } from "./functions/session-projection.js";
+import { registerMaintenanceProjectionFunction } from "./functions/maintenance-projection.js";
 import { registerApiTriggers } from "./triggers/api.js";
 import { registerEventTriggers } from "./triggers/events.js";
 import { registerMcpEndpoints } from "./mcp/server.js";
@@ -99,6 +104,16 @@ import { startViewerServer } from "./viewer/server.js";
 import { MetricsStore } from "./eval/metrics-store.js";
 import { DedupMap } from "./functions/dedup.js";
 import { registerHealthMonitor } from "./health/monitor.js";
+import {
+  collectPipelineHealth,
+  startPipelineReconcileLoop,
+} from "./health/pipeline.js";
+import {
+  defaultConnectorOutboxes,
+  recoverConnectorOutboxClaims,
+  registerConnectorOutboxReplayFunctions,
+  startConnectorOutboxReplayLoop,
+} from "./functions/connector-outbox.js";
 import { initMetrics, OTEL_CONFIG } from "./telemetry/setup.js";
 import { VERSION } from "./version.js";
 import { bootLog } from "./logger.js";
@@ -221,6 +236,7 @@ async function main() {
   const secret = getEnvVar("AGENTMEMORY_SECRET");
   const metricsStore = new MetricsStore(kv);
   const dedupMap = new DedupMap();
+  const projectionCoordinator = new ProjectionCoordinator();
 
   const vectorIndex = embeddingProvider ? new VectorIndex() : null;
 
@@ -234,17 +250,28 @@ async function main() {
   initMetrics(meterAccessor as ((name: string) => import("@opentelemetry/api").Meter) | undefined);
 
   registerPrivacyFunction(sdk);
-  registerObserveFunction(sdk, kv, dedupMap, config.maxObservationsPerSession);
   registerImageQuotaCleanup(sdk, kv);
   registerVisionSearchFunctions(sdk, kv, imageEmbeddingProvider);
   if (isSlotsEnabled()) {
     registerSlotsFunctions(sdk, kv);
   }
   registerDiskSizeManager(sdk, kv);
-  registerCompressFunction(sdk, kv, provider, metricsStore);
+  const compressionCore = registerCompressFunction(
+    sdk,
+    kv,
+    provider,
+    metricsStore,
+    projectionCoordinator,
+  );
   registerSearchFunction(sdk, kv);
   registerContextFunction(sdk, kv, config.tokenBudget);
-  registerSummarizeFunction(sdk, kv, provider, metricsStore);
+  const summarizeSessionCore = registerSummarizeFunction(
+    sdk,
+    kv,
+    provider,
+    metricsStore,
+    projectionCoordinator,
+  );
   registerMigrateFunction(sdk, kv);
   registerFileIndexFunction(sdk, kv);
   registerConsolidateFunction(sdk, kv, provider);
@@ -267,7 +294,26 @@ async function main() {
     );
   }
 
-  registerGraphFunction(sdk, kv, provider);
+  const graphExtractCore = registerGraphFunction(
+    sdk,
+    kv,
+    provider,
+    projectionCoordinator,
+  );
+  const projectGraphSourcesCore = registerGraphSourceProjectionFunction(
+    sdk,
+    kv,
+    graphExtractCore,
+    projectionCoordinator,
+  );
+  const observationProjectionRecovery = registerObservationProjectionFunction(
+    sdk,
+    kv,
+    compressionCore,
+    projectGraphSourcesCore,
+    projectionCoordinator,
+  );
+  registerObserveFunction(sdk, kv, dedupMap, config.maxObservationsPerSession);
   registerGraphImportFunction(sdk, kv);
   bootLog(
     `Knowledge graph: structural extraction on (LLM relations ${isGraphExtractionEnabled() ? "enabled" : "off"})`,
@@ -318,7 +364,7 @@ async function main() {
   registerSentinelsFunction(sdk, kv);
   registerSketchesFunction(sdk, kv);
   registerCrystallizeFunction(sdk, kv, provider);
-  registerDiagnosticsFunction(sdk, kv);
+  registerDiagnosticsFunction(sdk, kv, projectionCoordinator);
   registerFacetsFunction(sdk, kv);
   registerVerifyFunction(sdk, kv);
   registerLessonsFunctions(sdk, kv);
@@ -334,6 +380,21 @@ async function main() {
   registerRetentionFunctions(sdk, kv);
   registerCompressFileFunction(sdk, kv, provider);
   registerReplayFunctions(sdk, kv);
+  const sessionProjectionRecovery = registerSessionProjectionFunction(
+    sdk,
+    kv,
+    summarizeSessionCore,
+    projectGraphSourcesCore,
+    projectionCoordinator,
+  );
+  registerMaintenanceProjectionFunction(sdk, kv, projectionCoordinator);
+  const connectorOutboxes = defaultConnectorOutboxes();
+  registerConnectorOutboxReplayFunctions(sdk, {
+    outboxes: connectorOutboxes,
+    baseUrl: `http://127.0.0.1:${config.restPort}`,
+    secret,
+  });
+  await recoverConnectorOutboxClaims(connectorOutboxes);
   bootLog(
     `v0.6 advanced retrieval: sliding-window, query-expansion, temporal-graph, retention-scoring`,
   );
@@ -381,8 +442,11 @@ async function main() {
     graphWeight,
   );
 
-  const hybridRanker = (query: string, limit: number) =>
-    hybridSearch.search(query, limit);
+  const hybridRanker = (
+    query: string,
+    limit: number,
+    scope?: import("./types.js").RetrievalScope,
+  ) => hybridSearch.search(query, limit, scope);
   registerSmartSearchFunction(sdk, kv, hybridRanker);
   setHybridRanker(hybridRanker);
   registerRecentSearchesSweepFunction(sdk, kv);
@@ -390,8 +454,6 @@ async function main() {
   registerApiTriggers(sdk, kv, secret, metricsStore, provider);
   registerEventTriggers(sdk, kv);
   registerMcpEndpoints(sdk, kv, secret);
-
-  const healthMonitor = registerHealthMonitor(sdk, kv);
 
   const indexPersistence = new IndexPersistence(kv, bm25Index, vectorIndex);
   // Wire the persistence hook so delete paths can flush BM25/vector
@@ -528,6 +590,35 @@ async function main() {
     }
   }
 
+  observationProjectionRecovery.startRecovery();
+  // startRecovery is capped at one historical projection so liveness keeps a
+  // worker slot at boot. That cap also means a backlog never moves on its own:
+  // a credit only arrives with a new observation, so pending stays flat while
+  // the queue is quiet. Pace one extra credit per tick to clear it.
+  observationProjectionRecovery.startPacedRecovery();
+  sessionProjectionRecovery.startRecovery();
+  const healthMonitor = registerHealthMonitor(
+    sdk,
+    kv,
+    connectorOutboxes,
+    projectionCoordinator,
+  );
+  const pipelineReconcileLoop = startPipelineReconcileLoop(sdk);
+  const connectorOutboxReplayLoop = startConnectorOutboxReplayLoop(
+    sdk,
+    30_000,
+    async () => {
+      const pipeline = await collectPipelineHealth(kv);
+      return [pipeline.compression, pipeline.summary, pipeline.graph].every(
+        (stage) => stage.pending === 0 && stage.failed === 0,
+      );
+    },
+  );
+  bootLog("Projection recovery: enabled (every 1m)");
+  bootLog(
+    "Connector outbox replay: enabled (one current envelope every 30s when projections are settled)",
+  );
+
   // Ready / Endpoints lines are emitted via `bootLog` so they're
   // buffered in quiet mode and printed verbatim under --verbose. The
   // CLI surfaces a compact summary when it sees the worker reach
@@ -536,7 +627,7 @@ async function main() {
     `Ready. ${embeddingProvider ? "Triple-stream (BM25+Vector+Graph)" : "BM25+Graph"} search active.`,
   );
   bootLog(
-    `REST API: 130 endpoints at http://localhost:${config.restPort}/agentmemory/*`,
+    `REST API: 134 endpoints at http://localhost:${config.restPort}/agentmemory/*`,
   );
   bootLog(
     `MCP surface (opt-in via \`npx @agentmemory/mcp\`): ${getAllTools().length} tools · 6 resources · 3 prompts`,
@@ -609,6 +700,8 @@ async function main() {
   const shutdown = async () => {
     console.log(`\n[agentmemory] Shutting down...`);
     healthMonitor.stop();
+    pipelineReconcileLoop.stop();
+    connectorOutboxReplayLoop.stop();
     dedupMap.stop();
     indexPersistence.stop();
     await new Promise<void>((resolve) => viewerServer.close(() => resolve()));

@@ -1,0 +1,201 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { ObservationProjection, RawObservation } from "../src/types.js";
+import { KV } from "../src/state/schema.js";
+import { ProjectionCoordinator } from "../src/functions/projection-coordinator.js";
+import { mockKV, mockSdk } from "./helpers/mocks.js";
+
+vi.mock("../src/logger.js", () => ({
+  logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+}));
+
+const SESSION = "ses_drain_backlog";
+
+function rawObservation(id: string, index: number): RawObservation {
+  return {
+    id,
+    captureId: `capture-${id}`,
+    sessionId: SESSION,
+    timestamp: `2026-09-04T00:00:${String(index).padStart(2, "0")}.000Z`,
+    hookType: "conversation",
+    raw: { prompt: `backlog item ${index}` },
+  } satisfies RawObservation;
+}
+
+function pendingProjection(id: string, index: number): ObservationProjection {
+  return {
+    observationId: id,
+    captureId: `capture-${id}`,
+    sessionId: SESSION,
+    status: "pending",
+    attempts: 0,
+    updatedAt: `2026-09-04T00:00:${String(index).padStart(2, "0")}.000Z`,
+  } satisfies ObservationProjection;
+}
+
+/** Seeds observations that were queued but never projected — a real backlog. */
+async function seedBacklog(
+  kv: ReturnType<typeof mockKV>,
+  count: number,
+): Promise<string[]> {
+  const ids: string[] = [];
+  for (let index = 0; index < count; index += 1) {
+    const id = `obs_backlog_${index}`;
+    ids.push(id);
+    await kv.set(KV.rawObservations(SESSION), id, rawObservation(id, index));
+    await kv.set(KV.observationProjections, id, pendingProjection(id, index));
+  }
+  return ids;
+}
+
+async function registerPipeline(
+  sdk: ReturnType<typeof mockSdk>,
+  kv: ReturnType<typeof mockKV>,
+) {
+  const { registerObservationProjectionFunction } = await import(
+    "../src/functions/observation-projection.js"
+  );
+  return registerObservationProjectionFunction(
+    sdk as never,
+    kv as never,
+    undefined,
+    undefined,
+    new ProjectionCoordinator(),
+  );
+}
+
+function stubProjectionWork(sdk: ReturnType<typeof mockSdk>) {
+  sdk.registerFunction("mem::compress", async () => ({ success: true }));
+  sdk.registerFunction("mem::project-graph-sources", async () => ({
+    success: true,
+  }));
+}
+
+/**
+ * Reads the backing store directly. Polling through `kv.list` would land in the
+ * same counter the batching test asserts on.
+ */
+function succeededCount(kv: ReturnType<typeof mockKV>): number {
+  const rows = kv.store.get(KV.observationProjections);
+  if (!rows) return 0;
+  return Array.from(rows.values()).filter(
+    (row) => (row as ObservationProjection).status === "succeeded",
+  ).length;
+}
+
+describe("observation projection backlog recovery", () => {
+  beforeEach(() => {
+    process.env["AGENTMEMORY_AUTO_COMPRESS"] = "true";
+  });
+
+  afterEach(() => {
+    delete process.env["AGENTMEMORY_PROJECTION_RECOVERY_INTERVAL_MS"];
+  });
+
+  it("keeps startup recovery capped at one projection", async () => {
+    // Guards the existing liveness contract: registering the pipeline must not
+    // start draining a backlog on its own.
+    const sdk = mockSdk({ looseTrigger: true });
+    const kv = mockKV();
+    const recovery = await registerPipeline(sdk, kv);
+    stubProjectionWork(sdk);
+    await seedBacklog(kv, 3);
+
+    recovery.startRecovery();
+    await vi.waitFor(() => expect(succeededCount(kv)).toBe(1));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(succeededCount(kv)).toBe(1);
+  });
+
+  it("drains a backlog once paced recovery is running", async () => {
+    const sdk = mockSdk({ looseTrigger: true });
+    const kv = mockKV();
+    const recovery = await registerPipeline(sdk, kv);
+    stubProjectionWork(sdk);
+    await seedBacklog(kv, 5);
+
+    // Paced recovery hands the drain one credit per tick, so a backlog clears
+    // without ever holding more than one worker slot.
+    const stop = recovery.startPacedRecovery({ intervalMs: 5 });
+    try {
+      await vi.waitFor(() => expect(succeededCount(kv)).toBe(5), {
+        timeout: 5000,
+      });
+    } finally {
+      stop();
+    }
+    expect(await kv.list(KV.projectionPending("compression"))).toHaveLength(0);
+  });
+
+  it("stops re-scanning the projection scope once the backlog is empty", async () => {
+    const sdk = mockSdk({ looseTrigger: true });
+    const kv = mockKV();
+    let projectionListReads = 0;
+    const list = kv.list.bind(kv);
+    kv.list = (async <T,>(scope: string): Promise<T[]> => {
+      if (scope === KV.observationProjections) projectionListReads += 1;
+      return list<T>(scope);
+    }) as typeof kv.list;
+
+    const recovery = await registerPipeline(sdk, kv);
+    stubProjectionWork(sdk);
+    await seedBacklog(kv, 2);
+
+    const stop = recovery.startPacedRecovery({ intervalMs: 5 });
+    try {
+      await vi.waitFor(() => expect(succeededCount(kv)).toBe(2), {
+        timeout: 5000,
+      });
+      // One empty scan arms the cooldown; further ticks must not re-scan.
+      await vi.waitFor(() => expect(projectionListReads).toBeGreaterThan(1));
+      const settled = projectionListReads;
+      await new Promise((resolve) => setTimeout(resolve, 60)); // ≥ 10 ticks
+      expect(projectionListReads).toBe(settled);
+    } finally {
+      stop();
+    }
+  });
+
+  it("treats an interval of 0 as disabled", async () => {
+    const sdk = mockSdk({ looseTrigger: true });
+    const kv = mockKV();
+    const recovery = await registerPipeline(sdk, kv);
+    stubProjectionWork(sdk);
+    await seedBacklog(kv, 2);
+
+    const stop = recovery.startPacedRecovery({ intervalMs: 0 });
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      expect(succeededCount(kv)).toBe(0);
+    } finally {
+      stop();
+    }
+  });
+
+  it("reads the projection list once per batch rather than once per item", async () => {
+    const sdk = mockSdk({ looseTrigger: true });
+    const kv = mockKV();
+    let projectionListReads = 0;
+    const list = kv.list.bind(kv);
+    kv.list = (async <T,>(scope: string): Promise<T[]> => {
+      if (scope === KV.observationProjections) projectionListReads += 1;
+      return list<T>(scope);
+    }) as typeof kv.list;
+
+    const recovery = await registerPipeline(sdk, kv);
+    stubProjectionWork(sdk);
+    await seedBacklog(kv, 6);
+
+    const stop = recovery.startPacedRecovery({ intervalMs: 5 });
+    try {
+      await vi.waitFor(() => expect(succeededCount(kv)).toBe(6), {
+        timeout: 5000,
+      });
+    } finally {
+      stop();
+    }
+
+    // Six items must not cost six full scans of the projection scope: that
+    // O(n^2) is what stalls a large backlog.
+    expect(projectionListReads).toBeLessThanOrEqual(3);
+  });
+});
