@@ -96,6 +96,7 @@ describe("git-toplevel resolution parity", () => {
       const w = new FilesystemWatcher({
         roots: [repoDir, repoB],
         baseUrl: "http://localhost:3111",
+        outboxDir: join(tmpRoot, "watcher-outbox"),
         logger: {},
       });
       await w.flush(w.roots[0], "a.txt");

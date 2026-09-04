@@ -14,6 +14,7 @@ const testHome = mkdtempSync(join(tmpdir(), "agentmemory-test-home-"));
 export default defineConfig({
   test: {
     env: {
+      AGENTMEMORY_OUTBOX_DIR: join(testHome, "outbox"),
       HOME: testHome,
       USERPROFILE: testHome,
     },
