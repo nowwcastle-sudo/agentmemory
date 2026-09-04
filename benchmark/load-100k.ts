@@ -60,6 +60,39 @@ const CONCEPTS = [
   "hot-path", "cold-start", "tail-latency", "saturation", "quiescence",
 ];
 
+/**
+ * Bearer token for a deployment that sets AGENTMEMORY_SECRET. Without it every
+ * request returns 401 in ~4 ms and each cell reports 100% errors instead of a
+ * latency number — the run looks fast and measures nothing.
+ */
+/**
+ * Per-request timeout. The fixed 30 s was fine when every request 401'd in
+ * milliseconds, but a saturated deployment can take longer than that on
+ * /agentmemory/search — and a cell that reports 100% errors is not a latency
+ * measurement. Widen it deliberately with BENCH_TIMEOUT_MS when measuring a
+ * degraded system; leave it alone to let a regression show up as errors.
+ */
+const REQUEST_TIMEOUT_MS =
+  parseInt(process.env["BENCH_TIMEOUT_MS"] || "30000", 10) || 30_000;
+
+function authHeaders(extra: Record<string, string> = {}): Record<string, string> {
+  const secret = process.env["AGENTMEMORY_SECRET"];
+  return secret ? { ...extra, authorization: `Bearer ${secret}` } : extra;
+}
+
+/**
+ * Queries that actually reach the graph leg of hybrid search.
+ * extractEntitiesFromQuery matches [A-Z][a-zA-Z0-9_.-]+, so the
+ * all-lowercase text from buildContent yields no entities and searchByEntities
+ * never runs — a graph regression would not move these numbers at all.
+ */
+function buildEntityQuery(rng: () => number, i: number): string {
+  const noun = NOUNS[Math.floor(rng() * NOUNS.length)]!;
+  const concept = CONCEPTS[Math.floor(rng() * CONCEPTS.length)]!;
+  const cap = (w: string) => w.charAt(0).toUpperCase() + w.slice(1);
+  return `${cap(noun)} ${cap(concept)} seed${i % 97}`;
+}
+
 function buildContent(rng: () => number, i: number): string {
   const n = NOUNS[Math.floor(rng() * NOUNS.length)]!;
   const v = VERBS[Math.floor(rng() * VERBS.length)]!;
@@ -111,6 +144,7 @@ async function waitForLivez(baseUrl: string, timeoutMs: number): Promise<void> {
   while (Date.now() - start < timeoutMs) {
     try {
       const res = await fetch(`${baseUrl}/agentmemory/livez`, {
+        headers: authHeaders(),
         signal: AbortSignal.timeout(2000),
       });
       if (res.ok) return;
@@ -262,9 +296,9 @@ async function seedMemories(
       try {
         const res = await fetch(`${baseUrl}/agentmemory/remember`, {
           method: "POST",
-          headers: { "content-type": "application/json" },
+          headers: authHeaders({ "content-type": "application/json" }),
           body,
-          signal: AbortSignal.timeout(30_000),
+          signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
         });
         if (res.ok) {
           seeded++;
@@ -298,9 +332,9 @@ async function measureRemember(
     });
     const res = await fetch(`${baseUrl}/agentmemory/remember`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: authHeaders({ "content-type": "application/json" }),
       body,
-      signal: AbortSignal.timeout(30_000),
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     });
     await res.text().catch(() => "");
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -323,9 +357,9 @@ async function measureSmartSearch(
     });
     const res = await fetch(`${baseUrl}/agentmemory/smart-search`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: authHeaders({ "content-type": "application/json" }),
       body,
-      signal: AbortSignal.timeout(30_000),
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     });
     await res.text().catch(() => "");
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -340,6 +374,38 @@ async function measureSmartSearch(
   );
 }
 
+/**
+ * /agentmemory/search is the endpoint the graph leg sits on, and it was not
+ * measured at all. Half the queries carry capitalized tokens so the entity gate
+ * opens; the rest stay lowercase, so a regression in either path is visible.
+ */
+async function measureSearch(
+  baseUrl: string,
+  rng: () => number,
+  N: number,
+  C: number,
+  ops: number,
+): Promise<CellResult> {
+  const queries = Array.from({ length: 32 }, (_, i) =>
+    i % 2 === 0 ? buildEntityQuery(rng, i) : buildContent(rng, i),
+  );
+  const { latencies, errors, wallMs } = await driveLoad(C, ops, async (i) => {
+    const body = JSON.stringify({
+      query: queries[i % queries.length],
+      limit: 10,
+    });
+    const res = await fetch(`${baseUrl}/agentmemory/search`, {
+      method: "POST",
+      headers: authHeaders({ "content-type": "application/json" }),
+      body,
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    });
+    await res.text().catch(() => "");
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  });
+  return summarize("POST /agentmemory/search", N, C, latencies, errors, wallMs);
+}
+
 async function measureMemoriesLatest(
   baseUrl: string,
   N: number,
@@ -349,7 +415,8 @@ async function measureMemoriesLatest(
   const { latencies, errors, wallMs } = await driveLoad(C, ops, async () => {
     const res = await fetch(`${baseUrl}/agentmemory/memories?latest=true`, {
       method: "GET",
-      signal: AbortSignal.timeout(30_000),
+      headers: authHeaders(),
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     });
     await res.text().catch(() => "");
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -439,6 +506,16 @@ async function main(): Promise<void> {
           cfg.opsPerCell,
         );
         cells.push(search);
+
+        console.log(`[load-100k] cell N=${N} C=${C} search`);
+        const plainSearch = await measureSearch(
+          cfg.baseUrl,
+          mulberry32(cfg.seed ^ (N * 0xc2b2ae35) ^ C),
+          N,
+          C,
+          cfg.opsPerCell,
+        );
+        cells.push(plainSearch);
 
         console.log(`[load-100k] cell N=${N} C=${C} memories?latest=true`);
         const memories = await measureMemoriesLatest(
