@@ -1,16 +1,55 @@
 import type {
   GraphNode,
   GraphEdge,
+  GraphSourceLocator,
+  RetrievalScope,
 } from "../types.js";
 import { KV } from "../state/schema.js";
 import type { StateKV } from "../state/kv.js";
+import {
+  locatorRetrievalMetadata,
+  matchesRetrievalScope,
+} from "../state/retrieval-scope.js";
 
 export interface GraphRetrievalResult {
   obsId: string;
   sessionId: string;
+  source: GraphSourceLocator;
   score: number;
   graphContext: string;
   pathLength: number;
+}
+
+function nodeSourceRefs(node: GraphNode): GraphSourceLocator[] {
+  if (node.sourceRefs && node.sourceRefs.length > 0) return node.sourceRefs;
+  return node.sourceObservationIds.map((sourceId) => ({
+    sourceKind: sourceId.startsWith("mem_") ? "memory" : "observation",
+    sourceId,
+    ...(node.projectId ? { projectId: node.projectId } : {}),
+    ...(node.actorAgentId ? { actorAgentId: node.actorAgentId } : {}),
+    ...(node.visibility ? { visibility: node.visibility } : {}),
+  }));
+}
+
+function nodeMatchesScope(node: GraphNode, scope?: RetrievalScope): boolean {
+  if (!scope) return true;
+  const refs = nodeSourceRefs(node);
+  if (refs.length > 0) {
+    return refs.some((ref) =>
+      matchesRetrievalScope(locatorRetrievalMetadata(ref), scope),
+    );
+  }
+  return matchesRetrievalScope(node, scope);
+}
+
+function edgeMatchesScope(edge: GraphEdge, scope?: RetrievalScope): boolean {
+  if (!scope) return true;
+  if (edge.sourceRefs && edge.sourceRefs.length > 0) {
+    return edge.sourceRefs.some((ref) =>
+      matchesRetrievalScope(locatorRetrievalMetadata(ref), scope),
+    );
+  }
+  return matchesRetrievalScope(edge, scope);
 }
 
 function buildGraphContext(
@@ -38,6 +77,11 @@ function buildGraphContext(
   return parts.join(" ");
 }
 
+type TraversalIndex = {
+  nodeIndex: Map<string, GraphNode>;
+  adjacency: Map<string, Array<{ neighborId: string; edge: GraphEdge }>>;
+};
+
 export class GraphRetrieval {
   constructor(private kv: StateKV) {}
 
@@ -45,9 +89,21 @@ export class GraphRetrieval {
     entityNames: string[],
     maxDepth = 2,
     maxResults = 20,
+    scope?: RetrievalScope,
   ): Promise<GraphRetrievalResult[]> {
-    const allNodes = (await this.kv.list<GraphNode>(KV.graphNodes)).filter((n) => !n.stale);
-    const allEdges = (await this.kv.list<GraphEdge>(KV.graphEdges)).filter((e) => !e.stale);
+    const allNodes = (await this.kv.list<GraphNode>(KV.graphNodes)).filter(
+      (node) => !node.stale && nodeMatchesScope(node, scope),
+    );
+    const nodeIds = new Set(allNodes.map((node) => node.id));
+    const allEdges = (await this.kv.list<GraphEdge>(KV.graphEdges)).filter(
+      (edge) =>
+        !edge.stale &&
+        edgeMatchesScope(edge, scope) &&
+        nodeIds.has(edge.sourceNodeId) &&
+        nodeIds.has(edge.targetNodeId),
+    );
+
+    const traversalIndex = this.buildTraversalIndex(allNodes, allEdges);
 
     const matchingNodes = allNodes.filter((n) => {
       const nameLower = n.name.toLowerCase();
@@ -61,21 +117,24 @@ export class GraphRetrieval {
     if (matchingNodes.length === 0) return [];
 
     const results: GraphRetrievalResult[] = [];
-    const visitedObs = new Set<string>();
+    const visitedSources = new Set<string>();
 
     for (const startNode of matchingNodes) {
       const paths = this.dijkstraTraversal(
         startNode,
-        allNodes,
-        allEdges,
+        traversalIndex,
         maxDepth,
       );
 
       for (const path of paths) {
         const lastNode = path[path.length - 1].node;
-        for (const obsId of lastNode.sourceObservationIds) {
-          if (visitedObs.has(obsId)) continue;
-          visitedObs.add(obsId);
+        for (const source of nodeSourceRefs(lastNode)) {
+          if (!matchesRetrievalScope(locatorRetrievalMetadata(source), scope)) {
+            continue;
+          }
+          const sourceKey = `${source.sourceKind}:${source.sourceId}:${source.sessionId ?? ""}`;
+          if (visitedSources.has(sourceKey)) continue;
+          visitedSources.add(sourceKey);
 
           const pathLength = path.length;
           const edgeWeights = path
@@ -88,8 +147,9 @@ export class GraphRetrieval {
           const score = avgWeight * (1 / pathLength);
 
           results.push({
-            obsId,
-            sessionId: "",
+            obsId: source.sourceId,
+            sessionId: source.sessionId ?? "",
+            source,
             score,
             graphContext: buildGraphContext(path),
             pathLength,
@@ -97,12 +157,17 @@ export class GraphRetrieval {
         }
       }
 
-      for (const obsId of startNode.sourceObservationIds) {
-        if (visitedObs.has(obsId)) continue;
-        visitedObs.add(obsId);
+      for (const source of nodeSourceRefs(startNode)) {
+        if (!matchesRetrievalScope(locatorRetrievalMetadata(source), scope)) {
+          continue;
+        }
+        const sourceKey = `${source.sourceKind}:${source.sourceId}:${source.sessionId ?? ""}`;
+        if (visitedSources.has(sourceKey)) continue;
+        visitedSources.add(sourceKey);
         results.push({
-          obsId,
-          sessionId: "",
+          obsId: source.sourceId,
+          sessionId: source.sessionId ?? "",
+          source,
           score: 1.0,
           graphContext: `[${startNode.type}] ${startNode.name}`,
           pathLength: 0,
@@ -118,31 +183,47 @@ export class GraphRetrieval {
     obsIds: string[],
     maxDepth = 1,
     maxResults = 10,
+    scope?: RetrievalScope,
   ): Promise<GraphRetrievalResult[]> {
-    const allNodes = (await this.kv.list<GraphNode>(KV.graphNodes)).filter((n) => !n.stale);
-    const allEdges = (await this.kv.list<GraphEdge>(KV.graphEdges)).filter((e) => !e.stale);
+    const allNodes = (await this.kv.list<GraphNode>(KV.graphNodes)).filter(
+      (node) => !node.stale && nodeMatchesScope(node, scope),
+    );
+    const nodeIds = new Set(allNodes.map((node) => node.id));
+    const allEdges = (await this.kv.list<GraphEdge>(KV.graphEdges)).filter(
+      (edge) =>
+        !edge.stale &&
+        edgeMatchesScope(edge, scope) &&
+        nodeIds.has(edge.sourceNodeId) &&
+        nodeIds.has(edge.targetNodeId),
+    );
+
+    const traversalIndex = this.buildTraversalIndex(allNodes, allEdges);
 
     const linkedNodes = allNodes.filter((n) =>
-      n.sourceObservationIds.some((id) => obsIds.includes(id)),
+      nodeSourceRefs(n).some((source) => obsIds.includes(source.sourceId)),
     );
 
     const results: GraphRetrievalResult[] = [];
-    const visitedObs = new Set<string>(obsIds);
+    const visitedSources = new Set<string>(obsIds);
 
     for (const node of linkedNodes) {
-      const paths = this.dijkstraTraversal(node, allNodes, allEdges, maxDepth);
+      const paths = this.dijkstraTraversal(node, traversalIndex, maxDepth);
       for (const path of paths) {
         const lastNode = path[path.length - 1].node;
-        for (const obsId of lastNode.sourceObservationIds) {
-          if (visitedObs.has(obsId)) continue;
-          visitedObs.add(obsId);
+        for (const source of nodeSourceRefs(lastNode)) {
+          if (!matchesRetrievalScope(locatorRetrievalMetadata(source), scope)) {
+            continue;
+          }
+          if (visitedSources.has(source.sourceId)) continue;
+          visitedSources.add(source.sourceId);
 
           const pathLength = path.length;
           const score = 0.5 * (1 / (pathLength + 1));
 
           results.push({
-            obsId,
-            sessionId: "",
+            obsId: source.sourceId,
+            sessionId: source.sessionId ?? "",
+            source,
             score,
             graphContext: buildGraphContext(path),
             pathLength,
@@ -158,13 +239,23 @@ export class GraphRetrieval {
   async temporalQuery(
     entityName: string,
     asOf?: string,
+    scope?: RetrievalScope,
   ): Promise<{
     entity: GraphNode | null;
     currentState: GraphEdge[];
     history: GraphEdge[];
   }> {
-    const allNodes = (await this.kv.list<GraphNode>(KV.graphNodes)).filter((n) => !n.stale);
-    const allEdges = (await this.kv.list<GraphEdge>(KV.graphEdges)).filter((e) => !e.stale);
+    const allNodes = (await this.kv.list<GraphNode>(KV.graphNodes)).filter(
+      (node) => !node.stale && nodeMatchesScope(node, scope),
+    );
+    const nodeIds = new Set(allNodes.map((node) => node.id));
+    const allEdges = (await this.kv.list<GraphEdge>(KV.graphEdges)).filter(
+      (edge) =>
+        !edge.stale &&
+        edgeMatchesScope(edge, scope) &&
+        nodeIds.has(edge.sourceNodeId) &&
+        nodeIds.has(edge.targetNodeId),
+    );
 
     const entity = allNodes.find(
       (n) => n.name.toLowerCase() === entityName.toLowerCase(),
@@ -238,12 +329,16 @@ export class GraphRetrieval {
   //   - Min-heap dequeue is O(log V) per pop (previous queue.shift()
   //     was O(n) — the dominant cost on graphs above ~200 nodes per
   //     the contributor's benchmark in #328).
-  private dijkstraTraversal(
-    startNode: GraphNode,
+  /**
+   * Node lookup + undirected adjacency for one traversal pass. Built once per
+   * query from the already scope-filtered arrays and shared by every start
+   * node. Rebuilding it inside dijkstraTraversal made one search cost
+   * O(|matches| * (V+E)); on a 15.5k-node graph the worst case was ~93 s.
+   */
+  private buildTraversalIndex(
     allNodes: GraphNode[],
     allEdges: GraphEdge[],
-    maxDepth: number,
-  ): Array<Array<{ node: GraphNode; edge?: GraphEdge }>> {
+  ): TraversalIndex {
     const nodeIndex = new Map<string, GraphNode>();
     for (const n of allNodes) nodeIndex.set(n.id, n);
 
@@ -256,6 +351,15 @@ export class GraphRetrieval {
       adjacency.get(a)!.push({ neighborId: b, edge });
       adjacency.get(b)!.push({ neighborId: a, edge });
     }
+    return { nodeIndex, adjacency };
+  }
+
+  private dijkstraTraversal(
+    startNode: GraphNode,
+    index: TraversalIndex,
+    maxDepth: number,
+  ): Array<Array<{ node: GraphNode; edge?: GraphEdge }>> {
+    const { nodeIndex, adjacency } = index;
 
     const dist = new Map<string, number>();
     const pathTo = new Map<string, Array<{ node: GraphNode; edge?: GraphEdge }>>();

@@ -296,3 +296,94 @@ describe("GraphRetrieval", () => {
     expect(results.find((r) => r.obsId === "obs_4")).toBeUndefined();
   });
 });
+
+describe("GraphRetrieval multi start-node characterisation", () => {
+  // Locks behaviour the existing suite never exercised: every other
+  // searchByEntities test resolves to exactly ONE matching start node, so
+  // nothing pinned what happens when several start nodes race for the same
+  // source. `visitedSources` is shared across start nodes and the first one
+  // to reach a source keeps its score, so start-node iteration order is
+  // load-bearing — including the surprising part below, where only the FIRST
+  // start node scores its own observation at 1.0 because the others are
+  // claimed by its traversal before their self-scoring pass runs.
+  //
+  // Any change that reuses or reorders traversal state must leave these exact
+  // numbers untouched.
+  it("lets the first start node's traversal claim the other start nodes' own sources", async () => {
+    const nodes = [
+      makeNode("n1", "Auth", "concept", ["obs_a"]),
+      makeNode("n2", "AuthService", "concept", ["obs_b"]),
+      makeNode("n3", "AuthToken", "concept", ["obs_c"]),
+      makeNode("n4", "Shared", "concept", ["obs_shared"]),
+    ];
+    const edges = [
+      makeEdge("e1", "n1", "n4", "related_to", 0.9),
+      makeEdge("e2", "n2", "n4", "related_to", 0.5),
+      makeEdge("e3", "n3", "n4", "related_to", 0.2),
+    ];
+    const retrieval = new GraphRetrieval(mockKV(nodes, edges) as never);
+
+    const results = await retrieval.searchByEntities(["Auth"], 2, 20);
+
+    const byObs = new Map(results.map((r) => [r.obsId, r]));
+    expect([...byObs.keys()].sort()).toEqual([
+      "obs_a",
+      "obs_b",
+      "obs_c",
+      "obs_shared",
+    ]);
+
+    // n1 is first in list order: only it scores its own observation at 1.0.
+    expect(byObs.get("obs_a")!.score).toBe(1);
+    expect(byObs.get("obs_a")!.pathLength).toBe(0);
+    expect(byObs.get("obs_a")!.graphContext).toBe("[concept] Auth");
+
+    // The shared node is reached from n1 over the strongest edge (0.9).
+    expect(byObs.get("obs_shared")!.score).toBeCloseTo(0.45, 10);
+    expect(byObs.get("obs_shared")!.pathLength).toBe(2);
+
+    // n2 and n3 never reach their own self-scoring pass: n1's traversal got
+    // there first, so they carry path scores, not 1.0.
+    expect(byObs.get("obs_b")!.score).toBeCloseTo(0.2333333333333333, 10);
+    expect(byObs.get("obs_b")!.pathLength).toBe(3);
+    expect(byObs.get("obs_c")!.score).toBeCloseTo(0.18333333333333335, 10);
+    expect(byObs.get("obs_c")!.pathLength).toBe(3);
+  });
+});
+
+describe("GraphRetrieval scope boundary", () => {
+  // The traversal index is built from the scope-filtered arrays. If it were
+  // ever hoisted above that filter, an out-of-scope node would stay in the
+  // adjacency and act as a bridge: a same-project node reachable ONLY through
+  // another tenant's node would start showing up. Nothing else in the suite
+  // passes a scope to the graph leg, so this is the only guard.
+  it("does not reach a same-project node through an out-of-scope hop", async () => {
+    const inA = (id: string, name: string, obs: string[]): GraphNode => ({
+      ...makeNode(id, name, "concept", obs),
+      projectId: "projA",
+    });
+    const nodes: GraphNode[] = [
+      inA("a1", "Auth", ["obs_a1"]),
+      { ...makeNode("b1", "Bridge", "concept", ["obs_b1"]), projectId: "projB" },
+      inA("a2", "Downstream", ["obs_a2"]),
+    ];
+    const edges: GraphEdge[] = [
+      { ...makeEdge("e1", "a1", "b1", "related_to", 0.9), projectId: "projA" },
+      { ...makeEdge("e2", "b1", "a2", "related_to", 0.9), projectId: "projA" },
+    ];
+    const retrieval = new GraphRetrieval(mockKV(nodes, edges) as never);
+
+    const results = await retrieval.searchByEntities(["Auth"], 3, 20, {
+      projectId: "projA",
+    });
+    const obsIds = results.map((r) => r.obsId);
+
+    // a1 matches the entity directly and is in scope.
+    expect(obsIds).toContain("obs_a1");
+    // The bridge belongs to another project and must never appear.
+    expect(obsIds).not.toContain("obs_b1");
+    // a2 is in scope and does NOT match the entity, so it can only arrive by
+    // traversal — and the only route crosses the out-of-scope bridge.
+    expect(obsIds).not.toContain("obs_a2");
+  });
+});
