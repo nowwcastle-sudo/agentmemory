@@ -311,16 +311,7 @@ export function registerObservationProjectionFunction(
               data.observationId,
               synthetic,
             );
-            try {
-              getSearchIndex().add(synthetic);
-            } catch (error) {
-              logger.warn("Failed to index synthetic observation into BM25", {
-                obsId: synthetic.id,
-                sessionId: synthetic.sessionId,
-                error:
-                  error instanceof Error ? error.message : String(error),
-              });
-            }
+            getSearchIndex().add(synthetic);
             await vectorIndexAddGuarded(
               synthetic.id,
               synthetic.sessionId,
