@@ -6,6 +6,8 @@ import type {
   CompressedObservation,
   Memory,
   QueryExpansion,
+  GraphSourceLocator,
+  RetrievalScope,
 } from "../types.js";
 import { memoryToObservation } from "./memory-utils.js";
 import type { StateKV } from "./kv.js";
@@ -19,6 +21,19 @@ import { rerank } from "./reranker.js";
 
 const RRF_K = 60;
 
+/**
+ * Reports whether each graph-leg gate opened for one query. Both gates cost a
+ * full enumeration of the graph scopes when they open, and they are gated on
+ * different things: entities come from an ASCII-only extractor, so all-Korean
+ * or all-lowercase queries never open the first one, while the vector gate has
+ * no score threshold and opens on almost any query once the index is warm.
+ * Without this there is no way to size a fix against real traffic.
+ */
+export type GraphLegGateReporter = (
+  entities: boolean,
+  vectorHits: boolean,
+) => void;
+
 export class HybridSearch {
   private graphRetrieval: GraphRetrieval;
 
@@ -31,18 +46,24 @@ export class HybridSearch {
     private vectorWeight = 0.6,
     private graphWeight = 0.3,
     private rerankEnabled = process.env.RERANK_ENABLED === "true",
+    private reportGraphLegGates?: GraphLegGateReporter,
   ) {
     this.graphRetrieval = new GraphRetrieval(kv);
   }
 
-  async search(query: string, limit = 20): Promise<HybridSearchResult[]> {
-    return this.tripleStreamSearch(query, limit);
+  async search(
+    query: string,
+    limit = 20,
+    scope?: RetrievalScope,
+  ): Promise<HybridSearchResult[]> {
+    return this.tripleStreamSearch(query, limit, undefined, scope);
   }
 
   async searchWithExpansion(
     query: string,
     limit: number,
     expansion: QueryExpansion,
+    scope?: RetrievalScope,
   ): Promise<HybridSearchResult[]> {
     const allQueries = [
       query,
@@ -56,7 +77,9 @@ export class HybridSearch {
     ];
 
     const resultSets = await Promise.all(
-      allQueries.map((q) => this.tripleStreamSearch(q, limit, allEntities)),
+      allQueries.map((q) =>
+        this.tripleStreamSearch(q, limit, allEntities, scope),
+      ),
     );
 
     const merged = new Map<string, HybridSearchResult>();
@@ -82,20 +105,22 @@ export class HybridSearch {
     query: string,
     limit: number,
     entityHints?: string[],
+    scope?: RetrievalScope,
   ): Promise<HybridSearchResult[]> {
-    const bm25Results = this.bm25.search(query, limit * 2);
+    const bm25Results = this.bm25.search(query, limit * 2, scope);
 
     let vectorResults: Array<{
       obsId: string;
       sessionId: string;
       score: number;
+      source: GraphSourceLocator;
     }> = [];
     let queryEmbedding: Float32Array | null = null;
 
     if (this.vector && this.embeddingProvider && this.vector.size > 0) {
       try {
         queryEmbedding = await this.embeddingProvider.embed(query);
-        vectorResults = this.vector.search(queryEmbedding, limit * 2);
+        vectorResults = this.vector.search(queryEmbedding, limit * 2, scope);
       } catch {
         // fall through to BM25-only
       }
@@ -112,6 +137,7 @@ export class HybridSearch {
           entities,
           2,
           limit,
+          scope,
         );
       } catch {
         // graph search is best-effort
@@ -119,10 +145,16 @@ export class HybridSearch {
     }
 
     const topVectorObs = vectorResults.slice(0, 5).map((r) => r.obsId);
+    this.reportGraphLegGates?.(entities.length > 0, topVectorObs.length > 0);
     if (topVectorObs.length > 0) {
       try {
         const expansionResults =
-          await this.graphRetrieval.expandFromChunks(topVectorObs, 1, 5);
+          await this.graphRetrieval.expandFromChunks(
+            topVectorObs,
+            1,
+            5,
+            scope,
+          );
         graphResults = [...graphResults, ...expansionResults];
       } catch {
         // expansion is best-effort
@@ -140,6 +172,7 @@ export class HybridSearch {
         vectorScore: number;
         graphScore: number;
         graphContext?: string;
+        source: GraphSourceLocator;
       }
     >();
 
@@ -152,6 +185,7 @@ export class HybridSearch {
         bm25Score: r.score,
         vectorScore: 0,
         graphScore: 0,
+        source: r.source,
       });
     });
 
@@ -169,6 +203,7 @@ export class HybridSearch {
           bm25Score: 0,
           vectorScore: r.score,
           graphScore: 0,
+          source: r.source,
         });
       }
     });
@@ -181,6 +216,7 @@ export class HybridSearch {
         if (r.graphContext && !existing.graphContext) {
           existing.graphContext = r.graphContext;
         }
+        if (!existing.source) existing.source = r.source;
       } else {
         scores.set(r.obsId, {
           bm25Rank: Infinity,
@@ -191,6 +227,7 @@ export class HybridSearch {
           vectorScore: 0,
           graphScore: r.score,
           graphContext: r.graphContext,
+          source: r.source,
         });
       }
     });
@@ -236,6 +273,7 @@ export class HybridSearch {
       vectorScore: s.vectorScore,
       graphScore: s.graphScore,
       graphContext: s.graphContext,
+      source: s.source,
       combinedScore,
     }));
 
@@ -267,6 +305,7 @@ export class HybridSearch {
       graphScore: number;
       combinedScore: number;
       graphContext?: string;
+      source: GraphSourceLocator;
     }>,
     limit: number,
     maxPerSession = 3,
@@ -303,16 +342,25 @@ export class HybridSearch {
       graphScore: number;
       combinedScore: number;
       graphContext?: string;
+      source: GraphSourceLocator;
     }>,
     limit: number,
   ): Promise<HybridSearchResult[]> {
     const sliced = results.slice(0, limit);
     const observations = await Promise.all(
       sliced.map(async (r) => {
-        const obs = await this.kv
-          .get<CompressedObservation>(KV.observations(r.sessionId), r.obsId)
-          .catch(() => null);
-        if (obs) return obs;
+        if (r.source.sourceKind === "observation") {
+          const sessionId = r.source.sessionId ?? r.sessionId;
+          if (sessionId) {
+            const obs = await this.kv
+              .get<CompressedObservation>(
+                KV.observations(sessionId),
+                r.source.sourceId,
+              )
+              .catch(() => null);
+            if (obs) return obs;
+          }
+        }
         // Fallback: indexed entry may originate from mem::remember, which
         // writes to KV.memories with a synthetic sessionId ("memory" or the
         // memory's first associated session). Coerce the Memory record into
@@ -320,7 +368,24 @@ export class HybridSearch {
         const mem = await this.kv
           .get<Memory>(KV.memories, r.obsId)
           .catch(() => null);
-        return mem ? memoryToObservation(mem) : null;
+        if (mem) return memoryToObservation(mem);
+
+        // Legacy graph rows stored only an observation id. Their session
+        // locator cannot be reconstructed from the graph itself, so retain
+        // a bounded compatibility scan. Newly projected rows never use it.
+        if (!r.source.sessionId) {
+          const sessions = await this.kv.list<{ id: string }>(KV.sessions);
+          for (const session of sessions) {
+            const obs = await this.kv
+              .get<CompressedObservation>(
+                KV.observations(session.id),
+                r.source.sourceId,
+              )
+              .catch(() => null);
+            if (obs) return obs;
+          }
+        }
+        return null;
       }),
     );
     const enriched: HybridSearchResult[] = [];
@@ -335,6 +400,7 @@ export class HybridSearch {
           combinedScore: sliced[i].combinedScore,
           sessionId: sliced[i].sessionId,
           graphContext: sliced[i].graphContext,
+          source: sliced[i].source,
         });
       }
     }

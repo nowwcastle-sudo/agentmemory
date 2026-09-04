@@ -440,6 +440,19 @@ async function main() {
     embeddingConfig.bm25Weight,
     embeddingConfig.vectorWeight,
     graphWeight,
+    process.env["RERANK_ENABLED"] === "true",
+    // Each open gate costs a full enumeration of the graph scopes. Record them
+    // as metrics so real traffic — not a guess about it — sizes any fix.
+    // totalCalls is queries seen, successCount is times the gate opened.
+    (entities, vectorHits) => {
+      void metricsStore.record("search::gate-entities", 0, entities);
+      void metricsStore.record("search::gate-vector-hits", 0, vectorHits);
+      void metricsStore.record(
+        "search::graph-double-enumeration",
+        0,
+        entities && vectorHits,
+      );
+    },
   );
 
   const hybridRanker = (
