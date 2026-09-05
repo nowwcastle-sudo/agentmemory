@@ -49,6 +49,8 @@ export function importOrigin(
 export interface RawObservation {
   id: string;
   captureId?: string;
+  captureFingerprintVersion?: 1;
+  captureFingerprint?: string;
   sessionId: string;
   timestamp: string;
   hookType: HookType;

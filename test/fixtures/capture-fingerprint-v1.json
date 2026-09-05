@@ -1,0 +1,229 @@
+{
+  "version": 1,
+  "vectors": [
+    {
+      "name": "exact repeat",
+      "payload": {
+        "sessionId": "ses-vector",
+        "captureId": "capture-vector",
+        "hookType": "subagent_stop",
+        "timestamp": "2026-09-05T00:00:00.000Z",
+        "project": "  /work/alpha  ",
+        "projectName": "  Alpha  ",
+        "cwd": "  /work/alpha  ",
+        "agentId": "  reviewer  ",
+        "sourceClient": "  codex  ",
+        "data": {
+          "message": "keep",
+          "private": "<private>omit</private>"
+        }
+      },
+      "expectedInput": {
+        "sessionId": "ses-vector",
+        "captureId": "capture-vector",
+        "hookType": "subagent_stop",
+        "timestamp": "2026-09-05T00:00:00.000Z",
+        "project": { "source": "payload", "value": "/work/alpha" },
+        "projectName": { "source": "payload", "value": "Alpha" },
+        "cwd": { "source": "payload", "value": "/work/alpha" },
+        "agentId": { "source": "payload", "value": "reviewer" },
+        "sourceClient": { "source": "payload", "value": "codex" },
+        "sanitizedRawJson": "{\"message\":\"keep\",\"private\":\"[REDACTED]\"}"
+      },
+      "expectedHash": "a9683f8c990f5de60b8de4a551e23f0a42ba032d8db35acbe934f7bd74d6f456"
+    },
+    {
+      "name": "sanitized raw key order second-first",
+      "payload": {
+        "sessionId": "ses-order",
+        "captureId": "capture-order",
+        "hookType": "post_tool_use",
+        "timestamp": "2026-09-05T00:00:01.000Z",
+        "project": "/work/order",
+        "projectName": "Order",
+        "cwd": "/work/order",
+        "agentId": "worker",
+        "sourceClient": "claude",
+        "data": { "second": 2, "first": 1 }
+      },
+      "expectedInput": {
+        "sessionId": "ses-order",
+        "captureId": "capture-order",
+        "hookType": "post_tool_use",
+        "timestamp": "2026-09-05T00:00:01.000Z",
+        "project": { "source": "payload", "value": "/work/order" },
+        "projectName": { "source": "payload", "value": "Order" },
+        "cwd": { "source": "payload", "value": "/work/order" },
+        "agentId": { "source": "payload", "value": "worker" },
+        "sourceClient": { "source": "payload", "value": "claude" },
+        "sanitizedRawJson": "{\"second\":2,\"first\":1}"
+      },
+      "expectedHash": "f80f926a79efe19d61aa8e93c9c7e90a34dfe604201627afb0756dfc00641789"
+    },
+    {
+      "name": "sanitized raw key order first-second",
+      "payload": {
+        "sessionId": "ses-order",
+        "captureId": "capture-order",
+        "hookType": "post_tool_use",
+        "timestamp": "2026-09-05T00:00:01.000Z",
+        "project": "/work/order",
+        "projectName": "Order",
+        "cwd": "/work/order",
+        "agentId": "worker",
+        "sourceClient": "claude",
+        "data": { "first": 1, "second": 2 }
+      },
+      "expectedInput": {
+        "sessionId": "ses-order",
+        "captureId": "capture-order",
+        "hookType": "post_tool_use",
+        "timestamp": "2026-09-05T00:00:01.000Z",
+        "project": { "source": "payload", "value": "/work/order" },
+        "projectName": { "source": "payload", "value": "Order" },
+        "cwd": { "source": "payload", "value": "/work/order" },
+        "agentId": { "source": "payload", "value": "worker" },
+        "sourceClient": { "source": "payload", "value": "claude" },
+        "sanitizedRawJson": "{\"first\":1,\"second\":2}"
+      },
+      "expectedHash": "ec684a0bb653a47cc741dc38150d1b32d763ba2bee994abaf39b0c7827e45477"
+    },
+    {
+      "name": "identity fields omitted",
+      "payload": {
+        "sessionId": "ses-presence",
+        "captureId": "capture-presence",
+        "hookType": "notification",
+        "timestamp": "2026-09-05T00:00:02.000Z",
+        "data": { "message": "same" }
+      },
+      "expectedInput": {
+        "sessionId": "ses-presence",
+        "captureId": "capture-presence",
+        "hookType": "notification",
+        "timestamp": "2026-09-05T00:00:02.000Z",
+        "project": { "source": "omitted" },
+        "projectName": { "source": "omitted" },
+        "cwd": { "source": "omitted" },
+        "agentId": { "source": "omitted" },
+        "sourceClient": { "source": "omitted" },
+        "sanitizedRawJson": "{\"message\":\"same\"}"
+      },
+      "expectedHash": "d5ef0f24d69152cf1a15877ee7db6f839d74e562ceabcf6a8b0b386abbf9a07e"
+    },
+    {
+      "name": "identity fields explicitly empty",
+      "payload": {
+        "sessionId": "ses-presence",
+        "captureId": "capture-presence",
+        "hookType": "notification",
+        "timestamp": "2026-09-05T00:00:02.000Z",
+        "project": "   ",
+        "projectName": "",
+        "cwd": "   ",
+        "agentId": "",
+        "sourceClient": "   ",
+        "data": { "message": "same" }
+      },
+      "expectedInput": {
+        "sessionId": "ses-presence",
+        "captureId": "capture-presence",
+        "hookType": "notification",
+        "timestamp": "2026-09-05T00:00:02.000Z",
+        "project": { "source": "explicit_empty" },
+        "projectName": { "source": "explicit_empty" },
+        "cwd": { "source": "explicit_empty" },
+        "agentId": { "source": "explicit_empty" },
+        "sourceClient": { "source": "explicit_empty" },
+        "sanitizedRawJson": "{\"message\":\"same\"}"
+      },
+      "expectedHash": "3e2be7a73fab83eca8a5e6f80a826fcfa9fa22f804df412a502515479c90eb77"
+    },
+    {
+      "name": "identity supplied by payload",
+      "payload": {
+        "sessionId": "ses-source",
+        "captureId": "capture-source",
+        "hookType": "session_end",
+        "timestamp": "2026-09-05T00:00:03.000Z",
+        "project": "/work/source",
+        "projectName": "Source",
+        "cwd": "/work/source",
+        "agentId": "owner",
+        "sourceClient": "hermes",
+        "data": { "message": "same" }
+      },
+      "expectedInput": {
+        "sessionId": "ses-source",
+        "captureId": "capture-source",
+        "hookType": "session_end",
+        "timestamp": "2026-09-05T00:00:03.000Z",
+        "project": { "source": "payload", "value": "/work/source" },
+        "projectName": { "source": "payload", "value": "Source" },
+        "cwd": { "source": "payload", "value": "/work/source" },
+        "agentId": { "source": "payload", "value": "owner" },
+        "sourceClient": { "source": "payload", "value": "hermes" },
+        "sanitizedRawJson": "{\"message\":\"same\"}"
+      },
+      "expectedHash": "950f0656f9db95a6f2aa09625d5072a028b1b4a7a9f68cddb56b85c78386567c"
+    },
+    {
+      "name": "identity inherited from session",
+      "payload": {
+        "sessionId": "ses-source",
+        "captureId": "capture-source",
+        "hookType": "session_end",
+        "timestamp": "2026-09-05T00:00:03.000Z",
+        "data": { "message": "same" }
+      },
+      "inheritedSession": {
+        "project": " /work/source ",
+        "projectName": " Source ",
+        "cwd": " /work/source ",
+        "agentId": " owner ",
+        "sourceClient": " hermes "
+      },
+      "expectedInput": {
+        "sessionId": "ses-source",
+        "captureId": "capture-source",
+        "hookType": "session_end",
+        "timestamp": "2026-09-05T00:00:03.000Z",
+        "project": { "source": "inherited", "value": "/work/source" },
+        "projectName": { "source": "inherited", "value": "Source" },
+        "cwd": { "source": "inherited", "value": "/work/source" },
+        "agentId": { "source": "inherited", "value": "owner" },
+        "sourceClient": { "source": "inherited", "value": "hermes" },
+        "sanitizedRawJson": "{\"message\":\"same\"}"
+      },
+      "expectedHash": "d62c28c77b47f75ec5ec675927c6332bb657f33f1a01102a0f94783abfec622f"
+    },
+    {
+      "name": "agent and source client caps",
+      "payload": {
+        "sessionId": "ses-caps",
+        "captureId": "capture-caps",
+        "hookType": "subagent_start",
+        "timestamp": "2026-09-05T00:00:04.000Z",
+        "project": "/work/caps",
+        "projectName": "Caps",
+        "cwd": "/work/caps",
+        "agentId": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "sourceClient": "ssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssss",
+        "data": { "message": "caps" }
+      },
+      "expectedInput": {
+        "sessionId": "ses-caps",
+        "captureId": "capture-caps",
+        "hookType": "subagent_start",
+        "timestamp": "2026-09-05T00:00:04.000Z",
+        "project": { "source": "payload", "value": "/work/caps" },
+        "projectName": { "source": "payload", "value": "Caps" },
+        "cwd": { "source": "payload", "value": "/work/caps" },
+        "agentId": { "source": "payload", "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
+        "sourceClient": { "source": "payload", "value": "ssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssss" },
+        "sanitizedRawJson": "{\"message\":\"caps\"}"
+      },
+      "expectedHash": "65eddc79b421ae671cfb75552282d63a560f84a80622033568c801056508e4b3"
+    }
+  ]
+}

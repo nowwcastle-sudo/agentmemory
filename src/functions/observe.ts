@@ -10,7 +10,6 @@ import type {
 const TOOL_HOOKS = new Set(["pre_tool_use", "post_tool_use", "post_tool_failure"]);
 import { KV, STREAM, fingerprintId, generateId } from "../state/schema.js";
 import { StateKV } from "../state/kv.js";
-import { stripPrivateData } from "./privacy.js";
 import { DedupMap } from "./dedup.js";
 import { withKeyedLock } from "../state/keyed-mutex.js";
 import { isAutoCompressEnabled } from "../config.js";
@@ -19,6 +18,12 @@ import { logger } from "../logger.js";
 import { markProjectionPending } from "../health/pipeline.js";
 import { saveImageToDisk } from "../utils/image-store.js";
 import { observationProjectionQueue } from "./observation-projection.js";
+import {
+  buildCaptureFingerprintInputV1,
+  CAPTURE_FINGERPRINT_VERSION,
+  hashCaptureFingerprintV1,
+  sanitizeObservationData,
+} from "./capture-fingerprint.js";
 
 export function extractImage(d: unknown): string | undefined {
   if (!d) return undefined;
@@ -112,14 +117,7 @@ export function registerObserveFunction(
       }
     }
 
-    let sanitizedRaw: unknown = payload.data;
-    try {
-      const jsonStr = JSON.stringify(payload.data);
-      const sanitized = stripPrivateData(jsonStr);
-      sanitizedRaw = JSON.parse(sanitized);
-    } catch {
-      sanitizedRaw = stripPrivateData(String(payload.data));
-    }
+    const sanitizedRaw = sanitizeObservationData(payload.data);
 
     let originChannel: Origin["channel"] = "agent";
     if (payload.hookType === "prompt_submit") originChannel = "user";
@@ -184,6 +182,27 @@ export function registerObserveFunction(
         KV.sessions,
         payload.sessionId,
       );
+      const configuredAgentId = getAgentId();
+      const captureFingerprint = hashCaptureFingerprintV1(
+        buildCaptureFingerprintInputV1({
+          payload,
+          captureId,
+          sanitizedRaw,
+          inheritedSession: existingSession,
+          configuredAgentId,
+        }),
+      );
+      if (existingRaw && requestedCaptureId) {
+        if (
+          existingRaw.captureFingerprintVersion !== CAPTURE_FINGERPRINT_VERSION ||
+          !/^[a-f0-9]{64}$/.test(existingRaw.captureFingerprint ?? "")
+        ) {
+          return { success: false, error: "legacy_identity_unverified" };
+        }
+        if (existingRaw.captureFingerprint !== captureFingerprint) {
+          return { success: false, error: "capture_id_conflict" };
+        }
+      }
       let previousObservationCount =
         typeof existingSession?.observationCount === "number" &&
         Number.isFinite(existingSession.observationCount) &&
@@ -219,7 +238,7 @@ export function registerObserveFunction(
       const eventAgentId =
         (typeof payload.agentId === "string" && payload.agentId.trim().length > 0
           ? payload.agentId.trim().slice(0, 128)
-          : undefined) ?? existingSession?.agentId ?? getAgentId();
+          : undefined) ?? existingSession?.agentId ?? configuredAgentId;
       const eventSourceClient =
         existingSession?.sourceClient ??
         (typeof payload.sourceClient === "string" && payload.sourceClient.trim()
@@ -228,6 +247,8 @@ export function registerObserveFunction(
 
       let raw = existingRaw ?? rawCandidate;
       if (isNewCapture) {
+        raw.captureFingerprintVersion = CAPTURE_FINGERPRINT_VERSION;
+        raw.captureFingerprint = captureFingerprint;
         if (eventAgentId) raw.agentId = eventAgentId;
         if (eventSourceClient) raw.sourceClient = eventSourceClient;
         if (!raw.projectId && existingSession?.project) {

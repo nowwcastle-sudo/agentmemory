@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type {
   CompressedObservation,
@@ -6,7 +7,7 @@ import type {
   RawObservation,
   Session,
 } from "../src/types.js";
-import { KV } from "../src/state/schema.js";
+import { KV, fingerprintId } from "../src/state/schema.js";
 import { registerApiTriggers } from "../src/triggers/api.js";
 import { ProjectionCoordinator } from "../src/functions/projection-coordinator.js";
 import { mockKV, mockSdk } from "./helpers/mocks.js";
@@ -68,6 +69,52 @@ async function registerObservationPipeline(
     undefined,
     new ProjectionCoordinator(),
   );
+}
+
+const CAPTURE_SIDE_EFFECT_IDS = new Set([
+  "iii::durable::publish",
+  "stream::set",
+  "stream::send",
+  "mem::disk-size-delta",
+  "mem::vision-embed",
+]);
+
+async function captureIdentityHarness() {
+  const { registerObserveFunction } = await import(
+    "../src/functions/observe.js"
+  );
+  const { DedupMap } = await import("../src/functions/dedup.js");
+  const sdk = mockSdk({ looseTrigger: true });
+  const kv = mockKV();
+  const dedupMap = new DedupMap();
+  const sideEffects: string[] = [];
+  const trigger = sdk.trigger.bind(sdk);
+  sdk.trigger = vi.fn(async (request: unknown, data?: unknown) => {
+    const functionId =
+      typeof request === "object" && request !== null
+        ? (request as { function_id?: string }).function_id
+        : undefined;
+    if (functionId && CAPTURE_SIDE_EFFECT_IDS.has(functionId)) {
+      sideEffects.push(functionId);
+    }
+    return trigger(request as never, data);
+  }) as never;
+  registerApiTriggers(sdk as never, kv as never);
+  registerObserveFunction(sdk as never, kv as never, dedupMap);
+  return { sdk, kv, dedupMap, sideEffects };
+}
+
+function captureState(kv: ReturnType<typeof mockKV>): unknown {
+  return structuredClone(
+    Array.from(kv.store, ([scope, entries]) => [
+      scope,
+      Array.from(entries),
+    ]),
+  );
+}
+
+function apiObserveBody(input: HookPayload): Record<string, unknown> {
+  return { ...input };
 }
 
 describe("mem::observe durable capture", () => {
@@ -1084,5 +1131,282 @@ describe("api::observe capture boundary", () => {
         error: "Session observation limit reached (500)",
       },
     });
+  });
+});
+
+describe("api::observe capture identity", () => {
+  const identityMutations: Array<{
+    field: string;
+    mutate(input: HookPayload): HookPayload;
+  }> = [
+    {
+      field: "data",
+      mutate: (input) => ({
+        ...input,
+        data: { ...(input.data as object), last_message: "Different result" },
+      }),
+    },
+    {
+      field: "project",
+      mutate: (input) => ({ ...input, project: "/home/user/other" }),
+    },
+    {
+      field: "projectName",
+      mutate: (input) => ({ ...input, projectName: "other" }),
+    },
+    {
+      field: "cwd",
+      mutate: (input) => ({ ...input, cwd: "/home/user/other" }),
+    },
+    {
+      field: "agentId",
+      mutate: (input) => ({ ...input, agentId: "implementer" }),
+    },
+    {
+      field: "sourceClient",
+      mutate: (input) => ({ ...input, sourceClient: "claude" }),
+    },
+    {
+      field: "hookType",
+      mutate: (input) => ({ ...input, hookType: "session_end" }),
+    },
+    {
+      field: "timestamp",
+      mutate: (input) => ({
+        ...input,
+        timestamp: "2026-08-28T00:00:01.000Z",
+      }),
+    },
+  ];
+
+  it("deduplicates an exact repeat and stores its v1 capture fingerprint", async () => {
+    const { sdk, kv, dedupMap } = await captureIdentityHarness();
+    const input = payload("capture-fingerprint-repeat");
+    try {
+      const first = (await sdk.trigger("api::observe", {
+        body: apiObserveBody(input),
+      })) as {
+        status_code: number;
+        body: { observationId: string };
+      };
+      const replay = (await sdk.trigger("api::observe", {
+        body: apiObserveBody(input),
+      })) as {
+        status_code: number;
+        body: { deduplicated?: boolean; observationId: string };
+      };
+      const rawRows = await kv.list<RawObservation>(
+        KV.rawObservations(input.sessionId),
+      );
+
+      expect(first.status_code).toBe(201);
+      expect(replay).toMatchObject({
+        status_code: 201,
+        body: {
+          deduplicated: true,
+          observationId: first.body.observationId,
+        },
+      });
+      expect(rawRows).toHaveLength(1);
+      expect(rawRows[0]).toMatchObject({
+        captureFingerprintVersion: 1,
+        captureFingerprint: expect.stringMatching(/^[a-f0-9]{64}$/),
+      });
+    } finally {
+      dedupMap.stop();
+    }
+  });
+
+  it("stores a v1 capture fingerprint when captureId is omitted", async () => {
+    const { sdk, kv, dedupMap } = await captureIdentityHarness();
+    const { captureId: _captureId, ...input } = payload("unused-capture-id");
+    try {
+      const result = (await sdk.trigger("api::observe", {
+        body: input,
+      })) as {
+        status_code: number;
+        body: { observationId: string };
+      };
+      const raw = await kv.get<RawObservation>(
+        KV.rawObservations(input.sessionId),
+        result.body.observationId,
+      );
+
+      expect(result.status_code).toBe(201);
+      expect(raw).toMatchObject({
+        captureId: result.body.observationId,
+        captureFingerprintVersion: 1,
+        captureFingerprint: expect.stringMatching(/^[a-f0-9]{64}$/),
+      });
+    } finally {
+      dedupMap.stop();
+    }
+  });
+
+  it.each(identityMutations)(
+    "rejects a same-ID $field conflict before any side effect",
+    async ({ field, mutate }) => {
+      const { sdk, kv, dedupMap, sideEffects } =
+        await captureIdentityHarness();
+      const input = payload(`capture-fingerprint-conflict-${field}`);
+      try {
+        const first = (await sdk.trigger("api::observe", {
+          body: apiObserveBody(input),
+        })) as {
+          status_code: number;
+          body: { observationId: string };
+        };
+        expect(first.status_code).toBe(201);
+        await Promise.resolve();
+        await Promise.resolve();
+        if (field === "sourceClient") {
+          await kv.delete(
+            KV.observationProjections,
+            first.body.observationId,
+          );
+        }
+        const beforeState = captureState(kv);
+        const beforeSideEffects = sideEffects.length;
+        const beforeDedupSize = dedupMap.size;
+
+        const conflict = await sdk.trigger("api::observe", {
+          body: apiObserveBody(mutate(input)),
+        });
+        await Promise.resolve();
+        await Promise.resolve();
+
+        expect.soft(conflict).toEqual({
+          status_code: 409,
+          body: { success: false, error: "capture_id_conflict" },
+        });
+        expect.soft(captureState(kv)).toEqual(beforeState);
+        expect.soft(sideEffects).toHaveLength(beforeSideEffects);
+        expect.soft(dedupMap.size).toBe(beforeDedupSize);
+      } finally {
+        dedupMap.stop();
+      }
+    },
+  );
+
+  it.each([
+    {
+      caseName: "unknown version",
+      identity: {
+        captureFingerprintVersion: 2,
+        captureFingerprint: "a".repeat(64),
+      },
+    },
+    { caseName: "absent identity", identity: {} },
+    {
+      caseName: "v1 missing hash",
+      identity: { captureFingerprintVersion: 1 },
+    },
+    {
+      caseName: "v1 malformed hash",
+      identity: {
+        captureFingerprintVersion: 1,
+        captureFingerprint: "not-a-sha256",
+      },
+    },
+  ])(
+    "rejects $caseName as legacy identity without changing state",
+    async ({ caseName, identity }) => {
+      const { sdk, kv, dedupMap, sideEffects } =
+        await captureIdentityHarness();
+      const input = payload(`capture-fingerprint-${caseName.replace(/\s+/g, "-")}`);
+      const observationId = fingerprintId(
+        "obs",
+        `${input.sessionId}:${input.captureId}`,
+      );
+      await kv.set(KV.rawObservations(input.sessionId), observationId, {
+        id: observationId,
+        captureId: input.captureId,
+        sessionId: input.sessionId,
+        timestamp: input.timestamp,
+        hookType: input.hookType,
+        raw: input.data,
+        ...identity,
+      });
+      const beforeState = captureState(kv);
+      const beforeSideEffects = sideEffects.length;
+      const beforeDedupSize = dedupMap.size;
+
+      try {
+        const result = await sdk.trigger("api::observe", {
+          body: apiObserveBody(input),
+        });
+        await Promise.resolve();
+        await Promise.resolve();
+
+        expect.soft(result).toEqual({
+          status_code: 409,
+          body: { success: false, error: "legacy_identity_unverified" },
+        });
+        expect.soft(captureState(kv)).toEqual(beforeState);
+        expect.soft(sideEffects).toHaveLength(beforeSideEffects);
+        expect.soft(dedupMap.size).toBe(beforeDedupSize);
+      } finally {
+        dedupMap.stop();
+      }
+    },
+  );
+});
+
+describe("capture fingerprint v1 conformance", () => {
+  it("matches the pinned vectors for ordering, presence, source, and caps", async () => {
+    const {
+      buildCaptureFingerprintInputV1,
+      hashCaptureFingerprintV1,
+      sanitizeObservationData,
+    } = await import("../src/functions/capture-fingerprint.js");
+    const fixture = JSON.parse(
+      readFileSync(
+        new URL("./fixtures/capture-fingerprint-v1.json", import.meta.url),
+        "utf8",
+      ),
+    ) as {
+      version: number;
+      vectors: Array<{
+        name: string;
+        payload: HookPayload;
+        inheritedSession?: Partial<Session>;
+        expectedInput: unknown;
+        expectedHash: string;
+      }>;
+    };
+
+    expect(fixture.version).toBe(1);
+    for (const vector of fixture.vectors) {
+      const args = {
+        payload: vector.payload,
+        captureId: vector.payload.captureId!,
+        sanitizedRaw: sanitizeObservationData(vector.payload.data),
+        inheritedSession: vector.inheritedSession,
+      };
+      const input = buildCaptureFingerprintInputV1(args);
+      expect(input, vector.name).toEqual(vector.expectedInput);
+      expect(hashCaptureFingerprintV1(input), vector.name).toBe(
+        vector.expectedHash,
+      );
+      expect(vector.expectedHash, vector.name).toMatch(/^[a-f0-9]{64}$/);
+
+      if (vector.name === "exact repeat") {
+        expect(buildCaptureFingerprintInputV1(args)).toEqual(input);
+        expect(hashCaptureFingerprintV1(input)).toBe(vector.expectedHash);
+      }
+    }
+
+    const hashes = Object.fromEntries(
+      fixture.vectors.map((vector) => [vector.name, vector.expectedHash]),
+    );
+    expect(hashes["sanitized raw key order second-first"]).not.toBe(
+      hashes["sanitized raw key order first-second"],
+    );
+    expect(hashes["identity fields omitted"]).not.toBe(
+      hashes["identity fields explicitly empty"],
+    );
+    expect(hashes["identity supplied by payload"]).not.toBe(
+      hashes["identity inherited from session"],
+    );
   });
 });
