@@ -207,7 +207,6 @@ function terminalSessionSelection(
   const sessionId = String(terminal.envelope.body.sessionId).trim();
   const group = pending
     .filter((item) =>
-      item.adapter === terminal.adapter &&
       typeof item.envelope.body.sessionId === "string" &&
       item.envelope.body.sessionId.trim() === sessionId
     )
@@ -401,7 +400,6 @@ export function registerConnectorOutboxReplayFunctions(
 export function startConnectorOutboxReplayLoop(
   sdk: ISdk,
   intervalMs = 30_000,
-  canReplay: () => Promise<boolean> = async () => true,
 ): { stop(): void } {
   let stopped = false;
   let running = false;
@@ -409,7 +407,6 @@ export function startConnectorOutboxReplayLoop(
     if (stopped || running) return;
     running = true;
     try {
-      if (!(await canReplay())) return;
       await sdk.trigger({
         function_id: "mem::connector-outbox-replay",
         payload: { limit: 20 },

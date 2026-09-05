@@ -104,10 +104,7 @@ import { startViewerServer } from "./viewer/server.js";
 import { MetricsStore } from "./eval/metrics-store.js";
 import { DedupMap } from "./functions/dedup.js";
 import { registerHealthMonitor } from "./health/monitor.js";
-import {
-  collectPipelineHealth,
-  startPipelineReconcileLoop,
-} from "./health/pipeline.js";
+import { startPipelineReconcileLoop } from "./health/pipeline.js";
 import {
   defaultConnectorOutboxes,
   recoverConnectorOutboxClaims,
@@ -617,19 +614,10 @@ async function main() {
     projectionCoordinator,
   );
   const pipelineReconcileLoop = startPipelineReconcileLoop(sdk);
-  const connectorOutboxReplayLoop = startConnectorOutboxReplayLoop(
-    sdk,
-    30_000,
-    async () => {
-      const pipeline = await collectPipelineHealth(kv);
-      return [pipeline.compression, pipeline.summary, pipeline.graph].every(
-        (stage) => stage.pending === 0 && stage.failed === 0,
-      );
-    },
-  );
+  const connectorOutboxReplayLoop = startConnectorOutboxReplayLoop(sdk, 30_000);
   bootLog("Projection recovery: enabled (every 1m)");
   bootLog(
-    "Connector outbox replay: enabled (one current envelope every 30s when projections are settled)",
+    "Connector outbox replay: enabled (bounded current-envelope replay every 30s)",
   );
 
   // Ready / Endpoints lines are emitted via `bootLog` so they're

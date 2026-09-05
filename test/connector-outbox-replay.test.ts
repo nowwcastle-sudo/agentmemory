@@ -369,6 +369,179 @@ describe("connector outbox replay", () => {
     }
   });
 
+  it("replays same-session predecessors across adapters before terminal end", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agentmemory-outbox-terminal-cross-adapter-"));
+    const codex = join(root, "codex");
+    const hermes = join(root, "hermes");
+    const paths: string[] = [];
+    const fetchMock = vi.fn(async (url: string | URL, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body || "{}"));
+      paths.push(`${new URL(String(url)).pathname}:${body.captureId || "end"}`);
+      return new Response(
+        new URL(String(url)).pathname.endsWith("/observe")
+          ? JSON.stringify({ observationId: body.captureId })
+          : "{}",
+        { status: new URL(String(url)).pathname.endsWith("/observe") ? 201 : 200 },
+      );
+    });
+
+    try {
+      await writeEnvelope(hermes, "observe.json", {
+        schemaVersion: 2,
+        path: "/agentmemory/observe",
+        body: { captureId: "hermes:current-observe", sessionId: "shared-session" },
+        createdAt: "2026-08-30T00:00:00.000Z",
+      });
+      await writeEnvelope(codex, "end.json", {
+        schemaVersion: 2,
+        priority: "terminal",
+        path: "/agentmemory/session/end",
+        body: { sessionId: "shared-session" },
+        createdAt: "2026-08-30T00:00:01.000Z",
+      });
+
+      const result = await replayConnectorOutboxes({
+        outboxes: [
+          { adapter: "hermes", dir: hermes },
+          { adapter: "codex", dir: codex },
+        ],
+        baseUrl: "http://127.0.0.1:3111",
+        fetchImpl: fetchMock,
+        timeoutMs: 50,
+        limit: 20,
+      });
+
+      expect(result).toMatchObject({ delivered: 2, failed: 0 });
+      expect(paths).toEqual([
+        "/agentmemory/observe:hermes:current-observe",
+        "/agentmemory/session/end:end",
+      ]);
+      expect(await readdir(hermes)).toEqual([]);
+      expect(await readdir(codex)).toEqual([]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("restores cross-adapter predecessors and terminal end after a predecessor failure", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agentmemory-outbox-terminal-cross-adapter-failure-"));
+    const codex = join(root, "codex");
+    const hermes = join(root, "hermes");
+    const paths: string[] = [];
+    const fetchMock = vi.fn(async (url: string | URL) => {
+      const path = new URL(String(url)).pathname;
+      paths.push(path);
+      return path.endsWith("/observe")
+        ? new Response("unavailable", { status: 503 })
+        : new Response("{}", { status: 200 });
+    });
+
+    try {
+      await writeEnvelope(hermes, "observe.json", {
+        schemaVersion: 2,
+        path: "/agentmemory/observe",
+        body: { captureId: "hermes:failed-observe", sessionId: "shared-session" },
+        createdAt: "2026-08-30T00:00:00.000Z",
+      });
+      await writeEnvelope(codex, "end.json", {
+        schemaVersion: 2,
+        priority: "terminal",
+        path: "/agentmemory/session/end",
+        body: { sessionId: "shared-session" },
+        createdAt: "2026-08-30T00:00:01.000Z",
+      });
+
+      const result = await replayConnectorOutboxes({
+        outboxes: [
+          { adapter: "hermes", dir: hermes },
+          { adapter: "codex", dir: codex },
+        ],
+        baseUrl: "http://127.0.0.1:3111",
+        fetchImpl: fetchMock,
+        timeoutMs: 50,
+        limit: 20,
+      });
+
+      expect(result).toMatchObject({ delivered: 0, failed: 1 });
+      expect(paths).toEqual(["/agentmemory/observe"]);
+      expect(await readdir(hermes)).toEqual(["observe.json"]);
+      expect(await readdir(codex)).toEqual(["end.json"]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("leaves a cross-adapter terminal end pending until its bounded predecessors drain", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agentmemory-outbox-terminal-cross-adapter-slice-"));
+    const codex = join(root, "codex");
+    const hermes = join(root, "hermes");
+    const paths: string[] = [];
+    const fetchMock = vi.fn(async (url: string | URL, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body || "{}"));
+      const path = new URL(String(url)).pathname;
+      paths.push(`${path}:${body.captureId || "end"}`);
+      return new Response(
+        path.endsWith("/observe") ? JSON.stringify({ observationId: body.captureId }) : "{}",
+        { status: path.endsWith("/observe") ? 201 : 200 },
+      );
+    });
+
+    try {
+      for (const [index, captureId] of [
+        "hermes:current-0",
+        "hermes:current-1",
+      ].entries()) {
+        await writeEnvelope(hermes, `${index}-observe.json`, {
+          schemaVersion: 2,
+          path: "/agentmemory/observe",
+          body: { captureId, sessionId: "shared-session" },
+          createdAt: `2026-08-30T00:00:0${index}.000Z`,
+        });
+      }
+      await writeEnvelope(codex, "end.json", {
+        schemaVersion: 2,
+        priority: "terminal",
+        path: "/agentmemory/session/end",
+        body: { sessionId: "shared-session" },
+        createdAt: "2026-08-30T00:00:02.000Z",
+      });
+
+      const first = await replayConnectorOutboxes({
+        outboxes: [
+          { adapter: "hermes", dir: hermes },
+          { adapter: "codex", dir: codex },
+        ],
+        baseUrl: "http://127.0.0.1:3111",
+        fetchImpl: fetchMock,
+        timeoutMs: 50,
+        limit: 2,
+      });
+      expect(first).toMatchObject({ delivered: 2, failed: 0 });
+      expect(paths).toEqual([
+        "/agentmemory/observe:hermes:current-0",
+        "/agentmemory/observe:hermes:current-1",
+      ]);
+      expect(await readdir(hermes)).toEqual([]);
+      expect(await readdir(codex)).toEqual(["end.json"]);
+
+      const second = await replayConnectorOutboxes({
+        outboxes: [
+          { adapter: "hermes", dir: hermes },
+          { adapter: "codex", dir: codex },
+        ],
+        baseUrl: "http://127.0.0.1:3111",
+        fetchImpl: fetchMock,
+        timeoutMs: 50,
+        limit: 2,
+      });
+      expect(second).toMatchObject({ delivered: 1, failed: 0 });
+      expect(paths.slice(2)).toEqual(["/agentmemory/session/end:end"]);
+      expect(await readdir(codex)).toEqual([]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("keeps an observe envelope pending when a 2xx body reports rejection", async () => {
     const root = await mkdtemp(join(tmpdir(), "agentmemory-outbox-body-rejection-"));
     const codex = join(root, "codex");
@@ -602,27 +775,26 @@ describe("connector outbox replay", () => {
     }
   });
 
-  it("pauses automatic replay while downstream projections are unsettled", async () => {
+  it("replays automatic envelopes despite a legacy projection gate callback", async () => {
     vi.useFakeTimers();
     const sdk = { trigger: vi.fn(async () => ({ success: true })) };
     const canReplay = vi
       .fn<() => Promise<boolean>>()
-      .mockResolvedValueOnce(false)
-      .mockResolvedValueOnce(true);
+      .mockResolvedValue(false);
 
     try {
-      const loop = startConnectorOutboxReplayLoop(
+      const legacyStart = startConnectorOutboxReplayLoop as unknown as (
+        sdk: never,
+        intervalMs: number,
+        canReplay: () => Promise<boolean>,
+      ) => { stop(): void };
+      const loop = legacyStart(
         sdk as never,
         30_000,
         canReplay,
       );
 
       await vi.advanceTimersByTimeAsync(30_000);
-      expect(canReplay).toHaveBeenCalledTimes(1);
-      expect(sdk.trigger).not.toHaveBeenCalled();
-
-      await vi.advanceTimersByTimeAsync(30_000);
-      expect(canReplay).toHaveBeenCalledTimes(2);
       expect(sdk.trigger).toHaveBeenCalledTimes(1);
       expect(sdk.trigger).toHaveBeenCalledWith({
         function_id: "mem::connector-outbox-replay",
