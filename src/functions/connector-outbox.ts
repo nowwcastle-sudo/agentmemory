@@ -1,4 +1,4 @@
-import { readFile, readdir, rename, rm } from "node:fs/promises";
+import { readFile, readdir, rename, rm, stat } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import type { ISdk } from "iii-sdk";
 import { resolvePathLayout } from "../runtime-paths.js";
@@ -37,7 +37,66 @@ export type ConnectorOutboxInspection = {
   legacy: number;
   malformed: number;
   claimed: number;
+  pending: number;
+  scanned: number;
+  truncated: boolean;
 };
+
+const DEFAULT_OUTBOX_SCAN_LIMIT = 500;
+const OUTBOX_STAT_CONCURRENCY = 32;
+
+export function resolveOutboxScanLimit(
+  requested?: number,
+  env: NodeJS.ProcessEnv = process.env,
+): number {
+  // An explicit 0 means "parse nothing"; only an absent/invalid value falls back.
+  if (Number.isFinite(requested as number) && Number(requested) >= 0) {
+    return Math.floor(Number(requested));
+  }
+  // A blank or whitespace value must not read as 0 and silently disable replay.
+  const raw = (env.AGENTMEMORY_OUTBOX_SCAN_LIMIT ?? "").trim();
+  const configured = raw === "" ? Number.NaN : Number(raw);
+  return Number.isFinite(configured) && configured >= 0
+    ? Math.floor(configured)
+    : DEFAULT_OUTBOX_SCAN_LIMIT;
+}
+
+type OutboxEntry = {
+  outbox: ConnectorOutbox;
+  queue: number;
+  name: string;
+  at: number;
+};
+
+async function orderEntriesByWriteTime(entries: OutboxEntry[]): Promise<void> {
+  let cursor = 0;
+  const worker = async (): Promise<void> => {
+    for (;;) {
+      const index = cursor;
+      cursor += 1;
+      if (index >= entries.length) return;
+      const entry = entries[index];
+      try {
+        const { mtimeMs } = await stat(join(entry.outbox.dir, entry.name));
+        // A non-finite mtime would make the comparator non-antisymmetric.
+        entry.at = Number.isFinite(mtimeMs) ? mtimeMs : Number.POSITIVE_INFINITY;
+      } catch {
+        entry.at = Number.POSITIVE_INFINITY;
+      }
+    }
+  };
+  await Promise.all(
+    Array.from(
+      { length: Math.min(OUTBOX_STAT_CONCURRENCY, entries.length) },
+      worker,
+    ),
+  );
+  entries.sort((a, b) =>
+    (a.at === b.at ? 0 : a.at < b.at ? -1 : 1) ||
+    a.name.localeCompare(b.name) ||
+    a.queue - b.queue
+  );
+}
 
 export type ConnectorOutboxReplayResult = ConnectorOutboxInspection & {
   delivered: number;
@@ -70,66 +129,188 @@ export function defaultConnectorOutboxes(
   }));
 }
 
-async function readOutbox(outbox: ConnectorOutbox): Promise<{
+type OutboxQueue = {
   current: PendingEnvelope[];
   legacy: PendingEnvelope[];
-  malformed: number;
-  claimed: number;
-}> {
-  let names: string[];
-  try {
-    names = await readdir(outbox.dir);
-  } catch {
-    return { current: [], legacy: [], malformed: 0, claimed: 0 };
-  }
+};
 
-  const current: PendingEnvelope[] = [];
-  const legacy: PendingEnvelope[] = [];
-  let malformed = 0;
-  const claimed = names.filter((name) => name.endsWith(".json.replaying")).length;
-  for (const name of names.filter((entry) => entry.endsWith(".json"))) {
-    const file = join(outbox.dir, name);
-    try {
-      const value = JSON.parse(await readFile(file, "utf8"));
-      if (
-        typeof value?.path !== "string" ||
-        !value.body ||
-        typeof value.body !== "object" ||
-        Array.isArray(value.body)
-      ) {
-        malformed += 1;
-        continue;
+// How far past an undeliverable prefix a single pass may read. Legacy and
+// malformed envelopes are never deleted in current mode, so a fixed window
+// anchored on the oldest files would eventually hold nothing deliverable.
+const OUTBOX_PARSE_CAP_FACTOR = 10;
+
+async function readOutboxes(options: {
+  outboxes: ConnectorOutbox[];
+  scanLimit: number;
+  ordered: boolean;
+  // "sample" stops at the window; a replay mode keeps reading past envelopes it
+  // cannot deliver until it has a full window of the class it will deliver.
+  want: "current" | "legacy" | "sample";
+}): Promise<{ queues: OutboxQueue[]; inspection: ConnectorOutboxInspection }> {
+  const { outboxes, scanLimit } = options;
+  const queues: OutboxQueue[] = outboxes.map(() => ({ current: [], legacy: [] }));
+  const entries: OutboxEntry[] = [];
+  let claimed = 0;
+  let pending = 0;
+
+  const listings = await Promise.all(
+    outboxes.map(async (outbox) => {
+      try {
+        return await readdir(outbox.dir);
+      } catch {
+        return [] as string[];
       }
-      const item = {
-        adapter: outbox.adapter,
-        file,
-        envelope: value as ConnectorEnvelope,
-      };
-      if (value.schemaVersion === 2) current.push(item);
-      else legacy.push(item);
-    } catch {
-      malformed += 1;
+    }),
+  );
+  const perOutbox = listings.map((names, queue) => {
+    claimed += names.filter((name) => name.endsWith(".json.replaying")).length;
+    const pendingNames = names.filter((entry) => entry.endsWith(".json"));
+    pending += pendingNames.length;
+    return pendingNames.map((name) => ({
+      outbox: outboxes[queue],
+      queue,
+      name,
+      at: 0,
+    }));
+  });
+  // Interleave adapters. An unordered sample must not be one adapter's readdir
+  // prefix, or the health snapshot goes blind to every other adapter.
+  for (let index = 0; entries.length < pending; index += 1) {
+    for (const listing of perOutbox) {
+      if (index < listing.length) entries.push(listing[index]);
     }
   }
 
-  current.sort(comparePending);
-  legacy.sort(comparePending);
-  return { current, legacy, malformed, claimed };
+  // Order across every adapter, not per adapter: replay selects a terminal
+  // session and its predecessors from the union, so a per-adapter window could
+  // admit a session/end while its own earlier envelopes stayed unparsed.
+  if (options.ordered && scanLimit > 0 && entries.length > scanLimit) {
+    await orderEntriesByWriteTime(entries);
+  }
+
+  const parseCap = Math.min(
+    entries.length,
+    options.want === "sample" ? scanLimit : scanLimit * OUTBOX_PARSE_CAP_FACTOR,
+  );
+  // Terminal envelopes must never ship ahead of their own session, so a bounded
+  // scan holds them aside. They must not spend a window slot either: pinned at
+  // the oldest end and never delivered, they would fill the window and wedge
+  // replay permanently. They go back only when the scan turned out complete.
+  const held: Array<{ queue: number; legacy: boolean; item: PendingEnvelope }> = [];
+  let heldDropped = false;
+  let currentSeen = 0;
+  let legacySeen = 0;
+  let currentKept = 0;
+  let legacyKept = 0;
+  let malformed = 0;
+  let scanned = 0;
+  const satisfied = (): boolean =>
+    options.want === "current"
+      ? currentKept >= scanLimit
+      : options.want === "legacy"
+      ? legacyKept >= scanLimit
+      : false;
+  for (const entry of entries) {
+    if (scanned >= parseCap || satisfied()) break;
+    scanned += 1;
+    const file = join(entry.outbox.dir, entry.name);
+    let value: unknown;
+    try {
+      value = JSON.parse(await readFile(file, "utf8"));
+    } catch {
+      malformed += 1;
+      continue;
+    }
+    const candidate = value as ConnectorEnvelope | null;
+    if (
+      typeof candidate?.path !== "string" ||
+      !candidate.body ||
+      typeof candidate.body !== "object" ||
+      Array.isArray(candidate.body)
+    ) {
+      malformed += 1;
+      continue;
+    }
+    const item = {
+      adapter: entry.outbox.adapter,
+      file,
+      envelope: candidate,
+    };
+    const legacyItem = candidate.schemaVersion !== 2;
+    if (legacyItem) legacySeen += 1;
+    else currentSeen += 1;
+    if (
+      candidate.priority === "terminal" ||
+      requestPath(candidate.path) === "/agentmemory/session/end"
+    ) {
+      if (held.length >= scanLimit) heldDropped = true;
+      else held.push({ queue: entry.queue, legacy: legacyItem, item });
+      continue;
+    }
+    if (legacyItem) {
+      if (legacyKept >= scanLimit) continue;
+      queues[entry.queue].legacy.push(item);
+      legacyKept += 1;
+    } else {
+      if (currentKept >= scanLimit) continue;
+      queues[entry.queue].current.push(item);
+      currentKept += 1;
+    }
+  }
+
+  const complete = scanned >= pending && !heldDropped;
+  if (complete) {
+    for (const entry of held) {
+      const queue = queues[entry.queue];
+      if (entry.legacy) queue.legacy.push(entry.item);
+      else queue.current.push(entry.item);
+    }
+  }
+  const wanted = options.want === "legacy" ? legacyKept : currentKept;
+  if (
+    options.want !== "sample" && wanted === 0 && pending > 0 && scanned > 0 &&
+    scanned >= parseCap
+  ) {
+    logger.warn("Connector outbox scan found nothing deliverable", {
+      want: options.want,
+      pending,
+      scanned,
+      legacy: legacySeen,
+      malformed,
+    });
+  }
+  for (const queue of queues) {
+    queue.current.sort(comparePending);
+    queue.legacy.sort(comparePending);
+  }
+  return {
+    queues,
+    inspection: {
+      current: currentSeen,
+      legacy: legacySeen,
+      malformed,
+      claimed,
+      pending,
+      scanned,
+      truncated: !complete,
+    },
+  };
 }
 
 export async function inspectConnectorOutboxes(
   outboxes: ConnectorOutbox[],
+  scanLimit?: number,
 ): Promise<ConnectorOutboxInspection> {
-  const readings = await Promise.all(outboxes.map(readOutbox));
-  return readings.reduce(
-    (total, reading) => ({
-      current: total.current + reading.current.length,
-      legacy: total.legacy + reading.legacy.length,
-      malformed: total.malformed + reading.malformed,
-      claimed: total.claimed + reading.claimed,
-    }),
-    { current: 0, legacy: 0, malformed: 0, claimed: 0 },
-  );
+  const limit = resolveOutboxScanLimit(scanLimit);
+  // Classification is a sample, so write-time ordering buys nothing here and
+  // the stat sweep it costs would run on every health tick.
+  const { inspection } = await readOutboxes({
+    outboxes,
+    scanLimit: limit,
+    ordered: false,
+    want: "sample",
+  });
+  return inspection;
 }
 
 export async function recoverConnectorOutboxClaims(
@@ -268,22 +449,24 @@ export async function replayConnectorOutboxes(options: {
   fetchImpl?: typeof fetch;
   timeoutMs?: number;
   limit?: number;
+  scanLimit?: number;
   mode?: "current" | "legacy";
 }): Promise<ConnectorOutboxReplayResult> {
-  const readings = await Promise.all(options.outboxes.map(readOutbox));
-  const inspection = readings.reduce(
-    (total, reading) => ({
-      current: total.current + reading.current.length,
-      legacy: total.legacy + reading.legacy.length,
-      malformed: total.malformed + reading.malformed,
-      claimed: total.claimed + reading.claimed,
-    }),
-    { current: 0, legacy: 0, malformed: 0, claimed: 0 },
-  );
+  const scanLimit = resolveOutboxScanLimit(options.scanLimit);
   const mode = options.mode ?? "current";
+  const { queues: readings, inspection } = await readOutboxes({
+    outboxes: options.outboxes,
+    scanLimit,
+    ordered: true,
+    want: mode,
+  });
   const limit = Math.max(0, Math.min(100, Math.floor(options.limit ?? 4)));
+  // A bounded scan keeps its window by write time but orders delivery by
+  // createdAt, and the two can disagree. While the scan is truncated we cannot
+  // prove a session's earlier envelopes were seen, so no terminal ships at all:
+  // a session must never be ended ahead of its own observations.
   const queues = readings.map((reading) => [...reading[mode]]);
-  const terminalSelection = mode === "current"
+  const terminalSelection = mode === "current" && !inspection.truncated
     ? terminalSessionSelection(queues, limit)
     : [];
   const replayingTerminalSession = terminalSelection.length > 0;
@@ -362,6 +545,7 @@ export function registerConnectorOutboxReplayFunctions(
     secret?: string;
     fetchImpl?: typeof fetch;
     timeoutMs?: number;
+    scanLimit?: number;
   } = {},
 ): void {
   const outboxes = options.outboxes ?? defaultConnectorOutboxes();
@@ -381,6 +565,7 @@ export function registerConnectorOutboxReplayFunctions(
           fetchImpl: options.fetchImpl,
           timeoutMs: options.timeoutMs,
           limit,
+          scanLimit: options.scanLimit,
           mode: data.mode === "legacy" ? "legacy" : "current",
         }),
       );
@@ -393,7 +578,7 @@ export function registerConnectorOutboxReplayFunctions(
   );
 
   sdk.registerFunction("mem::connector-outbox-inspect", async () =>
-    inspectConnectorOutboxes(outboxes),
+    inspectConnectorOutboxes(outboxes, options.scanLimit),
   );
 }
 

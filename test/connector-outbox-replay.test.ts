@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -8,6 +8,7 @@ import {
   recoverConnectorOutboxClaims,
   registerConnectorOutboxReplayFunctions,
   replayConnectorOutboxes,
+  resolveOutboxScanLimit,
   startConnectorOutboxReplayLoop,
 } from "../src/functions/connector-outbox.js";
 import { mockSdk } from "./helpers/mocks.js";
@@ -803,6 +804,448 @@ describe("connector outbox replay", () => {
       loop.stop();
     } finally {
       vi.useRealTimers();
+    }
+  });
+  it("parses only the oldest bounded window when the backlog exceeds the scan limit", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agentmemory-outbox-scanlimit-"));
+    const codex = join(root, "codex");
+    try {
+      // Names sort in the reverse of mtime order, so a directory-order window
+      // would select the newest envelopes instead of the oldest ones.
+      const total = 12;
+      for (let index = 0; index < total; index += 1) {
+        const name = `${String.fromCharCode(122 - index)}-${index}.json`;
+        await writeEnvelope(codex, name, {
+          schemaVersion: 2,
+          path: "observe",
+          createdAt: new Date(Date.UTC(2026, 0, 1, 0, index)).toISOString(),
+          body: { captureId: `codex:${index}` },
+        });
+        const when = new Date(Date.UTC(2026, 0, 1, 0, index));
+        await utimes(join(codex, name), when, when);
+      }
+
+      const calls: unknown[] = [];
+      const result = await replayConnectorOutboxes({
+        outboxes: [{ adapter: "codex", dir: codex }],
+        baseUrl: "http://127.0.0.1:5611",
+        limit: 1,
+        scanLimit: 3,
+        fetchImpl: (async (_url: string, init: { body: string }) => {
+          calls.push(JSON.parse(init.body));
+          return new Response(JSON.stringify({ success: true }), { status: 200 });
+        }) as unknown as typeof fetch,
+      });
+
+      expect(result).toMatchObject({
+        pending: total,
+        scanned: 3,
+        truncated: true,
+        current: 3,
+        delivered: 1,
+        newlyAccepted: 1,
+      });
+      expect(calls).toEqual([{ captureId: "codex:0" }]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("reports an untruncated scan when the backlog fits the scan limit", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agentmemory-outbox-untruncated-"));
+    const codex = join(root, "codex");
+    try {
+      for (let index = 0; index < 3; index += 1) {
+        await writeEnvelope(codex, `e${index}.json`, {
+          schemaVersion: 2,
+          path: "observe",
+          createdAt: new Date(Date.UTC(2026, 0, 1, 0, index)).toISOString(),
+          body: { captureId: `codex:${index}` },
+        });
+      }
+
+      const inspection = await inspectConnectorOutboxes([
+        { adapter: "codex", dir: codex },
+      ]);
+
+      expect(inspection).toMatchObject({
+        pending: 3,
+        scanned: 3,
+        truncated: false,
+        current: 3,
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+  it("skips past an undeliverable oldest prefix instead of starving on it", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agentmemory-outbox-starve-"));
+    const codex = join(root, "codex");
+    try {
+      // Eight legacy envelopes are the oldest; nothing ever deletes them in
+      // current mode, so a fixed oldest-N window would deliver nothing forever.
+      for (let index = 0; index < 8; index += 1) {
+        const name = `legacy-${index}.json`;
+        await writeEnvelope(codex, name, {
+          schemaVersion: 1,
+          path: "observe",
+          createdAt: new Date(Date.UTC(2026, 0, 1, 0, index)).toISOString(),
+          body: { captureId: `legacy:${index}` },
+        });
+        const when = new Date(Date.UTC(2026, 0, 1, 0, index));
+        await utimes(join(codex, name), when, when);
+      }
+      for (let index = 0; index < 2; index += 1) {
+        const name = `current-${index}.json`;
+        await writeEnvelope(codex, name, {
+          schemaVersion: 2,
+          path: "observe",
+          createdAt: new Date(Date.UTC(2026, 0, 1, 1, index)).toISOString(),
+          body: { captureId: `current:${index}` },
+        });
+        const when = new Date(Date.UTC(2026, 0, 1, 1, index));
+        await utimes(join(codex, name), when, when);
+      }
+
+      const calls: unknown[] = [];
+      const result = await replayConnectorOutboxes({
+        outboxes: [{ adapter: "codex", dir: codex }],
+        baseUrl: "http://127.0.0.1:5611",
+        limit: 1,
+        scanLimit: 5,
+        fetchImpl: (async (_url: string, init: { body: string }) => {
+          calls.push(JSON.parse(init.body));
+          return new Response(JSON.stringify({ success: true }), { status: 200 });
+        }) as unknown as typeof fetch,
+      });
+
+      expect(result).toMatchObject({ pending: 10, delivered: 1, newlyAccepted: 1 });
+      expect(calls).toEqual([{ captureId: "current:0" }]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("never ships a terminal end whose predecessors fell outside another adapter's window", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agentmemory-outbox-crossadapter-"));
+    const codex = join(root, "codex");
+    const hermes = join(root, "hermes");
+    try {
+      // codex is the busy adapter: an old unrelated backlog, then the tracked
+      // session's observations. hermes holds only that session's terminal end.
+      for (let index = 0; index < 8; index += 1) {
+        const name = `other-${index}.json`;
+        await writeEnvelope(codex, name, {
+          schemaVersion: 2,
+          path: "observe",
+          createdAt: new Date(Date.UTC(2026, 0, 1, 0, index)).toISOString(),
+          body: { captureId: `other:${index}`, sessionId: "other-session" },
+        });
+        const when = new Date(Date.UTC(2026, 0, 1, 0, index));
+        await utimes(join(codex, name), when, when);
+      }
+      for (let index = 0; index < 3; index += 1) {
+        const name = `tracked-${index}.json`;
+        await writeEnvelope(codex, name, {
+          schemaVersion: 2,
+          path: "observe",
+          createdAt: new Date(Date.UTC(2026, 0, 1, 1, index)).toISOString(),
+          body: { captureId: `tracked:${index}`, sessionId: "tracked-session" },
+        });
+        const when = new Date(Date.UTC(2026, 0, 1, 1, index));
+        await utimes(join(codex, name), when, when);
+      }
+      await writeEnvelope(hermes, "end.json", {
+        schemaVersion: 2,
+        priority: "terminal",
+        path: "session/end",
+        createdAt: new Date(Date.UTC(2026, 0, 1, 2, 0)).toISOString(),
+        body: { sessionId: "tracked-session" },
+      });
+      const endAt = new Date(Date.UTC(2026, 0, 1, 2, 0));
+      await utimes(join(hermes, "end.json"), endAt, endAt);
+
+      const paths: string[] = [];
+      await replayConnectorOutboxes({
+        outboxes: [
+          { adapter: "codex", dir: codex },
+          { adapter: "hermes", dir: hermes },
+        ],
+        baseUrl: "http://127.0.0.1:5611",
+        limit: 4,
+        scanLimit: 5,
+        fetchImpl: (async (url: string) => {
+          paths.push(new URL(url).pathname);
+          return new Response(JSON.stringify({ success: true }), { status: 200 });
+        }) as unknown as typeof fetch,
+      });
+
+      expect(paths).not.toContain("/agentmemory/session/end");
+      expect(await readdir(hermes)).toEqual(["end.json"]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+  it("resolves the scan limit from the argument, then the environment, then the default", () => {
+    expect(resolveOutboxScanLimit(undefined, {})).toBe(500);
+    expect(resolveOutboxScanLimit(undefined, { AGENTMEMORY_OUTBOX_SCAN_LIMIT: "120" })).toBe(120);
+    expect(resolveOutboxScanLimit(7, { AGENTMEMORY_OUTBOX_SCAN_LIMIT: "120" })).toBe(7);
+    expect(resolveOutboxScanLimit(0, { AGENTMEMORY_OUTBOX_SCAN_LIMIT: "120" })).toBe(0);
+    expect(resolveOutboxScanLimit(-1, {})).toBe(500);
+    expect(resolveOutboxScanLimit(Number.NaN, {})).toBe(500);
+    expect(resolveOutboxScanLimit(undefined, { AGENTMEMORY_OUTBOX_SCAN_LIMIT: "nope" })).toBe(500);
+    expect(resolveOutboxScanLimit(4.9, {})).toBe(4);
+  });
+  it("never ships a terminal end while the scan is truncated", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agentmemory-outbox-truncated-terminal-"));
+    const codex = join(root, "codex");
+    try {
+      // mtime rank and createdAt rank disagree for obs-c: it is written last but
+      // is an earlier predecessor, so an mtime window can exclude it while
+      // admitting the session end that must not precede it.
+      const write = async (
+        name: string,
+        value: Record<string, unknown>,
+        mtime: Date,
+      ) => {
+        await writeEnvelope(codex, name, value);
+        await utimes(join(codex, name), mtime, mtime);
+      };
+      await write("a.json", {
+        schemaVersion: 2,
+        path: "observe",
+        createdAt: "2026-01-01T01:00:00.000Z",
+        body: { captureId: "a", sessionId: "S" },
+      }, new Date(Date.UTC(2026, 0, 1, 1, 0)));
+      await write("b.json", {
+        schemaVersion: 2,
+        path: "observe",
+        createdAt: "2026-01-01T01:01:00.000Z",
+        body: { captureId: "b", sessionId: "S" },
+      }, new Date(Date.UTC(2026, 0, 1, 1, 1)));
+      await write("end.json", {
+        schemaVersion: 2,
+        priority: "terminal",
+        path: "session/end",
+        createdAt: "2026-01-01T02:00:00.000Z",
+        body: { sessionId: "S" },
+      }, new Date(Date.UTC(2026, 0, 1, 2, 0)));
+      await write("c.json", {
+        schemaVersion: 2,
+        path: "observe",
+        createdAt: "2026-01-01T01:02:00.000Z",
+        body: { captureId: "c", sessionId: "S" },
+      }, new Date(Date.UTC(2026, 0, 1, 3, 0)));
+
+      const paths: string[] = [];
+      const result = await replayConnectorOutboxes({
+        outboxes: [{ adapter: "codex", dir: codex }],
+        baseUrl: "http://127.0.0.1:5611",
+        limit: 4,
+        // Two slots stop the scan before obs-c, whose write time is newest even
+        // though its createdAt makes it an earlier predecessor of the end.
+        scanLimit: 2,
+        fetchImpl: (async (url: string) => {
+          paths.push(new URL(url).pathname);
+          return new Response(JSON.stringify({ success: true }), { status: 200 });
+        }) as unknown as typeof fetch,
+      });
+
+      expect(result.truncated).toBe(true);
+      expect(paths).not.toContain("/agentmemory/session/end");
+      expect(await readdir(codex)).toContain("end.json");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("counts every legacy envelope it scanned, not just the ones it retained", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agentmemory-outbox-legacycount-"));
+    const codex = join(root, "codex");
+    try {
+      for (let index = 0; index < 9; index += 1) {
+        const name = `legacy-${index}.json`;
+        await writeEnvelope(codex, name, {
+          schemaVersion: 1,
+          path: "observe",
+          createdAt: new Date(Date.UTC(2026, 0, 1, 0, index)).toISOString(),
+          body: { captureId: `legacy:${index}` },
+        });
+        const when = new Date(Date.UTC(2026, 0, 1, 0, index));
+        await utimes(join(codex, name), when, when);
+      }
+
+      const result = await replayConnectorOutboxes({
+        outboxes: [{ adapter: "codex", dir: codex }],
+        baseUrl: "http://127.0.0.1:5611",
+        limit: 1,
+        scanLimit: 2,
+        fetchImpl: (async () =>
+          new Response(JSON.stringify({ success: true }), { status: 200 })) as unknown as typeof fetch,
+      });
+
+      expect(result).toMatchObject({ pending: 9, scanned: 9, legacy: 9, delivered: 0 });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("treats a blank scan-limit environment value as unset", () => {
+    expect(resolveOutboxScanLimit(undefined, { AGENTMEMORY_OUTBOX_SCAN_LIMIT: "" })).toBe(500);
+    expect(resolveOutboxScanLimit(undefined, { AGENTMEMORY_OUTBOX_SCAN_LIMIT: "   " })).toBe(500);
+  });
+  it("keeps draining observations when pending session ends outnumber the window", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agentmemory-outbox-endwedge-"));
+    const codex = join(root, "codex");
+    try {
+      const write = async (name: string, value: Record<string, unknown>, minute: number) => {
+        await writeEnvelope(codex, name, value);
+        const when = new Date(Date.UTC(2026, 0, 1, 0, minute));
+        await utimes(join(codex, name), when, when);
+      };
+      // Six ends are the oldest entries; the window is five.
+      for (let index = 0; index < 6; index += 1) {
+        await write(`end-${index}.json`, {
+          schemaVersion: 2,
+          priority: "terminal",
+          path: "session/end",
+          createdAt: new Date(Date.UTC(2026, 0, 1, 0, index)).toISOString(),
+          body: { sessionId: `s${index}` },
+        }, index);
+      }
+      for (let index = 0; index < 6; index += 1) {
+        await write(`obs-${index}.json`, {
+          schemaVersion: 2,
+          path: "observe",
+          createdAt: new Date(Date.UTC(2026, 0, 1, 1, index)).toISOString(),
+          body: { captureId: `obs:${index}`, sessionId: "live" },
+        }, 30 + index);
+      }
+
+      const paths: string[] = [];
+      const result = await replayConnectorOutboxes({
+        outboxes: [{ adapter: "codex", dir: codex }],
+        baseUrl: "http://127.0.0.1:5611",
+        limit: 4,
+        scanLimit: 5,
+        fetchImpl: (async (url: string) => {
+          paths.push(new URL(url).pathname);
+          return new Response(JSON.stringify({ success: true }), { status: 200 });
+        }) as unknown as typeof fetch,
+      });
+
+      expect(result.truncated).toBe(true);
+      expect(paths).not.toContain("/agentmemory/session/end");
+      expect(result.delivered).toBeGreaterThan(0);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("holds a terminal end back only while the scan is incomplete", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agentmemory-outbox-endcomplete-"));
+    const codex = join(root, "codex");
+    try {
+      await writeEnvelope(codex, "obs.json", {
+        schemaVersion: 2,
+        path: "observe",
+        createdAt: "2026-01-01T01:00:00.000Z",
+        body: { captureId: "a", sessionId: "S" },
+      });
+      await writeEnvelope(codex, "end.json", {
+        schemaVersion: 2,
+        priority: "terminal",
+        path: "session/end",
+        createdAt: "2026-01-01T02:00:00.000Z",
+        body: { sessionId: "S" },
+      });
+
+      const paths: string[] = [];
+      const result = await replayConnectorOutboxes({
+        outboxes: [{ adapter: "codex", dir: codex }],
+        baseUrl: "http://127.0.0.1:5611",
+        limit: 4,
+        scanLimit: 500,
+        fetchImpl: (async (url: string) => {
+          paths.push(new URL(url).pathname);
+          return new Response(JSON.stringify({ success: true }), { status: 200 });
+        }) as unknown as typeof fetch,
+      });
+
+      expect(result.truncated).toBe(false);
+      expect(paths).toEqual([
+        "/agentmemory/observe",
+        "/agentmemory/session/end",
+      ]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("stays quiet about undeliverable scans when the outbox is simply empty", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agentmemory-outbox-quiet-"));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const result = await replayConnectorOutboxes({
+        outboxes: [{ adapter: "codex", dir: join(root, "codex") }],
+        baseUrl: "http://127.0.0.1:5611",
+        limit: 4,
+        fetchImpl: (async () =>
+          new Response("{}", { status: 200 })) as unknown as typeof fetch,
+      });
+      expect(result).toMatchObject({ pending: 0, scanned: 0, truncated: false });
+      expect(
+        warn.mock.calls.filter(([line]) =>
+          String(line).includes("nothing deliverable")
+        ),
+      ).toEqual([]);
+    } finally {
+      warn.mockRestore();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("holds a legacy terminal end back while the scan is incomplete", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agentmemory-outbox-legacyend-"));
+    const codex = join(root, "codex");
+    try {
+      const write = async (name: string, value: Record<string, unknown>, minute: number) => {
+        await writeEnvelope(codex, name, value);
+        const when = new Date(Date.UTC(2026, 0, 1, 0, minute));
+        await utimes(join(codex, name), when, when);
+      };
+      await write("end.json", {
+        schemaVersion: 1,
+        priority: "terminal",
+        path: "session/end",
+        createdAt: "2026-01-01T02:00:00.000Z",
+        body: { sessionId: "S" },
+      }, 0);
+      for (let index = 0; index < 4; index += 1) {
+        await write(`obs-${index}.json`, {
+          schemaVersion: 1,
+          path: "observe",
+          createdAt: new Date(Date.UTC(2026, 0, 1, 1, index)).toISOString(),
+          body: { captureId: `o${index}`, sessionId: "S" },
+        }, 10 + index);
+      }
+
+      const paths: string[] = [];
+      await replayConnectorOutboxes({
+        outboxes: [{ adapter: "codex", dir: codex }],
+        baseUrl: "http://127.0.0.1:5611",
+        limit: 1,
+        scanLimit: 1,
+        mode: "legacy",
+        fetchImpl: (async (url: string) => {
+          paths.push(new URL(url).pathname);
+          return new Response(JSON.stringify({ success: true }), { status: 200 });
+        }) as unknown as typeof fetch,
+      });
+
+      expect(paths).not.toContain("/agentmemory/session/end");
+    } finally {
+      await rm(root, { recursive: true, force: true });
     }
   });
 });

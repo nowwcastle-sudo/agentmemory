@@ -379,10 +379,20 @@ export interface HealthSnapshot {
   notes?: string[];
   pipeline?: PipelineHealth;
   connectorOutbox?: {
+    /**
+     * Counted over the bounded scan window, not the whole directory. When
+     * `truncated` is true these three are a sample; `pending` is the backlog.
+     */
     current: number;
     legacy: number;
     malformed: number;
     claimed: number;
+    /** Exact number of pending envelopes on disk, counted without parsing. */
+    pending?: number;
+    /** How many of those envelopes this snapshot actually parsed. */
+    scanned?: number;
+    /** True when the backlog exceeded the bounded scan window. */
+    truncated?: boolean;
   };
 }
 
