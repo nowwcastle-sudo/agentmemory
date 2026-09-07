@@ -1,6 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
 import { readFileSync } from "node:fs";
-import { ProjectionCoordinator } from "../src/functions/projection-coordinator.js";
+import {
+  ProjectionCoordinator,
+  resolveProjectionCapacity,
+} from "../src/functions/projection-coordinator.js";
 
 describe("ProjectionCoordinator", () => {
   it("loads persisted indexes before starting health and projection recovery drains", () => {
@@ -21,7 +24,7 @@ describe("ProjectionCoordinator", () => {
   });
 
   it("defers a second projection without waiting for the active task", async () => {
-    const coordinator = new ProjectionCoordinator();
+    const coordinator = new ProjectionCoordinator(1);
     let release!: () => void;
     const first = coordinator.run(
       { stage: "compression", sourceId: "obs-1" },
@@ -47,7 +50,7 @@ describe("ProjectionCoordinator", () => {
   });
 
   it("reports only active timing and stage-level deferred work", async () => {
-    const coordinator = new ProjectionCoordinator();
+    const coordinator = new ProjectionCoordinator(1);
     let release!: () => void;
     const active = coordinator.run(
       { stage: "compression", sourceId: "obs-secret" },
@@ -62,6 +65,8 @@ describe("ProjectionCoordinator", () => {
       activeStage: "compression",
       activeSince: expect.any(String),
       deferredStages: ["summary"],
+      active: 1,
+      capacity: 1,
     });
     expect(JSON.stringify(coordinator.status())).not.toContain("obs-secret");
 
@@ -90,7 +95,7 @@ describe("ProjectionCoordinator", () => {
   });
 
   it("coalesces repeated stage requests and wakes stages by priority", async () => {
-    const coordinator = new ProjectionCoordinator();
+    const coordinator = new ProjectionCoordinator(1);
     const wakeOrder: string[] = [];
     const replacedCompressionWake = vi.fn();
     let release!: () => void;
@@ -143,7 +148,11 @@ describe("ProjectionCoordinator", () => {
       "graph",
       "maintenance",
     ]);
-    expect(coordinator.status()).toEqual({ deferredStages: [] });
+    expect(coordinator.status()).toEqual({
+      deferredStages: [],
+      active: 0,
+      capacity: 1,
+    });
   });
 
   it("schedules an idle stage request without retaining it", async () => {
@@ -151,9 +160,89 @@ describe("ProjectionCoordinator", () => {
     const wake = vi.fn();
 
     coordinator.request("compression", wake);
-    expect(coordinator.status()).toEqual({ deferredStages: [] });
+    expect(coordinator.status()).toEqual({
+      deferredStages: [],
+      active: 0,
+      capacity: 6,
+    });
     expect(wake).not.toHaveBeenCalled();
     await Promise.resolve();
     expect(wake).toHaveBeenCalledOnce();
+  });
+  it("runs independent sources at the same time up to the capacity", async () => {
+    const coordinator = new ProjectionCoordinator(3);
+    const releases: Array<() => void> = [];
+    const hold = (stage: "compression" | "summary" | "graph", sourceId: string) =>
+      coordinator.run({ stage, sourceId }, () =>
+        new Promise<string>((resolve) => {
+          releases.push(() => resolve(sourceId));
+        }));
+
+    const first = hold("compression", "obs-1");
+    const second = hold("compression", "obs-2");
+    const third = hold("summary", "ses-1");
+    await Promise.resolve();
+
+    expect(coordinator.status()).toMatchObject({ active: 3, capacity: 3 });
+
+    // The fourth is refused because every slot is taken, not because it shares
+    // a source with anything already running.
+    await expect(
+      coordinator.run({ stage: "graph", sourceId: "obs-9" }, async () => "no"),
+    ).resolves.toMatchObject({
+      accepted: false,
+      deferred: true,
+      error: "projection_coordinator_busy",
+    });
+
+    for (const release of releases) release();
+    await expect(Promise.all([first, second, third])).resolves.toEqual([
+      { accepted: true, value: "obs-1" },
+      { accepted: true, value: "obs-2" },
+      { accepted: true, value: "ses-1" },
+    ]);
+  });
+
+  it("never overlaps one source with itself even with capacity to spare", async () => {
+    const coordinator = new ProjectionCoordinator(4);
+    let release!: () => void;
+    const active = coordinator.run(
+      { stage: "compression", sourceId: "obs-1" },
+      () =>
+        new Promise<void>((resolve) => {
+          release = resolve;
+        }),
+    );
+    await Promise.resolve();
+
+    await expect(
+      coordinator.run(
+        { stage: "compression", sourceId: "obs-1" },
+        async () => "second",
+      ),
+    ).resolves.toEqual({
+      accepted: false,
+      deferred: true,
+      error: "projection_coordinator_busy",
+      activeStage: "compression",
+    });
+
+    // The same source id under a different stage is independent work.
+    await expect(
+      coordinator.run({ stage: "graph", sourceId: "obs-1" }, async () => "graph"),
+    ).resolves.toEqual({ accepted: true, value: "graph" });
+
+    release();
+    await active;
+  });
+
+  it("resolves the capacity from the environment and falls back to six", () => {
+    expect(resolveProjectionCapacity({})).toBe(6);
+    expect(resolveProjectionCapacity({ AGENTMEMORY_PROJECTION_CONCURRENCY: "12" })).toBe(12);
+    expect(resolveProjectionCapacity({ AGENTMEMORY_PROJECTION_CONCURRENCY: "1" })).toBe(1);
+    expect(resolveProjectionCapacity({ AGENTMEMORY_PROJECTION_CONCURRENCY: "" })).toBe(6);
+    expect(resolveProjectionCapacity({ AGENTMEMORY_PROJECTION_CONCURRENCY: "   " })).toBe(6);
+    expect(resolveProjectionCapacity({ AGENTMEMORY_PROJECTION_CONCURRENCY: "0" })).toBe(6);
+    expect(resolveProjectionCapacity({ AGENTMEMORY_PROJECTION_CONCURRENCY: "nope" })).toBe(6);
   });
 });

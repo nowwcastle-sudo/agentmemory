@@ -27,7 +27,7 @@ describe("pipeline health markers", () => {
       "../src/health/pipeline.js"
     );
     const kv = mockKV();
-    const coordinator = new ProjectionCoordinator();
+    const coordinator = new ProjectionCoordinator(1);
     let release!: () => void;
     const active = coordinator.run(
       { stage: "compression", sourceId: "private-observation-id" },
@@ -44,6 +44,8 @@ describe("pipeline health markers", () => {
       activeStage: "compression",
       activeSince: expect.any(String),
       deferredStages: ["summary"],
+      active: 1,
+      capacity: 1,
     });
     expect(JSON.stringify(pipeline)).not.toContain("private-observation-id");
     const health = baseHealth();

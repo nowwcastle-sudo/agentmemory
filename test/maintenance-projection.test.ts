@@ -26,7 +26,7 @@ describe("durable maintenance projection", () => {
   it("defers while another projection stage is active without spending an attempt", async () => {
     const kv = mockKV();
     const sdk = mockSdk({ looseTrigger: true });
-    const coordinator = new ProjectionCoordinator();
+    const coordinator = new ProjectionCoordinator(1);
     let release!: () => void;
     const active = coordinator.run(
       { stage: "compression", sourceId: "obs-active" },

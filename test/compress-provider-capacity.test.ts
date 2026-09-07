@@ -72,7 +72,7 @@ describe("mem::compress provider capacity", () => {
   });
 
   it("defers the public wrapper without mutating observations while another stage is active", async () => {
-    const coordinator = new ProjectionCoordinator();
+    const coordinator = new ProjectionCoordinator(1);
     let release!: () => void;
     const active = coordinator.run(
       { stage: "graph", sourceId: "graph-source" },

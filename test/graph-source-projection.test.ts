@@ -563,7 +563,7 @@ describe("common graph source projection", () => {
         }
         return { success: true, nodesAdded: 0, edgesAdded: 0 };
       },
-      new ProjectionCoordinator(),
+      new ProjectionCoordinator(1),
     );
 
     const slow = sdk.trigger("mem::project-graph-sources", {
