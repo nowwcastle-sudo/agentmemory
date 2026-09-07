@@ -198,4 +198,41 @@ describe("observation projection backlog recovery", () => {
     // O(n^2) is what stalls a large backlog.
     expect(projectionListReads).toBeLessThanOrEqual(3);
   });
+  it("drains the backlog with as many projections in flight as the coordinator admits", async () => {
+    process.env["AGENTMEMORY_PROJECTION_RECOVERY_INTERVAL_MS"] = "5";
+    const kv = mockKV();
+    const sdk = mockSdk({ looseTrigger: true });
+    await seedBacklog(kv, 12);
+
+    let inFlight = 0;
+    let peakInFlight = 0;
+    const releases: Array<() => void> = [];
+    sdk.registerFunction("mem::compress", async () => {
+      inFlight += 1;
+      peakInFlight = Math.max(peakInFlight, inFlight);
+      await new Promise<void>((resolve) => {
+        releases.push(resolve);
+        // Let every admitted projection reach this point before any returns.
+        if (releases.length >= 4) for (const release of releases.splice(0)) release();
+      });
+      inFlight -= 1;
+      return { success: true };
+    });
+    sdk.registerFunction("mem::project-graph-sources", async () => ({
+      success: true,
+    }));
+
+    const recovery = await registerPipeline(sdk, kv);
+    const stopPacer = recovery.startPacedRecovery({ intervalMs: 50 });
+    const deadline = Date.now() + 4000;
+    while (peakInFlight < 4 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    stopPacer();
+    for (const release of releases.splice(0)) release();
+
+    // One at a time was the old ceiling: the coordinator admits six, so the
+    // drain has to ask for more than one.
+    expect(peakInFlight).toBeGreaterThan(1);
+  });
 });

@@ -122,9 +122,11 @@ export function registerObservationProjectionFunction(
       // Mint only when the drain is idle. Minting unconditionally lets credits
       // pile up behind a slow projection, and the drain then runs items
       // back-to-back — which is exactly the continuous slot occupancy the
-      // one-item startup cap exists to prevent.
+      // one-item startup cap exists to prevent. One credit per idle tick,
+      // though, left every coordinator slot but one empty, so mint a batch the
+      // size of the capacity: still nothing while busy, still bounded.
       if (drainRunning || drainCredits > 0) return;
-      drainCredits += 1;
+      drainCredits += Math.max(1, coordinator.status().capacity);
       scheduleDrain();
     }, intervalMs);
     timer.unref?.();
@@ -139,48 +141,73 @@ export function registerObservationProjectionFunction(
   let pendingQueue: ObservationProjection[] = [];
   let refreshBlockedUntil = 0;
 
+  // Several drain lanes share one queue, so a refresh is single-flighted:
+  // otherwise each idle lane would scan the whole scope at the same moment.
+  let refreshInFlight: Promise<boolean> | null = null;
+
+  async function refreshPendingQueue(attempted: Set<string>): Promise<boolean> {
+    if (refreshInFlight) return refreshInFlight;
+    refreshInFlight = (async () => {
+      const rows = await kv
+        .list<ObservationProjection>(KV.observationProjections)
+        .catch((error: unknown) => {
+          // A scan failure is not an empty backlog. Say so, and do not arm the
+          // cooldown — otherwise a KV outage looks exactly like "all drained".
+          logger.warn("Observation projection scan failed", {
+            error: error instanceof Error ? error.message : String(error),
+          });
+          return null;
+        });
+      if (!rows) return false;
+      pendingQueue = rows
+        .filter(
+          (projection) =>
+            projection.status === "pending" &&
+            !attempted.has(projection.observationId),
+        )
+        .sort((left, right) => left.updatedAt.localeCompare(right.updatedAt));
+      if (pendingQueue.length === 0) {
+        // Nothing is waiting: stop re-scanning the whole scope on every tick.
+        refreshBlockedUntil = Date.now() + EMPTY_BACKLOG_RESCAN_MS;
+        return false;
+      }
+      return true;
+    })();
+    try {
+      return await refreshInFlight;
+    } finally {
+      refreshInFlight = null;
+    }
+  }
+
   async function nextPendingProjection(
     attempted: Set<string>,
   ): Promise<ObservationProjection | undefined> {
-    while (pendingQueue.length > 0) {
-      const candidate = pendingQueue.shift();
-      if (candidate && !attempted.has(candidate.observationId)) return candidate;
+    for (;;) {
+      while (pendingQueue.length > 0) {
+        const candidate = pendingQueue.shift();
+        if (candidate && !attempted.has(candidate.observationId)) {
+          // Claim it here, before any await, so two lanes cannot take the same
+          // row out of the shared queue.
+          attempted.add(candidate.observationId);
+          return candidate;
+        }
+      }
+      if (Date.now() < refreshBlockedUntil) return undefined;
+      if (!(await refreshPendingQueue(attempted))) return undefined;
     }
-    if (Date.now() < refreshBlockedUntil) return undefined;
-    const rows = await kv
-      .list<ObservationProjection>(KV.observationProjections)
-      .catch((error: unknown) => {
-        // A scan failure is not an empty backlog. Say so, and do not arm the
-        // cooldown — otherwise a KV outage looks exactly like "all drained".
-        logger.warn("Observation projection scan failed", {
-          error: error instanceof Error ? error.message : String(error),
-        });
-        return null;
-      });
-    if (!rows) return undefined;
-    pendingQueue = rows
-      .filter(
-        (projection) =>
-          projection.status === "pending" &&
-          !attempted.has(projection.observationId),
-      )
-      .sort((left, right) => left.updatedAt.localeCompare(right.updatedAt));
-    if (pendingQueue.length === 0) {
-      // Nothing is waiting: stop re-scanning the whole scope on every tick.
-      refreshBlockedUntil = Date.now() + EMPTY_BACKLOG_RESCAN_MS;
-      return undefined;
-    }
-    return pendingQueue.shift();
   }
 
   async function drainPendingProjections(): Promise<void> {
     const attempted = new Set<string>();
-    try {
+    // One projection at a time made the drain rate 1 / projection duration no
+    // matter how many slots the coordinator offered. Run a lane per slot.
+    const lanes = Math.max(1, coordinator.status().capacity);
+    const lane = async (): Promise<void> => {
       while (drainCredits > 0) {
         drainCredits -= 1;
         const projection = await nextPendingProjection(attempted);
-        if (!projection) break;
-        attempted.add(projection.observationId);
+        if (!projection) return;
         // The cached row may have been projected by another path since the
         // scan, so confirm against the record before spending the slot.
         const current = await kv
@@ -208,6 +235,9 @@ export function registerObservationProjectionFunction(
           }),
         );
       }
+    };
+    try {
+      await Promise.all(Array.from({ length: lanes }, lane));
     } catch (error) {
       logger.warn("Observation projection drain stopped", {
         error: error instanceof Error ? error.message : String(error),

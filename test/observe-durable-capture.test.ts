@@ -58,6 +58,7 @@ function failingDerivedKV() {
 async function registerObservationPipeline(
   sdk: ReturnType<typeof mockSdk>,
   kv: ReturnType<typeof mockKV>,
+  capacity?: number,
 ): Promise<void> {
   const { registerObservationProjectionFunction } = await import(
     "../src/functions/observation-projection.js"
@@ -67,7 +68,7 @@ async function registerObservationPipeline(
     kv as never,
     undefined,
     undefined,
-    new ProjectionCoordinator(),
+    new ProjectionCoordinator(capacity),
   );
 }
 
@@ -373,7 +374,9 @@ describe("mem::observe durable capture", () => {
     process.env["AGENTMEMORY_AUTO_COMPRESS"] = "true";
     const sdk = mockSdk({ looseTrigger: true });
     const kv = mockKV();
-    await registerObservationPipeline(sdk, kv);
+    // This case is about durable capture under a burst, so it pins the
+    // projection bound at one rather than depending on the default capacity.
+    await registerObservationPipeline(sdk, kv, 1);
     registerObserveFunction(sdk as never, kv as never);
     let inFlight = 0;
     let maxInFlight = 0;
