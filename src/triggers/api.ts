@@ -1886,13 +1886,48 @@ export function registerApiTriggers(
   // 두 record 모두 신규 capture와 같은 persistent projector를 사용하므로
   // 재실행은 성공한 source를 건너뛰고 실제 신규 count만 반환한다.
   sdk.registerFunction("api::graph-build",
-    async (req: ApiRequest<{ batchSize?: number }>): Promise<Response> => {
+    async (
+      req: ApiRequest<{ batchSize?: number; mode?: string }>,
+    ): Promise<Response> => {
       const authErr = checkAuth(req, secret);
       if (authErr) return authErr;
       const batchSize = Math.max(
         1,
         Math.min(100, Number((req.body as { batchSize?: number })?.batchSize) || 25),
       );
+      // Without a mode this runs as "configured", which treats any succeeded
+      // projection as satisfied, so a re-run skips exactly the rows a backfill
+      // exists to upgrade. "semantic" re-runs anything not already semantic.
+      const requestedMode = (req.body as { mode?: string })?.mode;
+      if (
+        requestedMode !== undefined &&
+        !["configured", "structural", "semantic"].includes(requestedMode)
+      ) {
+        return {
+          status_code: 400,
+          body: { success: false, error: "invalid graph projection mode" },
+        };
+      }
+      // This handler walks every session inline in one HTTP request, so a full
+      // backfill would outlive the invocation budget. A caller scopes it to
+      // sessions and caps the batches, then resumes from the report.
+      const requestedSessions = (req.body as { sessionIds?: string[] })?.sessionIds;
+      if (
+        requestedSessions !== undefined &&
+        (!Array.isArray(requestedSessions) ||
+          requestedSessions.some((id) => typeof id !== "string" || !id))
+      ) {
+        return {
+          status_code: 400,
+          body: { success: false, error: "sessionIds must be non-empty strings" },
+        };
+      }
+      const sessionFilter = requestedSessions ? new Set(requestedSessions) : undefined;
+      const rawMaxBatches = Number((req.body as { maxBatches?: number })?.maxBatches);
+      const maxBatches = Number.isFinite(rawMaxBatches) && rawMaxBatches > 0
+        ? Math.floor(rawMaxBatches)
+        : Number.POSITIVE_INFINITY;
+      let truncated = false;
       try {
         const sessions = await kv.list<Session>(KV.sessions);
         let totalNodes = 0;
@@ -1905,7 +1940,7 @@ export function registerApiTriggers(
           try {
             const result = (await sdk.trigger({
               function_id: "mem::project-graph-sources",
-              payload: { sources },
+              payload: requestedMode ? { sources, mode: requestedMode } : { sources },
             })) as {
               success?: boolean;
               nodesAdded?: number;
@@ -1922,15 +1957,19 @@ export function registerApiTriggers(
             });
           }
           batchesRun++;
+          if (batchesRun >= maxBatches) truncated = true;
         };
         for (const session of sessions) {
+          if (truncated) break;
           const sid = session?.id;
           if (typeof sid !== "string" || sid.length === 0) continue;
+          if (sessionFilter && !sessionFilter.has(sid)) continue;
           const observations = await kv.list<CompressedObservation>(KV.observations(sid));
           const compressed = observations.filter((o) => o && typeof o.title === "string" && o.title.length > 0);
           observationSources += compressed.length;
           if (compressed.length === 0) continue;
           for (let i = 0; i < compressed.length; i += batchSize) {
+            if (truncated) break;
             const batch = compressed.slice(i, i + batchSize);
             await projectBatch(
               batch.map((observation) => ({
@@ -1941,7 +1980,10 @@ export function registerApiTriggers(
             );
           }
         }
-        const memories = await kv.list<Memory>(KV.memories);
+        // A scoped or truncated run must not touch the global memory pass.
+        const memories = truncated || sessionFilter
+          ? []
+          : await kv.list<Memory>(KV.memories);
         const latestMemories = memories.filter((memory) => memory?.isLatest !== false);
         memorySources = latestMemories.length;
         for (let i = 0; i < latestMemories.length; i += batchSize) {
@@ -1963,6 +2005,7 @@ export function registerApiTriggers(
             memories: memorySources,
             nodes: totalNodes,
             edges: totalEdges,
+            truncated,
           },
         };
       } catch {

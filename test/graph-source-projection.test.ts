@@ -942,4 +942,79 @@ describe("api::graph-build common backfill", () => {
     })) as { status_code: number; body: { nodes: number; edges: number } };
     expect(second.body).toMatchObject({ nodes: 0, edges: 0 });
   });
+
+  it("passes the requested mode through so a semantic backfill re-runs structural work", async () => {
+    const sdk = mockSdk();
+    const kv = mockKV();
+    const modes: Array<string | undefined> = [];
+    registerGraphPipeline(sdk, kv);
+    registerApiTriggers(sdk as never, kv as never);
+    await kv.set(KV.sessions, "ses_graph_source", session());
+    await kv.set(
+      KV.observations("ses_graph_source"),
+      "obs_graph_source",
+      observation(),
+    );
+
+    const projectGraphSources = sdk.fns.get("mem::project-graph-sources");
+    sdk.registerFunction(
+      "mem::project-graph-sources",
+      async (data: { mode?: string }) => {
+        modes.push(data?.mode);
+        return projectGraphSources
+          ? await projectGraphSources(data as never)
+          : { success: true };
+      },
+    );
+
+    await sdk.trigger("api::graph-build", { body: { batchSize: 1 } });
+    await sdk.trigger("api::graph-build", {
+      body: { batchSize: 1, mode: "semantic" },
+    });
+
+    // Without the passthrough the second call also runs as "configured", which
+    // treats any succeeded projection as satisfied and skips the very rows a
+    // backfill exists to upgrade.
+    expect(modes).toEqual([undefined, "semantic"]);
+  });
+  it("scopes a backfill to named sessions and stops at maxBatches so it can resume", async () => {
+    const sdk = mockSdk();
+    const kv = mockKV();
+    const seen: string[][] = [];
+    registerGraphPipeline(sdk, kv);
+    registerApiTriggers(sdk as never, kv as never);
+    for (const sid of ["ses_a", "ses_b"]) {
+      await kv.set(KV.sessions, sid, { ...session(), id: sid });
+      for (let index = 0; index < 3; index += 1) {
+        await kv.set(KV.observations(sid), `obs_${sid}_${index}`, {
+          ...observation(),
+          id: `obs_${sid}_${index}`,
+          sessionId: sid,
+        });
+      }
+    }
+    sdk.registerFunction(
+      "mem::project-graph-sources",
+      async (data: { sources?: Array<{ sourceId: string }> }) => {
+        seen.push((data?.sources ?? []).map((source) => source.sourceId));
+        return { success: true, nodesAdded: 0, edgesAdded: 0 };
+      },
+    );
+
+    // One session only: the other must not be touched at all.
+    const scoped = (await sdk.trigger("api::graph-build", {
+      body: { batchSize: 2, sessionIds: ["ses_b"] },
+    })) as { status_code: number; body: { batches: number; truncated?: boolean } };
+    expect(scoped.status_code).toBe(200);
+    expect(seen.flat().every((id) => id.includes("ses_b"))).toBe(true);
+
+    // A bounded run reports that it stopped early, so a caller can resume
+    // instead of reading the stop as "nothing left to do".
+    seen.length = 0;
+    const bounded = (await sdk.trigger("api::graph-build", {
+      body: { batchSize: 1, sessionIds: ["ses_a"], maxBatches: 2 },
+    })) as { status_code: number; body: { batches: number; truncated?: boolean } };
+    expect(bounded.body.batches).toBe(2);
+    expect(bounded.body.truncated).toBe(true);
+  });
 });
