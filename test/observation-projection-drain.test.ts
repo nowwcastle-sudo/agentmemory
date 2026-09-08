@@ -235,4 +235,40 @@ describe("observation projection backlog recovery", () => {
     // drain has to ask for more than one.
     expect(peakInFlight).toBeGreaterThan(1);
   });
+  it("tops the drain up while it is still running instead of waiting for it to finish", async () => {
+    const kv = mockKV();
+    const sdk = mockSdk({ looseTrigger: true });
+    await seedBacklog(kv, 20);
+
+    const started: string[] = [];
+    let blockForever!: () => void;
+    sdk.registerFunction("mem::compress", async (data: unknown) => {
+      const request = data as { observationId: string };
+      started.push(request.observationId);
+      // The first admitted projection never settles, so the drain pass never
+      // ends. A pacer that only mints while idle would stop here forever.
+      if (started.length === 1) {
+        await new Promise<void>((resolve) => {
+          blockForever = resolve;
+        });
+      }
+      return { success: true };
+    });
+    sdk.registerFunction("mem::project-graph-sources", async () => ({
+      success: true,
+    }));
+
+    const recovery = await registerPipeline(sdk, kv);
+    const stopPacer = recovery.startPacedRecovery({ intervalMs: 50 });
+    try {
+      const deadline = Date.now() + 5000;
+      while (started.length < 20 && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      expect(started.length).toBe(20);
+    } finally {
+      stopPacer();
+      blockForever?.();
+    }
+  });
 });

@@ -97,6 +97,9 @@ export function registerObservationProjectionFunction(
 ): ProjectionRecoveryController {
   let drainCredits = 0;
   let drainRunning = false;
+  // While a pacer is running it keeps topping the credit pool up, so a lane
+  // that runs out should wait for the next tick rather than ending the pass.
+  let pacerIntervalMs = 0;
 
   const scheduleDrain = (): void => {
     if (drainRunning) return;
@@ -118,19 +121,25 @@ export function registerObservationProjectionFunction(
     const configured = options?.intervalMs ?? configuredRecoveryIntervalMs();
     if (configured === 0) return () => {};
     const intervalMs = Math.max(MIN_RECOVERY_INTERVAL_MS, configured);
+    pacerIntervalMs = intervalMs;
     const timer = setInterval(() => {
-      // Mint only when the drain is idle. Minting unconditionally lets credits
-      // pile up behind a slow projection, and the drain then runs items
-      // back-to-back — which is exactly the continuous slot occupancy the
-      // one-item startup cap exists to prevent. One credit per idle tick,
-      // though, left every coordinator slot but one empty, so mint a batch the
-      // size of the capacity: still nothing while busy, still bounded.
-      if (drainRunning || drainCredits > 0) return;
-      drainCredits += Math.max(1, coordinator.status().capacity);
+      // Top the credit pool up to the coordinator's capacity, whether or not a
+      // drain is already running. Minting only while idle meant a pass that
+      // never quite finishes — one slow projection is enough — was never
+      // replenished, so the backlog moved at the rate new observations arrived
+      // rather than at the rate projection could absorb. The pool is a ceiling,
+      // not a queue: it never exceeds the capacity, and the coordinator remains
+      // the thing that bounds concurrency.
+      const capacity = Math.max(1, coordinator.status().capacity);
+      if (drainCredits >= capacity) return;
+      drainCredits = capacity;
       scheduleDrain();
     }, intervalMs);
     timer.unref?.();
-    return () => clearInterval(timer);
+    return () => {
+      pacerIntervalMs = 0;
+      clearInterval(timer);
+    };
   };
 
   // The projection scope keeps succeeded rows, so listing it costs O(total)
@@ -204,7 +213,13 @@ export function registerObservationProjectionFunction(
     // matter how many slots the coordinator offered. Run a lane per slot.
     const lanes = Math.max(1, coordinator.status().capacity);
     const lane = async (): Promise<void> => {
-      while (drainCredits > 0) {
+      for (;;) {
+        if (drainCredits <= 0) {
+          // Without a pacer the pool is all the work this pass may do.
+          if (pacerIntervalMs === 0) return;
+          await new Promise((resolve) => setTimeout(resolve, pacerIntervalMs));
+          if (drainCredits <= 0) continue;
+        }
         drainCredits -= 1;
         const projection = await nextPendingProjection(attempted);
         if (!projection) return;
