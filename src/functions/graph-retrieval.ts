@@ -52,6 +52,33 @@ function edgeMatchesScope(edge: GraphEdge, scope?: RetrievalScope): boolean {
   return matchesRetrievalScope(edge, scope);
 }
 
+/**
+ * How much a path is discounted for the nodes it travels through.
+ *
+ * Every neighbour reached through the same node scores identically under
+ * `avgWeight * (1 / pathLength)`, so a node the whole corpus touches hands the
+ * ranking an arbitrary slice of its own fan-out. That is what the real-corpus
+ * A/B measured: the one observation about a function lost its place to a grep
+ * of the same file, both two hops behind a generic hub.
+ *
+ * A hop through a degree-2 node is evidence; a hop through a degree-400 node is
+ * barely more than "these both exist in this corpus". Discounting by the log of
+ * the degree says so without eliminating the hub route -- graph IDF. Endpoints
+ * are exempt: the start node is what the query matched, and the destination is
+ * the answer being scored, not a route through anything.
+ */
+function hubDiscount(
+  path: Array<{ node: GraphNode; edge?: GraphEdge }>,
+  adjacency: Map<string, Array<{ neighborId: string; edge: GraphEdge }>>,
+): number {
+  let discount = 1;
+  for (const step of path.slice(1, -1)) {
+    const degree = Math.max(1, adjacency.get(step.node.id)?.length ?? 1);
+    discount /= 1 + Math.log(degree);
+  }
+  return discount;
+}
+
 function buildGraphContext(
   path: Array<{ node: GraphNode; edge?: GraphEdge }>,
 ): string {
@@ -144,7 +171,8 @@ export class GraphRetrieval {
             edgeWeights.length > 0
               ? edgeWeights.reduce((a, b) => a + b, 0) / edgeWeights.length
               : 0.5;
-          const score = avgWeight * (1 / pathLength);
+          const score =
+            avgWeight * (1 / pathLength) * hubDiscount(path, traversalIndex.adjacency);
 
           results.push({
             obsId: source.sourceId,
@@ -218,7 +246,10 @@ export class GraphRetrieval {
           visitedSources.add(source.sourceId);
 
           const pathLength = path.length;
-          const score = 0.5 * (1 / (pathLength + 1));
+          const score =
+            0.5 *
+            (1 / (pathLength + 1)) *
+            hubDiscount(path, traversalIndex.adjacency);
 
           results.push({
             obsId: source.sourceId,

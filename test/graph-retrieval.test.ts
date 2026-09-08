@@ -308,7 +308,10 @@ describe("GraphRetrieval multi start-node characterisation", () => {
   // claimed by its traversal before their self-scoring pass runs.
   //
   // Any change that reuses or reorders traversal state must leave these exact
-  // numbers untouched.
+  // numbers untouched. The hub discount is not such a change -- it rewrites the
+  // score formula on purpose -- so the two path scores below carry its factor
+  // explicitly. Every structural assertion (which sources appear, path lengths,
+  // the 1.0 self-score, obs_b above obs_c) is unchanged.
   it("lets the first start node's traversal claim the other start nodes' own sources", async () => {
     const nodes = [
       makeNode("n1", "Auth", "concept", ["obs_a"]),
@@ -343,11 +346,21 @@ describe("GraphRetrieval multi start-node characterisation", () => {
     expect(byObs.get("obs_shared")!.pathLength).toBe(2);
 
     // n2 and n3 never reach their own self-scoring pass: n1's traversal got
-    // there first, so they carry path scores, not 1.0.
-    expect(byObs.get("obs_b")!.score).toBeCloseTo(0.2333333333333333, 10);
+    // there first, so they carry path scores, not 1.0. Both route through
+    // "Shared" (degree 3), so both take the same 1 / (1 + ln 3) discount --
+    // which is why their ratio, and the ordering it decides, is untouched.
+    const sharedDiscount = 1 / (1 + Math.log(3));
+    expect(byObs.get("obs_b")!.score).toBeCloseTo(
+      0.2333333333333333 * sharedDiscount,
+      10,
+    );
     expect(byObs.get("obs_b")!.pathLength).toBe(3);
-    expect(byObs.get("obs_c")!.score).toBeCloseTo(0.18333333333333335, 10);
+    expect(byObs.get("obs_c")!.score).toBeCloseTo(
+      0.18333333333333335 * sharedDiscount,
+      10,
+    );
     expect(byObs.get("obs_c")!.pathLength).toBe(3);
+    expect(byObs.get("obs_b")!.score).toBeGreaterThan(byObs.get("obs_c")!.score);
   });
 });
 
@@ -385,5 +398,75 @@ describe("GraphRetrieval scope boundary", () => {
     // a2 is in scope and does NOT match the entity, so it can only arrive by
     // traversal — and the only route crosses the out-of-scope bridge.
     expect(obsIds).not.toContain("obs_a2");
+  });
+  // The A/B on the real corpus (records/core-recovery/verification/
+  // graph-weight-decision-20260909.md) showed the graph leg displacing the one
+  // observation about a function with a generic grep of the same file. The
+  // mechanism is here: every neighbour reached through a hub gets the identical
+  // `avgWeight * (1 / pathLength)`, so the sort keeps an arbitrary slice of the
+  // hub's fan-out. A path through a node the whole corpus touches carries far
+  // less evidence than one through a node two observations touch, and the score
+  // has to say so.
+  it("ranks a path through a low-degree node above one through a hub", async () => {
+    const nodes: GraphNode[] = [makeNode("start", "Delta Persist", "concept", ["obs_start"])];
+    const edges: GraphEdge[] = [
+      makeEdge("e_hub", "start", "hub", "related_to", 0.4),
+      makeEdge("e_specific", "start", "specific", "related_to", 0.4),
+    ];
+    // A hub every observation touches: one shared tool name, 50 files hanging
+    // off it. Its leaves are two hops from the query entity.
+    nodes.push(makeNode("hub", "Bash", "concept", ["obs_hub"]));
+    for (let i = 0; i < 50; i++) {
+      nodes.push(makeNode(`h${i}`, `hub-file-${i}`, "file", [`obs_hub_${i}`]));
+      edges.push(makeEdge(`eh${i}`, "hub", `h${i}`, "related_to", 0.4));
+    }
+    // The specific neighbour, same distance and same edge weights, but it is
+    // shared with exactly one other node.
+    nodes.push(makeNode("specific", "persistGraphDeltaUnlocked", "function", ["obs_specific_mid"]));
+    nodes.push(makeNode("leaf", "graph-delta-note", "file", ["obs_specific"]));
+    edges.push(makeEdge("e_leaf", "specific", "leaf", "related_to", 0.4));
+
+    const retrieval = new GraphRetrieval(mockKV(nodes, edges) as never);
+    const results = await retrieval.searchByEntities(["Delta Persist"], 2, 100);
+    const scoreOf = (obsId: string): number =>
+      results.find((r) => r.obsId === obsId)?.score ?? -1;
+
+    expect(scoreOf("obs_specific")).toBeGreaterThan(0);
+    expect(scoreOf("obs_hub_0")).toBeGreaterThan(0);
+    // Both sit at depth 2 behind identical edge weights; only the degree of the
+    // node they travel through separates them.
+    expect(scoreOf("obs_specific")).toBeGreaterThan(scoreOf("obs_hub_0"));
+
+    // And the consequence that was actually observed: with a realistic cutoff
+    // the hub's fan-out must not crowd the specific observation out.
+    const cut = await retrieval.searchByEntities(["Delta Persist"], 2, 10);
+    expect(cut.map((r) => r.obsId)).toContain("obs_specific");
+  });
+
+  // expandFromChunks scores `0.5 * (1 / (pathLength + 1))`, which ties for the
+  // same reason; the vector leg feeds it, so it fans out from whatever the top
+  // hits touch.
+  it("applies the same hub discount when expanding from chunks", async () => {
+    const nodes: GraphNode[] = [makeNode("seed", "Seed", "concept", ["obs_seed"])];
+    const edges: GraphEdge[] = [];
+    nodes.push(makeNode("hub2", "apply_patch", "concept", ["obs_seed"]));
+    edges.push(makeEdge("es_hub", "seed", "hub2", "related_to", 0.4));
+    for (let i = 0; i < 40; i++) {
+      nodes.push(makeNode(`k${i}`, `k-file-${i}`, "file", [`obs_k_${i}`]));
+      edges.push(makeEdge(`ek${i}`, "hub2", `k${i}`, "related_to", 0.4));
+    }
+    nodes.push(makeNode("narrow", "Narrow", "concept", ["obs_seed"]));
+    edges.push(makeEdge("es_narrow", "seed", "narrow", "related_to", 0.4));
+    nodes.push(makeNode("narrowLeaf", "narrow-leaf", "file", ["obs_narrow"]));
+    edges.push(makeEdge("e_narrow_leaf", "narrow", "narrowLeaf", "related_to", 0.4));
+
+    const retrieval = new GraphRetrieval(mockKV(nodes, edges) as never);
+    const results = await retrieval.expandFromChunks(["obs_seed"], 2, 100);
+    const scoreOf = (obsId: string): number =>
+      results.find((r) => r.obsId === obsId)?.score ?? -1;
+
+    expect(scoreOf("obs_narrow")).toBeGreaterThan(0);
+    expect(scoreOf("obs_k_0")).toBeGreaterThan(0);
+    expect(scoreOf("obs_narrow")).toBeGreaterThan(scoreOf("obs_k_0"));
   });
 });
