@@ -141,4 +141,40 @@ describe("HybridSearch graph-leg gate instrumentation", () => {
 
     expect(seen).toEqual([{ entities: false, vectorHits: false }]);
   });
+  it("does not touch the graph at all when the graph weight is zero", async () => {
+    const bm25 = new SearchIndex();
+    bm25.add(observation);
+    const { vector, embedding } = withVector();
+    const scopesListed: string[] = [];
+    const kv = {
+      get: async () => null,
+      list: async <T,>(scope: string): Promise<T[]> => {
+        scopesListed.push(scope);
+        if (scope === KV.graphNodes) return [node("n1", "Auth")] as unknown as T[];
+        if (scope === KV.graphEdges) return [] as unknown as T[];
+        return [] as T[];
+      },
+    };
+    const seen: Array<{ entities: boolean; vectorHits: boolean }> = [];
+
+    const search = new HybridSearch(
+      bm25,
+      vector,
+      embedding,
+      kv as never,
+      0.4,
+      0.6,
+      0,
+      false,
+      (entities, vectorHits) => seen.push({ entities, vectorHits }),
+    );
+    await search.search("Auth middleware", 10);
+
+    // At weight zero the leg's score is multiplied away, so every scope
+    // enumeration it costs is spent for a result that cannot affect ranking.
+    expect(scopesListed).not.toContain(KV.graphNodes);
+    expect(scopesListed).not.toContain(KV.graphEdges);
+    expect(seen).toEqual([{ entities: false, vectorHits: false }]);
+  });
+
 });

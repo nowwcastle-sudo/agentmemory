@@ -131,7 +131,11 @@ export class HybridSearch {
         ? entityHints
         : extractEntitiesFromQuery(query);
     let graphResults: GraphRetrievalResult[] = [];
-    if (entities.length > 0) {
+    // A zero weight multiplies the leg's contribution away, so running it only
+    // buys full enumerations of the graph scopes for a result that cannot move
+    // any ranking. Skip the traversal itself rather than its score.
+    const graphLegEnabled = this.graphWeight > 0;
+    if (graphLegEnabled && entities.length > 0) {
       try {
         graphResults = await this.graphRetrieval.searchByEntities(
           entities,
@@ -144,8 +148,13 @@ export class HybridSearch {
       }
     }
 
-    const topVectorObs = vectorResults.slice(0, 5).map((r) => r.obsId);
-    this.reportGraphLegGates?.(entities.length > 0, topVectorObs.length > 0);
+    const topVectorObs = graphLegEnabled
+      ? vectorResults.slice(0, 5).map((r) => r.obsId)
+      : [];
+    this.reportGraphLegGates?.(
+      graphLegEnabled && entities.length > 0,
+      topVectorObs.length > 0,
+    );
     if (topVectorObs.length > 0) {
       try {
         const expansionResults =

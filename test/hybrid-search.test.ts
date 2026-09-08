@@ -66,6 +66,21 @@ describe("HybridSearch", () => {
     expect(results[0].bm25Score).toBeGreaterThan(0);
   });
 
+  it("still ranks bm25 and vector hits when the graph weight is zero", async () => {
+    const obs = makeObs({ id: "obs_1", sessionId: "ses_1" });
+    bm25.add(obs);
+    await kv.set("mem:obs:ses_1", "obs_1", obs);
+
+    // Zero weight turns the graph leg off entirely; the remaining streams must
+    // still produce a ranking rather than an empty result.
+    const hybrid = new HybridSearch(bm25, null, null, kv as never, 0.4, 0.6, 0);
+    const results = await hybrid.search("auth");
+
+    expect(results.length).toBe(1);
+    expect(results[0].observation.id).toBe("obs_1");
+    expect(results[0].bm25Score).toBeGreaterThan(0);
+  });
+
   it("returns empty results for no-match query", async () => {
     const obs = makeObs({ id: "obs_1", sessionId: "ses_1" });
     bm25.add(obs);
