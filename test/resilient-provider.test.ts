@@ -169,4 +169,34 @@ describe("ResilientProvider LLM concurrency", () => {
       }
     }
   });
+  it("waits longer for a slot than a call can hold one", () => {
+    // A waiter that gives up sooner than an in-flight call can finish is
+    // guaranteed to fail once every slot is busy: the slot it is waiting for
+    // cannot possibly free up in time. The bound has to outlive one call.
+    const previous = process.env["AGENTMEMORY_LLM_TIMEOUT_MS"];
+    process.env["AGENTMEMORY_LLM_TIMEOUT_MS"] = "45000";
+    try {
+      const provider = new ResilientProvider({
+        name: "stub",
+        isNoop: false,
+      } as unknown as MemoryProvider);
+      const acquireBound = (provider as unknown as { acquireTimeoutMs: number })
+        .acquireTimeoutMs;
+      expect(acquireBound).toBeGreaterThan(45_000);
+    } finally {
+      if (previous === undefined) delete process.env["AGENTMEMORY_LLM_TIMEOUT_MS"];
+      else process.env["AGENTMEMORY_LLM_TIMEOUT_MS"] = previous;
+    }
+  });
+
+  it("honours an explicit acquire bound over the derived one", () => {
+    const provider = new ResilientProvider(
+      { name: "stub", isNoop: false } as unknown as MemoryProvider,
+      2,
+      7_000,
+    );
+    expect(
+      (provider as unknown as { acquireTimeoutMs: number }).acquireTimeoutMs,
+    ).toBe(7_000);
+  });
 });

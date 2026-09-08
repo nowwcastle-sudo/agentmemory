@@ -2,7 +2,34 @@ import type { MemoryProvider, CircuitBreakerState } from "../types.js";
 import { CircuitBreaker } from "./circuit-breaker.js";
 
 const DEFAULT_MAX_CONCURRENCY = 6;
-const DEFAULT_ACQUIRE_TIMEOUT_MS = 30_000;
+const DEFAULT_LLM_TIMEOUT_MS = 60_000;
+/**
+ * How much longer than one in-flight call a waiter may wait for its slot.
+ * A fixed bound below the call timeout is unsatisfiable: once every slot is
+ * busy, the slot the waiter needs cannot free up before the waiter gives up,
+ * so every caller past the concurrency limit fails by construction rather
+ * than by load.
+ */
+const ACQUIRE_TIMEOUT_MULTIPLIER = 2;
+
+function configuredCallTimeoutMs(): number {
+  for (const key of ["OPENAI_TIMEOUT_MS", "AGENTMEMORY_LLM_TIMEOUT_MS"]) {
+    const raw = process.env[key];
+    if (!raw || !/^\d+$/.test(raw.trim())) continue;
+    const parsed = Number(raw);
+    if (Number.isSafeInteger(parsed) && parsed > 0) return parsed;
+  }
+  return DEFAULT_LLM_TIMEOUT_MS;
+}
+
+function defaultAcquireTimeoutMs(): number {
+  const raw = process.env["AGENTMEMORY_LLM_ACQUIRE_TIMEOUT_MS"];
+  if (raw && /^\d+$/.test(raw.trim())) {
+    const parsed = Number(raw);
+    if (Number.isSafeInteger(parsed) && parsed > 0) return parsed;
+  }
+  return configuredCallTimeoutMs() * ACQUIRE_TIMEOUT_MULTIPLIER;
+}
 
 type ProviderWaiter = {
   resolve: () => void;
@@ -50,7 +77,7 @@ export class ResilientProvider implements MemoryProvider {
   constructor(
     private inner: MemoryProvider,
     private maxConcurrency = configuredMaxConcurrency(),
-    acquireTimeoutMs = DEFAULT_ACQUIRE_TIMEOUT_MS,
+    acquireTimeoutMs = defaultAcquireTimeoutMs(),
   ) {
     this.maxConcurrency = Number.isFinite(maxConcurrency)
       ? Math.max(1, Math.floor(maxConcurrency))
@@ -58,7 +85,7 @@ export class ResilientProvider implements MemoryProvider {
     this.acquireTimeoutMs =
       Number.isFinite(acquireTimeoutMs) && acquireTimeoutMs > 0
         ? Math.floor(acquireTimeoutMs)
-        : DEFAULT_ACQUIRE_TIMEOUT_MS;
+        : defaultAcquireTimeoutMs();
     this.name = `resilient(${inner.name})`;
     this.isNoop = inner.isNoop === true;
   }
