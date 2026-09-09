@@ -977,6 +977,51 @@ describe("api::graph-build common backfill", () => {
     // backfill exists to upgrade.
     expect(modes).toEqual([undefined, "semantic"]);
   });
+  // Scoping the request has to scope the work, not just the results. The
+  // handler listed the whole session scope and filtered afterwards, so a call
+  // naming one session still paid for every session in the store. On the live
+  // store that enumeration passed 120 s -- past the 180 s invocation budget once
+  // the per-session work is added -- and every scoped backfill call answered
+  // 504, which is what stalled the graph backlog drain.
+  it("does not enumerate the whole session scope when the request names sessions", async () => {
+    const sdk = mockSdk();
+    const kv = mockKV();
+    const listedScopes: string[] = [];
+    const watchedKv = {
+      ...kv,
+      list: async <T>(scope: string): Promise<T[]> => {
+        listedScopes.push(scope);
+        return kv.list<T>(scope);
+      },
+    };
+    registerGraphPipeline(sdk, watchedKv as never);
+    registerApiTriggers(sdk as never, watchedKv as never);
+    for (const sid of ["ses_a", "ses_b"]) {
+      await kv.set(KV.sessions, sid, { ...session(), id: sid });
+      await kv.set(KV.observations(sid), `obs_${sid}_0`, {
+        ...observation(),
+        id: `obs_${sid}_0`,
+        sessionId: sid,
+      });
+    }
+    sdk.registerFunction("mem::project-graph-sources", async () => ({
+      success: true,
+      nodesAdded: 0,
+      edgesAdded: 0,
+    }));
+
+    listedScopes.length = 0;
+    const scoped = (await sdk.trigger("api::graph-build", {
+      body: { batchSize: 2, sessionIds: ["ses_b"] },
+    })) as { status_code: number };
+
+    expect(scoped.status_code).toBe(200);
+    expect(listedScopes).not.toContain(KV.sessions);
+    // The named session's own observations still have to be read.
+    expect(listedScopes).toContain(KV.observations("ses_b"));
+    expect(listedScopes).not.toContain(KV.observations("ses_a"));
+  });
+
   it("scopes a backfill to named sessions and stops at maxBatches so it can resume", async () => {
     const sdk = mockSdk();
     const kv = mockKV();

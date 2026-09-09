@@ -1929,7 +1929,17 @@ export function registerApiTriggers(
         : Number.POSITIVE_INFINITY;
       let truncated = false;
       try {
-        const sessions = await kv.list<Session>(KV.sessions);
+        // Scoping the request has to scope the work. Listing the whole session
+        // scope and filtering afterwards made a call naming one session pay for
+        // every session in the store; on the live store that list passed 120 s,
+        // so a scoped backfill call answered 504 before it projected anything.
+        const sessions = sessionFilter
+          ? (
+              await Promise.all(
+                [...sessionFilter].map((id) => kv.get<Session>(KV.sessions, id)),
+              )
+            ).filter((entry): entry is Session => Boolean(entry))
+          : await kv.list<Session>(KV.sessions);
         let totalNodes = 0;
         let totalEdges = 0;
         let batchesRun = 0;
