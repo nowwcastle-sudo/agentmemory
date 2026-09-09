@@ -79,10 +79,17 @@ export function evaluateHealth(
     degraded = true;
   }
 
+  // Against the V8 ceiling when the snapshot carries it: heapTotal is what V8
+  // has grown to, kept deliberately close to heapUsed, so heapUsed/heapTotal
+  // alarms on ordinary operation. #158 papered over that with an RSS floor,
+  // which only defers the false alarm until RSS crosses it -- the live worker
+  // then reported memory_critical_98%_rss564mb while using 7.8% of its limit.
+  const memDenominator =
+    snapshot.memory.heapLimit && snapshot.memory.heapLimit > 0
+      ? snapshot.memory.heapLimit
+      : snapshot.memory.heapTotal;
   const memPercent =
-    snapshot.memory.heapTotal > 0
-      ? (snapshot.memory.heapUsed / snapshot.memory.heapTotal) * 100
-      : 0;
+    memDenominator > 0 ? (snapshot.memory.heapUsed / memDenominator) * 100 : 0;
   const rss = snapshot.memory.rss ?? 0;
   const rssAboveFloor = rss >= cfg.memoryRssFloorBytes;
   const memMb = Math.round(rss / (1024 * 1024));
@@ -128,7 +135,16 @@ export function evaluateHealth(
       alerts.push("index_snapshot_stale");
       degraded = true;
     }
-    if (pipeline.index.lastFailureAt && pipeline.index.dirty) {
+    // lastFailureAt is a high-water mark, so testing it against `dirty` alone
+    // re-raises a days-old failure on every later dirty window. Alarm only when
+    // the failure is the most recent outcome: no success since, or none ever.
+    const lastIndexFailure = Date.parse(pipeline.index.lastFailureAt ?? "");
+    const lastIndexSuccess = Date.parse(pipeline.index.lastSuccessAt ?? "");
+    const failureIsCurrent =
+      Number.isFinite(lastIndexFailure) &&
+      (!Number.isFinite(lastIndexSuccess) ||
+        lastIndexFailure > lastIndexSuccess);
+    if (failureIsCurrent && pipeline.index.dirty) {
       alerts.push("index_snapshot_failed");
       degraded = true;
     }

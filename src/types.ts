@@ -369,6 +369,14 @@ export interface HealthSnapshot {
     heapTotal: number;
     rss: number;
     external: number;
+    /**
+     * V8's own ceiling (`getHeapStatistics().heap_size_limit`). heapTotal is
+     * what V8 has allocated so far and it tracks a few MB above heapUsed, so a
+     * healthy process reads 95-100% of it forever; only this value says how
+     * much room is actually left. Optional: snapshots from older workers, and
+     * the fixtures written against them, do not carry it.
+     */
+    heapLimit?: number;
   };
   cpu: { userMicros: number; systemMicros: number; percent: number };
   eventLoopLagMs: number;
