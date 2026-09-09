@@ -1,4 +1,4 @@
-import type { ISdk } from 'iii-sdk'
+import type { ISdk } from '../iii-compat.js'
 import type { CompactSearchResult, CompressedObservation, Memory, RetrievalMetadata, RetrievalScope, SearchResult, Session } from '../types.js'
 import { KV } from '../state/schema.js'
 import { StateKV } from '../state/kv.js'
