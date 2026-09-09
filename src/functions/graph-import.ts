@@ -1,6 +1,6 @@
 import { readFile, stat } from "node:fs/promises";
 import { join } from "node:path";
-import type { ISdk } from "iii-sdk";
+import type { ISdk } from "../iii-compat.js";
 import type { GraphEdge, GraphEdgeType, GraphNode, GraphNodeType } from "../types.js";
 import { KV, generateId } from "../state/schema.js";
 import type { StateKV } from "../state/kv.js";

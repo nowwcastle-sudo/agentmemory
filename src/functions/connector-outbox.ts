@@ -1,6 +1,6 @@
 import { readFile, readdir, rename, rm, stat } from "node:fs/promises";
 import { join, resolve } from "node:path";
-import type { ISdk } from "iii-sdk";
+import type { ISdk } from "../iii-compat.js";
 import { resolvePathLayout } from "../runtime-paths.js";
 import { logger } from "../logger.js";
 

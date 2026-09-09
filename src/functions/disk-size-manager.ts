@@ -1,4 +1,4 @@
-import { TriggerAction, type ISdk } from "iii-sdk";
+import { TriggerAction, type ISdk } from "../iii-compat.js";
 import { KV } from "../state/schema.js";
 import { StateKV } from "../state/kv.js";
 import { getMaxBytes } from "../utils/image-store.js";

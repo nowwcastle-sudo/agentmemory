@@ -1,7 +1,7 @@
 import { homedir } from "node:os";
 import { lstat, readFile, readdir } from "node:fs/promises";
 import { resolve, join } from "node:path";
-import type { ISdk } from "iii-sdk";
+import type { ISdk } from "../iii-compat.js";
 import type {
   CompressedObservation,
   Crystal,

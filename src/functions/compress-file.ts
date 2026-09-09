@@ -1,7 +1,7 @@
 import { constants } from "node:fs";
 import { lstat, open, readFile, writeFile } from "node:fs/promises";
 import { basename, dirname, extname, join, resolve } from "node:path";
-import type { ISdk } from "iii-sdk";
+import type { ISdk } from "../iii-compat.js";
 import type { MemoryProvider } from "../types.js";
 import type { StateKV } from "../state/kv.js";
 import { recordAudit } from "./audit.js";

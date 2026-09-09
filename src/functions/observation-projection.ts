@@ -1,4 +1,4 @@
-import { TriggerAction, type ISdk } from "iii-sdk";
+import { TriggerAction, type ISdk } from "../iii-compat.js";
 import type {
   ObservationProjection,
   RawObservation,

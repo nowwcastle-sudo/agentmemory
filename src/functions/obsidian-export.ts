@@ -1,7 +1,7 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import { join, resolve, sep } from "node:path";
 import { homedir } from "node:os";
-import type { ISdk } from "iii-sdk";
+import type { ISdk } from "../iii-compat.js";
 import type { StateKV } from "../state/kv.js";
 import { KV } from "../state/schema.js";
 import type {
