@@ -1,4 +1,4 @@
-import type { ISdk } from '../iii-compat.js'
+import type { ISdk } from 'iii-sdk'
 
 export class StateKV {
   constructor(private sdk: ISdk) {}

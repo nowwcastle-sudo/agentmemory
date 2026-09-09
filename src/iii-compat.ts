@@ -18,7 +18,7 @@
 // plain data carried over the wire, so owning the declaration costs nothing and
 // removes a dependency on a type the SDK no longer publishes.
 
-import type { IIIClient as SdkClient } from "iii-sdk";
+import type { ISdk as SdkClient } from "iii-sdk";
 
 export { TriggerAction, registerWorker } from "iii-sdk";
 
