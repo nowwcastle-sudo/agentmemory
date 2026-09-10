@@ -126,10 +126,23 @@ const BARE_TITLES = new Set([
   "post_compact", "assistant_response",
 ]);
 
+// Hook names as a title prefix ("assistant_response: ## Session Summary")
+// are still hook-name titles; a tool name as a prefix ("Bash: npm test") is
+// the descriptive form and is not.
+const HOOK_NAMES = new Set([
+  "prompt_submit", "post_tool_use", "pre_tool_use", "post_tool_failure",
+  "session_start", "session_end", "stop", "subagent_stop", "subagent_start",
+  "user_prompt_submit", "notification", "task_completed", "pre_compact",
+  "post_compact", "assistant_response",
+]);
+
 export function isBareTitle(title: string | undefined): boolean {
   const t = (title ?? "").trim();
   if (t.length <= 2) return true;
-  return BARE_TITLES.has(t.toLowerCase());
+  const lower = t.toLowerCase();
+  if (BARE_TITLES.has(lower)) return true;
+  const colon = lower.indexOf(":");
+  return colon > 0 && HOOK_NAMES.has(lower.slice(0, colon).trim());
 }
 
 /** The harness asks for a compaction summary through the same prompt hook. */
@@ -163,7 +176,7 @@ export function synthesizeTitle(raw: RawObservation): string {
     const message = str(data["message"]) ?? str(data["title"]);
     return message ? finishTitle(`Notification: ${firstLine(message)}`) : "Notification";
   }
-  if (raw.hookType === "assistant_response") {
+  if (raw.hookType === "assistant_response" || (raw.toolName ?? "").toLowerCase() === "assistant_response") {
     // The compaction summary the harness writes arrives here too ("## Session
     // Summary"); its first heading is the right title.
     const text =

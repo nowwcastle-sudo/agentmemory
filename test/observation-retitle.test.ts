@@ -21,8 +21,8 @@ function compressed(id: string, sid: string, title: string, over: Partial<Compre
 
 describe("isBareTitle", () => {
   it("knows a bare tool or hook name when it sees one", () => {
-    for (const bare of ["Bash", "Read", "prompt_submit", "Monitor", "Edit", "post_tool_use", "ab", ""]) expect(isBareTitle(bare), bare).toBe(true);
-    for (const fine of ["Bash: npm test", "Read functions/context.ts", "Prompt: 진행", "Implement retry policy"]) expect(isBareTitle(fine), fine).toBe(false);
+    for (const bare of ["Bash", "Read", "prompt_submit", "Monitor", "Edit", "post_tool_use", "ab", "", "assistant_response: ## Session Summary", "prompt_submit: hello"]) expect(isBareTitle(bare), bare).toBe(true);
+    for (const fine of ["Bash: npm test", "Read functions/context.ts", "Prompt: 진행", "Implement retry policy", "Assistant: Session Summary"]) expect(isBareTitle(fine), fine).toBe(false);
   });
 });
 

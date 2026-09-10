@@ -67,6 +67,9 @@ describe("synthesizeTitle", () => {
       .toBe("Assistant: Login now works with magic links.");
     expect(synthesizeTitle(raw({ hookType: "assistant_response" as never, toolInput: {}, toolOutput: "{} | ## Session Summary" })))
       .toBe("Assistant: {} | ## Session Summary");
+    // The live rows carry it as the tool name on a post_tool_use hook.
+    expect(synthesizeTitle(raw({ toolName: "assistant_response", toolInput: {}, toolOutput: "## Session Summary\n\n### Tasks" })))
+      .toBe("Assistant: Session Summary");
   });
 
   it("falls back to the tool name plus the output's first line, then the tool name alone", () => {
