@@ -86,6 +86,21 @@ describe("selectTypingCandidates", () => {
     expect(picked[0].target.type).toBe("file");
   });
 
+  // Second trial: four of twenty-four typed edges pointed at file nodes named
+  // "memory", "user" and "gosulgoseul-entertainer" -- not files. A file node
+  // with neither a path separator nor an extension is not worth a model call.
+  it("skips file nodes that have neither a path nor an extension", () => {
+    const junk = node("n_junk", "file", "memory");
+    const bare = node("n_bare", "file", "README");
+    const edges = [
+      edge("e_junk", "related_to", "n_c", "n_junk", ["o1", "o2", "o3"]),
+      edge("e_bare", "related_to", "n_c", "n_bare", ["o1", "o2", "o3"]),
+      edge("e_real", "related_to", "n_c", "n_f", ["o1", "o2"]),
+    ];
+    const picked = selectTypingCandidates([concept, file, junk, bare], edges, { minBacking: 2, maxPairs: 10 });
+    expect(picked.map((c) => c.edge.id)).toEqual(["e_real"]);
+  });
+
   it("honours maxPairs after ordering", () => {
     const edges = [
       edge("a", "related_to", "n_c", "n_f", ["o1", "o2"]),
@@ -206,6 +221,33 @@ describe("mem::graph-type-backfill", () => {
     expect(typed).toMatchObject({ sourceNodeId: "n_c", targetNodeId: "n_f", weight: 0.85, sourceObservationIds: ["o1", "o2", "o3"] });
     expect(old).toMatchObject({ stale: true, isLatest: false, supersededBy: typed!.id });
     expect(await kv.get(KV.graphEdgeHistory, "e_rel")).toMatchObject({ supersededBy: typed!.id });
+  });
+
+  // Trial 2 re-typed pairs whose trial-1 typed edge had been reverted (stale).
+  // persistGraphDelta merged the new decision into that same-key row, which
+  // stayed stale, and the related_to was superseded anyway -- 34 pairs with
+  // no live edge at all. A merged-into row must come back to life.
+  it("revives a previously reverted typed edge for the same pair instead of leaving both stale", async () => {
+    const kv = mockKV();
+    const sdk = mockSdk();
+    for (const n of [concept, file]) await kv.set(KV.graphNodes, n.id, n);
+    await kv.set(KV.graphEdges, "e_rel", edge("e_rel", "related_to", "n_c", "n_f", ["o1", "o2"]));
+    const reverted = edge("e_old_typed", "implements", "n_c", "n_f", ["o1"], { stale: true, isLatest: false, weight: 0.5 });
+    await kv.set(KV.graphEdges, reverted.id, reverted);
+    await kv.set(KV.graphEdgeKey, "n_c|n_f|implements", reverted.id);
+    const provider = {
+      name: "test",
+      compress: vi.fn().mockResolvedValue('<pairs><pair i="1" type="implements" weight="0.9"/></pairs>'),
+      summarize: vi.fn(),
+    };
+    registerGraphTypeBackfill(sdk as never, kv as never, provider as never);
+    const result = (await sdk.trigger("mem::graph-type-backfill", { minBacking: 2 })) as { typed: number };
+    expect(result.typed).toBe(1);
+    const edges = await kv.list<GraphEdge>(KV.graphEdges);
+    const live = edges.filter((e) => !e.stale && e.sourceNodeId === "n_c" && e.targetNodeId === "n_f");
+    expect(live.map((e) => e.type)).toEqual(["implements"]);
+    expect(live[0].weight).toBe(0.9);
+    expect(edges.find((e) => e.id === "e_rel")).toMatchObject({ stale: true, supersededBy: live[0].id });
   });
 
   it("skips edges the caller has already attempted, so a resumable driver never re-asks", async () => {

@@ -39,6 +39,12 @@ export interface TypingSelection {
 const isLive = (n: GraphNode | undefined): n is GraphNode =>
   !!n && !n.stale && !n.mergedInto;
 
+// The heuristic extractor makes a file node out of anything in an
+// observation's `files` list, and some of those are words ("memory", "user").
+// A real file has a path separator or an extension; typing a relation to a
+// word is never right, so those pairs are not candidates.
+const looksLikeFile = (name: string): boolean => /[\\/]/.test(name) || /\.[A-Za-z0-9]+$/.test(name);
+
 /**
  * Live concept-file related_to edges with at least `minBacking` observations
  * behind them, most evidence first. Superseded edges and edges touching a
@@ -58,6 +64,7 @@ export function selectTypingCandidates(
     const target = byId.get(edge.targetNodeId);
     if (!isLive(source) || !isLive(target)) continue;
     if (source.type !== "concept" || target.type !== "file") continue;
+    if (!looksLikeFile(target.name)) continue;
     out.push({ edge, source, target });
   }
   out.sort(
@@ -346,6 +353,23 @@ export function registerGraphTypeBackfill(
               KV.graphEdgeKey,
               `${typed.sourceNodeId}|${typed.targetNodeId}|${typed.type}`,
             )) ?? typed.id;
+          // If persist merged into a row that had been reverted earlier (stale),
+          // that row is the one retrieval will look at -- bring it back to life
+          // with this decision's weight. Otherwise the pair ends up with no live
+          // edge at all, which is what happened to 34 pairs on 2026-09-10.
+          if (finalId !== typed.id) {
+            const merged = await kv.get<GraphEdge>(KV.graphEdges, finalId);
+            if (merged && (merged.stale || merged.isLatest === false)) {
+              const { tvalidEnd: _end, supersededBy: _by, ...rest } = merged;
+              await kv.set(KV.graphEdges, finalId, {
+                ...rest,
+                weight: t.weight,
+                stale: false,
+                isLatest: true,
+                context: typed.context,
+              });
+            }
+          }
           // Same shape the temporal graph uses when a newer edge replaces an
           // older one, plus `stale` so retrieval and the snapshot stop walking
           // the related_to.
