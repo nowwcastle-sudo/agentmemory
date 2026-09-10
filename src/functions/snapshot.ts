@@ -27,6 +27,7 @@ import { KV, generateId } from "../state/schema.js";
 import type { StateKV } from "../state/kv.js";
 import { recordAudit } from "./audit.js";
 import { collectExportData } from "./export-import.js";
+import { writeInsight } from "./insight-index.js";
 import { logger } from "../logger.js";
 
 const COMMIT_HASH_RE = /^[0-9a-f]{7,40}$/i;
@@ -475,7 +476,9 @@ async function restoreSnapshotPayload(
   await writeRecords(kv, KV.crystals, payload.crystals, (record) => record.id);
   await writeRecords(kv, KV.facets, payload.facets, (record) => record.id);
   await writeRecords(kv, KV.lessons, payload.lessons, (record) => record.id);
-  await writeRecords(kv, KV.insights, payload.insights, (record) => record.id);
+  // Through writeInsight rather than writeRecords: the index is derived
+  // state and a restore must leave it consistent, like the graph snapshot.
+  for (const insight of payload.insights ?? []) await writeInsight(kv, insight);
   await writeRecords(
     kv,
     KV.accessLog,

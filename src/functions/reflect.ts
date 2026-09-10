@@ -12,6 +12,7 @@ import type {
 } from "../types.js";
 import { recordAudit } from "./audit.js";
 import { REFLECT_SYSTEM, buildReflectPrompt } from "../prompts/reflect.js";
+import { writeInsight, rebuildInsightIndex } from "./insight-index.js";
 
 interface ConceptCluster {
   concepts: string[];
@@ -326,7 +327,7 @@ export function registerReflectFunctions(
 
             if (existing && !existing.deleted) {
               reinforceInsight(existing);
-              await kv.set(KV.insights, existing.id, existing);
+              await writeInsight(kv, existing);
               reinforced++;
             } else {
               const now = new Date().toISOString();
@@ -346,7 +347,7 @@ export function registerReflectFunctions(
                 updatedAt: now,
                 decayRate: 0.05,
               };
-              await kv.set(KV.insights, insight.id, insight);
+              await writeInsight(kv, insight);
               newInsights++;
             }
 
@@ -473,6 +474,13 @@ export function registerReflectFunctions(
     },
   );
 
+  // First run after deploy, and repair: the one deliberate full-scope list
+  // of mem:insights. Same role as mem::graph-snapshot-rebuild.
+  sdk.registerFunction("mem::insight-index-rebuild", async () => {
+    const result = await rebuildInsightIndex(kv);
+    return { success: true, ...result };
+  });
+
   sdk.registerFunction("mem::insight-decay-sweep", 
     async () => {
       const items = await kv.list<Insight>(KV.insights);
@@ -513,7 +521,7 @@ export function registerReflectFunctions(
         }
       }
 
-      await Promise.all(dirty.map((i) => kv.set(KV.insights, i.id, i)));
+      await Promise.all(dirty.map((i) => writeInsight(kv, i)));
       await recordAudit(kv, "reflect", "mem::insight-decay-sweep", dirty.map((i) => i.id), {
         event: "insight.decay",
         decayed,

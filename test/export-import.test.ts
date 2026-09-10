@@ -158,6 +158,42 @@ describe("Export/Import Functions", () => {
     expect(allSessions.length).toBe(2);
   });
 
+  it("import writes an insight index row for each imported insight", async () => {
+    const exportData: ExportData = {
+      version: "0.9.29",
+      exportedAt: new Date().toISOString(),
+      sessions: [],
+      observations: {},
+      memories: [],
+      summaries: [],
+      insights: [{
+        id: "ins_imported",
+        title: "imported-insight",
+        content: "index rows must survive this path",
+        confidence: 0.9,
+        reinforcements: 0,
+        sourceConceptCluster: ["graph"],
+        sourceMemoryIds: [],
+        sourceLessonIds: [],
+        sourceCrystalIds: [],
+        tags: [],
+        createdAt: "2026-09-10T00:00:00Z",
+        updatedAt: "2026-09-10T00:00:00Z",
+        decayRate: 0.05,
+      }],
+    };
+
+    const result = (await sdk.trigger("mem::import", {
+      exportData,
+      strategy: "merge",
+    })) as { success: boolean };
+    expect(result.success).toBe(true);
+
+    const rows = await kv.list<{ id: string; preview: string }>("mem:insight:index");
+    expect(rows.map((r) => r.id)).toEqual(["ins_imported"]);
+    expect(rows[0].preview).toBe("index rows must survive this path");
+  });
+
   it("import adds imported records to the search index", async () => {
     // Regression: mem::import wrote rows to KV but never indexed them.
     // On an existing install the boot rebuild gate (bm25.size === 0) is

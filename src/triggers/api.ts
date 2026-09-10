@@ -1830,6 +1830,27 @@ export function registerApiTriggers(
     config: { api_path: "/agentmemory/graph/snapshot-rebuild", http_method: "POST" },
   });
 
+  // Repair / first-run endpoint for the insight index. mem::context reads
+  // the index instead of listing the whole insight scope, and an empty
+  // index falls back to the full list until this has run once. Same shape
+  // as /graph/snapshot-rebuild.
+  sdk.registerFunction("api::insight-index-rebuild",
+    async (req: ApiRequest): Promise<Response> => {
+      const authErr = checkAuth(req, secret);
+      if (authErr) return authErr;
+      const result = await sdk.trigger({
+        function_id: "mem::insight-index-rebuild",
+        payload: {},
+      });
+      return { status_code: 200, body: result };
+    },
+  );
+  sdk.registerTrigger({
+    type: "http",
+    function_id: "api::insight-index-rebuild",
+    config: { api_path: "/agentmemory/insight-index/rebuild", http_method: "POST" },
+  });
+
   // #814 v2: clean-restart endpoint for legacy corpora too large for
   // safe rebuild. Wipes graph state without touching observations, so
   // recall + history stay intact while the graph rebuilds incrementally

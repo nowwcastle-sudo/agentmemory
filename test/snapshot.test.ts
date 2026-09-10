@@ -318,6 +318,21 @@ describe("Snapshot Functions", () => {
   });
 
   it("snapshot-restore restores only into an empty target and rebuilds derived state", async () => {
+    await kv.set("mem:insights", "ins_restore", {
+        id: "ins_restore",
+        title: "restored-insight",
+        content: "index rows must survive this path",
+        confidence: 0.9,
+        reinforcements: 0,
+        sourceConceptCluster: ["graph"],
+        sourceMemoryIds: [],
+        sourceLessonIds: [],
+        sourceCrystalIds: [],
+        tags: [],
+        createdAt: "2026-09-10T00:00:00Z",
+        updatedAt: "2026-09-10T00:00:00Z",
+        decayRate: 0.05,
+      });
     await sdk.trigger("mem::snapshot-create", { message: "Restore source" });
     const stateWrite = vi
       .mocked(writeFileSync)
@@ -355,6 +370,11 @@ describe("Snapshot Functions", () => {
     });
     expect(graphRebuild).toHaveBeenCalledWith({ force: true });
     expect(indexReconcile).toHaveBeenCalledTimes(1);
+    // The insight index is derived state too: a restored store must not
+    // leave mem::context falling back to the full scope until someone
+    // remembers to rebuild it.
+    const rows = await targetKv.list<{ id: string }>("mem:insight:index");
+    expect(rows.map((r) => r.id)).toEqual(["ins_restore"]);
   });
 
   it("round-trips pending, failed, and succeeded session projections", async () => {
@@ -773,6 +793,20 @@ describe("Snapshot Functions", () => {
 
     const audits = await kv.list("mem:audit");
     expect(audits.length).toBe(1);
+  });
+
+  it("POST /agentmemory/insight-index/rebuild triggers mem::insight-index-rebuild", async () => {
+    const rebuild = vi.fn().mockResolvedValue({ success: true, rows: 3 });
+    sdk.registerFunction("mem::insight-index-rebuild", rebuild);
+    registerApiTriggers(sdk as never, kv as never);
+
+    const res = (await sdk.trigger("api::insight-index-rebuild", {
+      body: {},
+      headers: {},
+    })) as { status_code: number; body: unknown };
+    expect(res.status_code).toBe(200);
+    expect(res.body).toEqual({ success: true, rows: 3 });
+    expect(rebuild).toHaveBeenCalledTimes(1);
   });
 
   it("snapshot REST endpoints do not wrap failed operations in 2xx", async () => {

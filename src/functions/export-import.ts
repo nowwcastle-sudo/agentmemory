@@ -34,6 +34,7 @@ import { VERSION } from "../version.js";
 import { recordAudit } from "./audit.js";
 import { indexRecords } from "./search.js";
 import { resetLessonIndex } from "./lessons.js";
+import { writeInsight } from "./insight-index.js";
 import { logger } from "../logger.js";
 
 // Bounded-concurrency chunk size for the import delete/write loops. A
@@ -437,6 +438,10 @@ export function registerExportImportFunction(sdk: ISdk, kv: StateKV): void {
           (i) => kv.delete(KV.insights, i.id),
         );
         await runChunked(
+          await kv.list<{ id: string }>(KV.insightIndex).catch(() => []),
+          (i) => kv.delete(KV.insightIndex, i.id),
+        );
+        await runChunked(
           await kv.list<{ id: string }>(KV.graphNodes).catch(() => []),
           (n) => kv.delete(KV.graphNodes, n.id),
         );
@@ -708,7 +713,7 @@ export function registerExportImportFunction(sdk: ISdk, kv: StateKV): void {
             const existing = await kv.get(KV.insights, insight.id).catch(() => null);
             if (existing) { stats.skipped++; return; }
           }
-          await kv.set(KV.insights, insight.id, insight);
+          await writeInsight(kv, insight);
         });
       }
       if (importData.accessLogs) {

@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, vi } from "vitest";
 import { registerContextFunction } from "../src/functions/context.js";
 import { KV } from "../src/state/schema.js";
 import type { Insight, ProjectProfile } from "../src/types.js";
+import { toIndexRow } from "../src/functions/insight-index.js";
 
 function mockKV() {
   const store = new Map<string, Map<string, unknown>>();
@@ -159,5 +160,45 @@ describe("mem::context — insights auto-injection (ontology-lite follow-up)", (
     const result = await handler({ sessionId: "ses_scope", project: "/tmp/proj" });
     expect(result.context).not.toContain("other-project-insight");
     expect(result.context).toContain("global-insight-marker");
+  });
+});
+
+describe("mem::context — reads the insight index, not the whole scope", () => {
+  let kv: ReturnType<typeof mockKV>;
+  let handler: ContextHandler;
+
+  beforeEach(() => {
+    kv = mockKV();
+    handler = wireContext(kv);
+  });
+
+  it("serves insights from the index without listing mem:insights", async () => {
+    const listed: string[] = [];
+    const inner = kv.list;
+    kv.list = async <T>(scope: string): Promise<T[]> => {
+      listed.push(scope);
+      return inner<T>(scope);
+    };
+    const insight = makeInsight({
+      id: "insight_idx",
+      title: "index-only-marker",
+      content: "served from the index row",
+      confidence: 0.9,
+    });
+    await kv.set(KV.insightIndex, insight.id, toIndexRow(insight));
+
+    const result = await handler({ sessionId: "ses_idx", project: "/tmp/proj" });
+    expect(result.context).toContain("index-only-marker");
+    expect(result.context).toContain("served from the index row");
+    expect(listed).toContain(KV.insightIndex);
+    expect(listed).not.toContain(KV.insights);
+  });
+
+  // Regression guard for stores that predate the index: behaviour is
+  // unchanged, only slower, until mem::insight-index-rebuild has run.
+  it("falls back to the full scope when the index is empty", async () => {
+    await seedInsight(kv, { id: "insight_legacy", title: "legacy-scope-marker" });
+    const result = await handler({ sessionId: "ses_legacy", project: "/tmp/proj" });
+    expect(result.context).toContain("legacy-scope-marker");
   });
 });

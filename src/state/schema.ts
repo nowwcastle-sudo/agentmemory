@@ -71,6 +71,11 @@ export const KV = {
   crystals: "mem:crystals",
   lessons: "mem:lessons",
   insights: "mem:insights",
+  // One small row per insight -- scoring fields and a 240-char preview --
+  // so mem::context does not list the whole scope (23.8 MB on the live
+  // store) to keep five. Written alongside every insight write; rebuilt
+  // from the full scope by mem::insight-index-rebuild.
+  insightIndex: "mem:insight:index",
   graphEdgeHistory: "mem:graph:edge-history",
   enrichedChunks: (sessionId: string) => `mem:enriched:${sessionId}`,
   latentEmbeddings: (obsId: string) => `mem:latent:${obsId}`,

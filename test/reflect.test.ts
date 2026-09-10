@@ -178,6 +178,25 @@ describe("Reflect", () => {
     });
 
 
+    it("writes an index row for every insight it creates or reinforces", async () => {
+      await kv.set("mem:graph:nodes", "node_security", makeConceptNode("security"));
+      await kv.set("mem:graph:nodes", "node_validation", makeConceptNode("validation"));
+      await kv.set("mem:graph:nodes", "node_testing", makeConceptNode("testing"));
+      await kv.set("mem:graph:edges", "edge_1", makeEdge("security", "validation"));
+      await kv.set("mem:graph:edges", "edge_2", makeEdge("security", "testing"));
+      await kv.set("mem:semantic", "sem_1", makeSemantic("Always validate security inputs"));
+      await kv.set("mem:semantic", "sem_2", makeSemantic("Testing improves security coverage"));
+      await kv.set("mem:semantic", "sem_3", makeSemantic("Validation prevents injection attacks"));
+      await kv.set("mem:lessons", "lsn_1", makeLesson("Use execFile for security", ["security"]));
+
+      await sdk.trigger("mem::reflect", {});
+
+      const insights = await kv.list<Insight>("mem:insights");
+      const rows = await kv.list<{ id: string; preview: string }>("mem:insight:index");
+      expect(rows.map((r) => r.id).sort()).toEqual(insights.map((i) => i.id).sort());
+      for (const row of rows) expect(row.preview.length).toBeGreaterThan(0);
+    });
+
     it("ignores stale graph nodes when forming concept clusters", async () => {
       await kv.set("mem:graph:nodes", "node_security", makeConceptNode("security"));
       await kv.set("mem:graph:nodes", "node_validation", makeConceptNode("validation"));
