@@ -6,6 +6,9 @@ export const KV = {
   observations: (sessionId: string) => `mem:obs:${sessionId}`,
   rawObservations: (sessionId: string) => `mem:raw-obs:${sessionId}`,
   observationProjections: "mem:obs:projections",
+  // The non-succeeded subset of observationProjections, same row shape, so the
+  // drain, health reconcile and retry scheduler never list the full scope.
+  observationProjectionsActive: "mem:obs:projections:active",
   sessionProjections: "mem:session:projections",
   maintenanceProjections: "mem:maintenance:projections",
   graphProjections: "mem:graph:projections",

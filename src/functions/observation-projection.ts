@@ -8,6 +8,10 @@ import type {
 import { KV, STREAM } from "../state/schema.js";
 import { StateKV } from "../state/kv.js";
 import { withKeyedLock } from "../state/keyed-mutex.js";
+import {
+  listActiveProjections,
+  writeObservationProjection,
+} from "./observation-projection-index.js";
 import { isAutoCompressEnabled } from "../config.js";
 import { buildSyntheticCompression } from "./compress-synthetic.js";
 import {
@@ -157,8 +161,7 @@ export function registerObservationProjectionFunction(
   async function refreshPendingQueue(attempted: Set<string>): Promise<boolean> {
     if (refreshInFlight) return refreshInFlight;
     refreshInFlight = (async () => {
-      const rows = await kv
-        .list<ObservationProjection>(KV.observationProjections)
+      const rows = await listActiveProjections(kv)
         .catch((error: unknown) => {
           // A scan failure is not an empty backlog. Say so, and do not arm the
           // cooldown — otherwise a KV outage looks exactly like "all drained".
@@ -296,11 +299,7 @@ export function registerObservationProjectionFunction(
           data.observationId,
           previous.updatedAt,
         );
-        await kv.set(
-          KV.observationProjections,
-          data.observationId,
-          running,
-        );
+        await writeObservationProjection(kv, running);
 
         try {
           const raw = await kv.get<RawObservation>(
@@ -330,11 +329,7 @@ export function registerObservationProjectionFunction(
                   updatedAt: new Date().toISOString(),
                 };
                 delete pending.lastError;
-                await kv.set(
-                  KV.observationProjections,
-                  data.observationId,
-                  pending,
-                );
+                await writeObservationProjection(kv, pending);
                 await markProjectionPending(
                   kv,
                   "compression",
@@ -441,11 +436,7 @@ export function registerObservationProjectionFunction(
             status: "succeeded",
             updatedAt: new Date().toISOString(),
           };
-          await kv.set(
-            KV.observationProjections,
-            data.observationId,
-            succeeded,
-          );
+          await writeObservationProjection(kv, succeeded);
           await markProjectionSucceeded(
             kv,
             "compression",
@@ -481,11 +472,7 @@ export function registerObservationProjectionFunction(
             updatedAt: new Date().toISOString(),
             lastError,
           };
-          await kv.set(
-            KV.observationProjections,
-            data.observationId,
-            failed,
-          );
+          await writeObservationProjection(kv, failed);
           await markProjectionFailed(
             kv,
             "compression",
@@ -533,7 +520,7 @@ export function registerObservationProjectionFunction(
           updatedAt: new Date().toISOString(),
         };
         delete pending.lastError;
-        await kv.set(KV.observationProjections, data.observationId, pending);
+        await writeObservationProjection(kv, pending);
         await markProjectionPending(
           kv,
           "compression",

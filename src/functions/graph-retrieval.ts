@@ -6,6 +6,7 @@ import type {
 } from "../types.js";
 import { KV } from "../state/schema.js";
 import type { StateKV } from "../state/kv.js";
+import { onKvWrite, type KvWriteEvent } from "../state/kv-write-hooks.js";
 import {
   locatorRetrievalMetadata,
   matchesRetrievalScope,
@@ -109,8 +110,114 @@ type TraversalIndex = {
   adjacency: Map<string, Array<{ neighborId: string; edge: GraphEdge }>>;
 };
 
+/**
+ * The live graph held in process.
+ *
+ * Every search used to list mem:graph:nodes (80 MB) and mem:graph:edges
+ * (64 MB) through the engine, which retains ~2.5x of what it carries. The
+ * scopes are listed once per process instead; StateKV reports each later
+ * set/update/delete through kv-write-hooks and the row is applied here, so
+ * the copy stays exact for every writer in this process. Writes that land
+ * while the first load is in flight are buffered and replayed over it.
+ *
+ * A safety-net TTL exists for writes from outside the process (maintenance
+ * tools talking to the engine directly). It is off unless
+ * AGENTMEMORY_GRAPH_CACHE_TTL_MS is set: a periodic full reload is the exact
+ * engine growth this cache removes, and those tools are followed by a worker
+ * restart anyway.
+ */
+interface LiveGraphCache {
+  nodes: Map<string, GraphNode>;
+  edges: Map<string, GraphEdge>;
+  loadedAt: number;
+}
+
+function graphCacheTtlFromEnv(): number {
+  const raw = process.env["AGENTMEMORY_GRAPH_CACHE_TTL_MS"];
+  const parsed = raw ? Number(raw) : NaN;
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : Number.POSITIVE_INFINITY;
+}
+
+const hasId = (value: unknown): value is { id: string } =>
+  !!value && typeof value === "object" && typeof (value as { id?: unknown }).id === "string";
+
 export class GraphRetrieval {
-  constructor(private kv: StateKV) {}
+  private cache: LiveGraphCache | null = null;
+  private loading: Promise<LiveGraphCache> | null = null;
+  private pendingWrites: KvWriteEvent[] | null = null;
+  private subscribed = false;
+  private readonly ttlMs: number;
+  private readonly now: () => number;
+
+  constructor(
+    private kv: StateKV,
+    options: { ttlMs?: number; now?: () => number } = {},
+  ) {
+    this.ttlMs = options.ttlMs ?? graphCacheTtlFromEnv();
+    this.now = options.now ?? Date.now;
+  }
+
+  /** Drop the held graph; the next search lists both scopes again. */
+  invalidate(): void {
+    this.cache = null;
+  }
+
+  private async liveGraph(): Promise<{ nodes: GraphNode[]; edges: GraphEdge[] }> {
+    const cache = await this.ensureCache();
+    return {
+      nodes: Array.from(cache.nodes.values()).filter((node) => !node.stale),
+      edges: Array.from(cache.edges.values()).filter((edge) => !edge.stale),
+    };
+  }
+
+  private async ensureCache(): Promise<LiveGraphCache> {
+    if (this.cache && this.now() - this.cache.loadedAt <= this.ttlMs) return this.cache;
+    if (this.loading) return this.loading;
+    this.loading = (async () => {
+      if (!this.subscribed) {
+        onKvWrite(this.kv, (event) => this.applyWrite(event));
+        this.subscribed = true;
+      }
+      this.pendingWrites = [];
+      // Sequential on purpose: two 60-80 MB messages in flight at once is a
+      // larger peak in the engine than one after the other.
+      const nodes = await this.kv.list<GraphNode>(KV.graphNodes);
+      const edges = await this.kv.list<GraphEdge>(KV.graphEdges);
+      const cache: LiveGraphCache = { nodes: new Map(), edges: new Map(), loadedAt: this.now() };
+      for (const node of nodes) if (hasId(node)) cache.nodes.set(node.id, node);
+      for (const edge of edges) if (hasId(edge)) cache.edges.set(edge.id, edge);
+      this.cache = cache;
+      const replay = this.pendingWrites;
+      this.pendingWrites = null;
+      for (const event of replay) this.applyWrite(event);
+      return cache;
+    })().finally(() => {
+      this.loading = null;
+    });
+    return this.loading;
+  }
+
+  private applyWrite(event: KvWriteEvent): void {
+    if (event.scope !== KV.graphNodes && event.scope !== KV.graphEdges) return;
+    if (this.pendingWrites) {
+      this.pendingWrites.push(event);
+      return;
+    }
+    if (!this.cache) return;
+    const map: Map<string, unknown> =
+      event.scope === KV.graphNodes ? this.cache.nodes : this.cache.edges;
+    if (event.op === "delete") {
+      map.delete(event.key);
+      return;
+    }
+    if (hasId(event.value)) {
+      map.set(event.key, event.value);
+      return;
+    }
+    // A partial update without the merged row: the row is unknown now, so
+    // the next search reloads rather than guesses.
+    this.cache = null;
+  }
 
   async searchByEntities(
     entityNames: string[],
@@ -118,13 +225,11 @@ export class GraphRetrieval {
     maxResults = 20,
     scope?: RetrievalScope,
   ): Promise<GraphRetrievalResult[]> {
-    const allNodes = (await this.kv.list<GraphNode>(KV.graphNodes)).filter(
-      (node) => !node.stale && nodeMatchesScope(node, scope),
-    );
+    const live = await this.liveGraph();
+    const allNodes = live.nodes.filter((node) => nodeMatchesScope(node, scope));
     const nodeIds = new Set(allNodes.map((node) => node.id));
-    const allEdges = (await this.kv.list<GraphEdge>(KV.graphEdges)).filter(
+    const allEdges = live.edges.filter(
       (edge) =>
-        !edge.stale &&
         edgeMatchesScope(edge, scope) &&
         nodeIds.has(edge.sourceNodeId) &&
         nodeIds.has(edge.targetNodeId),
@@ -213,13 +318,11 @@ export class GraphRetrieval {
     maxResults = 10,
     scope?: RetrievalScope,
   ): Promise<GraphRetrievalResult[]> {
-    const allNodes = (await this.kv.list<GraphNode>(KV.graphNodes)).filter(
-      (node) => !node.stale && nodeMatchesScope(node, scope),
-    );
+    const live = await this.liveGraph();
+    const allNodes = live.nodes.filter((node) => nodeMatchesScope(node, scope));
     const nodeIds = new Set(allNodes.map((node) => node.id));
-    const allEdges = (await this.kv.list<GraphEdge>(KV.graphEdges)).filter(
+    const allEdges = live.edges.filter(
       (edge) =>
-        !edge.stale &&
         edgeMatchesScope(edge, scope) &&
         nodeIds.has(edge.sourceNodeId) &&
         nodeIds.has(edge.targetNodeId),
@@ -276,13 +379,11 @@ export class GraphRetrieval {
     currentState: GraphEdge[];
     history: GraphEdge[];
   }> {
-    const allNodes = (await this.kv.list<GraphNode>(KV.graphNodes)).filter(
-      (node) => !node.stale && nodeMatchesScope(node, scope),
-    );
+    const live = await this.liveGraph();
+    const allNodes = live.nodes.filter((node) => nodeMatchesScope(node, scope));
     const nodeIds = new Set(allNodes.map((node) => node.id));
-    const allEdges = (await this.kv.list<GraphEdge>(KV.graphEdges)).filter(
+    const allEdges = live.edges.filter(
       (edge) =>
-        !edge.stale &&
         edgeMatchesScope(edge, scope) &&
         nodeIds.has(edge.sourceNodeId) &&
         nodeIds.has(edge.targetNodeId),

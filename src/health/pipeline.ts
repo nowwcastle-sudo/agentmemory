@@ -3,7 +3,6 @@ import type {
   GraphSnapshot,
   IndexPersistenceStatus,
   MaintenanceProjection,
-  ObservationProjection,
   PipelineHealth,
   ProjectionBacklog,
   ProjectionPipelineStage,
@@ -13,6 +12,7 @@ import type { ISdk } from "../iii-compat.js";
 import type { StateKV } from "../state/kv.js";
 import { KV } from "../state/schema.js";
 import { withKeyedLock } from "../state/keyed-mutex.js";
+import { listActiveProjections } from "../functions/observation-projection-index.js";
 import { isAutoCompressEnabled } from "../config.js";
 import type { ProjectionCoordinator } from "../functions/projection-coordinator.js";
 
@@ -143,7 +143,9 @@ export async function reconcilePipelineMarkers(
   graph: { pending: number; failed: number };
 }> {
   const [observations, sessions, graphs] = await Promise.all([
-    kv.list<ObservationProjection>(KV.observationProjections),
+    // Only non-succeeded rows; a succeeded row's stale marker is removed by
+    // the "not known" branch below, the same outcome as before.
+    listActiveProjections(kv),
     kv.list<SessionProjection>(KV.sessionProjections),
     kv.list<GraphProjection>(KV.graphProjections),
   ]);
@@ -289,9 +291,7 @@ export async function reconcilePipelineWork(
   return withKeyedLock("pipeline-reconcile", async () => {
     const automatic = options.automatic === true;
     const now = options.now ?? Date.now();
-    const observations = await kv.list<ObservationProjection>(
-      KV.observationProjections,
-    );
+    const observations = await listActiveProjections(kv);
     const dueCompression = observations.filter((projection) =>
       isRetryDue(projection, automatic, now),
     );

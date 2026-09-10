@@ -1,10 +1,13 @@
 import { vi } from "vitest";
+import { emitKvWrite } from "../../src/state/kv-write-hooks.js";
 
 type Handler = (data: unknown) => Promise<unknown>;
 
+// Mirrors StateKV, including the write events it emits: an in-process cache
+// under test must learn about writes the same way it does in production.
 export function mockKV() {
   const store = new Map<string, Map<string, unknown>>();
-  return {
+  const kv = {
     store,
     get: async <T>(scope: string, key: string): Promise<T | null> => {
       return (store.get(scope)?.get(key) as T) ?? null;
@@ -19,20 +22,24 @@ export function mockKV() {
       const value = (entries.get(key) as Record<string, unknown>) ?? {};
       for (const u of updates) value[u.path] = u.value;
       entries.set(key, value);
+      emitKvWrite(kv, { op: "update", scope, key, value });
     },
     set: async <T>(scope: string, key: string, data: T): Promise<T> => {
       if (!store.has(scope)) store.set(scope, new Map());
       store.get(scope)!.set(key, data);
+      emitKvWrite(kv, { op: "set", scope, key, value: data });
       return data;
     },
     delete: async (scope: string, key: string): Promise<void> => {
       store.get(scope)?.delete(key);
+      emitKvWrite(kv, { op: "delete", scope, key });
     },
     list: async <T>(scope: string): Promise<T[]> => {
       const entries = store.get(scope);
       return entries ? (Array.from(entries.values()) as T[]) : [];
     },
   };
+  return kv;
 }
 
 export function mockSdk(opts?: { looseTrigger?: boolean }) {

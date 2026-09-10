@@ -28,6 +28,7 @@ import type { StateKV } from "../state/kv.js";
 import { recordAudit } from "./audit.js";
 import { collectExportData } from "./export-import.js";
 import { writeInsight } from "./insight-index.js";
+import { rebuildActiveProjectionIndex } from "./observation-projection-index.js";
 import { logger } from "../logger.js";
 
 const COMMIT_HASH_RE = /^[0-9a-f]{7,40}$/i;
@@ -491,6 +492,9 @@ async function restoreSnapshotPayload(
     payload.observationProjections,
     (record) => record.observationId,
   );
+  // The active index is derived state; a restore rebuilds it from what was
+  // just written rather than trusting whatever the previous store held.
+  await rebuildActiveProjectionIndex(kv);
   await writeRecords(
     kv,
     KV.graphProjections,

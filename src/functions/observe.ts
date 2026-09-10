@@ -12,6 +12,7 @@ import { KV, STREAM, fingerprintId, generateId } from "../state/schema.js";
 import { StateKV } from "../state/kv.js";
 import { DedupMap } from "./dedup.js";
 import { withKeyedLock } from "../state/keyed-mutex.js";
+import { writeObservationProjection } from "./observation-projection-index.js";
 import { isAutoCompressEnabled } from "../config.js";
 import { getAgentId } from "../config.js";
 import { logger } from "../logger.js";
@@ -390,7 +391,7 @@ export function registerObserveFunction(
           attempts: 0,
           updatedAt: new Date().toISOString(),
         };
-        await kv.set(KV.observationProjections, obsId, projection);
+        await writeObservationProjection(kv, projection);
       }
 
       if (!isNewCapture && !projectionWasMissing) {

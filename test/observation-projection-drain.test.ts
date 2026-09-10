@@ -129,10 +129,11 @@ describe("observation projection backlog recovery", () => {
   it("stops re-scanning the projection scope once the backlog is empty", async () => {
     const sdk = mockSdk({ looseTrigger: true });
     const kv = mockKV();
+    // The drain reads the active index, not the full projection scope.
     let projectionListReads = 0;
     const list = kv.list.bind(kv);
     kv.list = (async <T,>(scope: string): Promise<T[]> => {
-      if (scope === KV.observationProjections) projectionListReads += 1;
+      if (scope === KV.observationProjectionsActive) projectionListReads += 1;
       return list<T>(scope);
     }) as typeof kv.list;
 
@@ -175,9 +176,11 @@ describe("observation projection backlog recovery", () => {
     const sdk = mockSdk({ looseTrigger: true });
     const kv = mockKV();
     let projectionListReads = 0;
+    let fullScopeReads = 0;
     const list = kv.list.bind(kv);
     kv.list = (async <T,>(scope: string): Promise<T[]> => {
-      if (scope === KV.observationProjections) projectionListReads += 1;
+      if (scope === KV.observationProjectionsActive) projectionListReads += 1;
+      if (scope === KV.observationProjections) fullScopeReads += 1;
       return list<T>(scope);
     }) as typeof kv.list;
 
@@ -197,6 +200,8 @@ describe("observation projection backlog recovery", () => {
     // Six items must not cost six full scans of the projection scope: that
     // O(n^2) is what stalls a large backlog.
     expect(projectionListReads).toBeLessThanOrEqual(3);
+    // The full scope is read once, to build the index, and never again.
+    expect(fullScopeReads).toBeLessThanOrEqual(1);
   });
   it("drains the backlog with as many projections in flight as the coordinator admits", async () => {
     process.env["AGENTMEMORY_PROJECTION_RECOVERY_INTERVAL_MS"] = "5";

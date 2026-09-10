@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import type { HealthSnapshot, IndexPersistenceStatus } from "../src/types.js";
 import { KV } from "../src/state/schema.js";
+import { writeObservationProjection } from "../src/functions/observation-projection-index.js";
 import { evaluateHealth } from "../src/health/thresholds.js";
 import { registerApiTriggers } from "../src/triggers/api.js";
 import { mockKV } from "./helpers/mocks.js";
@@ -329,11 +330,12 @@ describe("pipeline health markers", () => {
         KV.observationProjections,
         request.observationId,
       );
-      await kv.set(KV.observationProjections, request.observationId, {
+      // mem::project-observation writes through the helper, so the stub does.
+      await writeObservationProjection(kv as never, {
         ...projection,
         status: "succeeded",
         updatedAt: "2026-08-28T00:01:00.000Z",
-      });
+      } as never);
       await markProjectionSucceeded(
         kv as never,
         "compression",
@@ -821,11 +823,11 @@ describe("pipeline health markers", () => {
         KV.observationProjections,
         request.observationId,
       );
-      await kv.set(KV.observationProjections, request.observationId, {
+      await writeObservationProjection(kv as never, {
         ...projection,
         status: "succeeded",
         updatedAt: new Date(base + 30_000).toISOString(),
-      });
+      } as never);
       return { success: true };
     });
     sdk.registerFunction("mem::project-observation", retry);

@@ -1,4 +1,5 @@
 import type { ISdk } from 'iii-sdk'
+import { emitKvWrite } from './kv-write-hooks.js'
 
 export class StateKV {
   constructor(private sdk: ISdk) {}
@@ -11,10 +12,12 @@ export class StateKV {
   }
 
   async set<T = unknown>(scope: string, key: string, value: T): Promise<T> {
-    return this.sdk.trigger<{ scope: string; key: string; value: T }, T>({
+    const result = await this.sdk.trigger<{ scope: string; key: string; value: T }, T>({
       function_id: 'state::set',
       payload: { scope, key, value },
     })
+    emitKvWrite(this, { op: 'set', scope, key, value })
+    return result
   }
 
   async update<T = unknown>(
@@ -22,20 +25,23 @@ export class StateKV {
     key: string,
     ops: Array<{ type: string; path: string; value?: unknown }>,
   ): Promise<T> {
-    return this.sdk.trigger<
+    const result = await this.sdk.trigger<
       { scope: string; key: string; ops: Array<{ type: string; path: string; value?: unknown }> },
       T
     >({
       function_id: 'state::update',
       payload: { scope, key, ops },
     })
+    emitKvWrite(this, { op: 'update', scope, key, value: result })
+    return result
   }
 
   async delete(scope: string, key: string): Promise<void> {
-    return this.sdk.trigger<{ scope: string; key: string }, void>({
+    await this.sdk.trigger<{ scope: string; key: string }, void>({
       function_id: 'state::delete',
       payload: { scope, key },
     })
+    emitKvWrite(this, { op: 'delete', scope, key })
   }
 
   async list<T = unknown>(scope: string): Promise<T[]> {
