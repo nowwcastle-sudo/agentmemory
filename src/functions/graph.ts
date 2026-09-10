@@ -721,14 +721,13 @@ export function extractGraphHeuristics(
       nodeFor("concept", c, obs),
     );
 
+    // Only concept x file co-occurrence. Linking adjacent concepts or adjacent
+    // files to each other was dropped on 2026-09-10: adjacency in a list is
+    // not a relationship, and on the live store those chains were a quarter of
+    // all related_to edges (11k concept-concept, 1.4k file-file) with a median
+    // of one backing observation.
     for (const concept of conceptNodes) {
       for (const file of fileNodes) link(concept, file);
-    }
-    for (let i = 0; i + 1 < conceptNodes.length; i++) {
-      link(conceptNodes[i], conceptNodes[i + 1]);
-    }
-    for (let i = 0; i + 1 < fileNodes.length; i++) {
-      link(fileNodes[i], fileNodes[i + 1]);
     }
   }
 

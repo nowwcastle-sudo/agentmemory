@@ -33,18 +33,25 @@ describe("extractGraphHeuristics", () => {
     expect(byType.has("concept:jwt")).toBe(true);
   });
 
-  it("links concepts to files and consecutive siblings as related_to", () => {
+  // Measured on the live store 2026-09-10: related_to was 73% of live edges, and
+  // a quarter of those were concept-concept or file-file links whose only basis
+  // was being adjacent in an observation's list. Adjacency in a list is not a
+  // relationship. Co-occurrence of a concept with a file in one observation is
+  // a weak but real signal, so that stays.
+  it("links each concept to each file as related_to, and nothing else", () => {
     const { nodes, edges } = extractGraphHeuristics([
-      obs("o1", ["a.ts", "b.ts"], ["caching"]),
+      obs("o1", ["a.ts", "b.ts"], ["caching", "jwt"]),
     ]);
     expect(edges.every((e) => e.type === "related_to")).toBe(true);
     const names = new Map(nodes.map((n) => [n.id, n.name]));
     const pairs = edges.map(
       (e) => `${names.get(e.sourceNodeId)}|${names.get(e.targetNodeId)}`,
     );
-    expect(pairs).toContain("caching|a.ts");
-    expect(pairs).toContain("caching|b.ts");
-    expect(pairs).toContain("a.ts|b.ts");
+    expect(pairs.sort()).toEqual(
+      ["caching|a.ts", "caching|b.ts", "jwt|a.ts", "jwt|b.ts"].sort(),
+    );
+    expect(pairs).not.toContain("a.ts|b.ts");
+    expect(pairs).not.toContain("caching|jwt");
   });
 
   it("merges repeated entities across observations instead of duplicating", () => {
