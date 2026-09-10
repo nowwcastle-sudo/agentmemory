@@ -65,6 +65,7 @@ const MAX_GRAPH_QUERY_LIMIT = 5000;
 // fresh during rebuild and stored alongside.
 const SNAPSHOT_TOP_NODES = DEFAULT_GRAPH_QUERY_LIMIT;
 import { SNAPSHOT_KEY, belongsToCurrentGeneration } from "./graph-generation.js";
+import { isIndexableEdge, upsertRelationsForEdge } from "./graph-relations-index.js";
 
 // `state::list` over a 75K-node scope can exceed the iii invocation
 // timeout. The query handler races the enumeration against this budget
@@ -763,6 +764,22 @@ async function persistGraphDeltaUnlocked(
   // endpoints to the persisted ids so edges never dangle and re-runs hit the
   // same edge-index key instead of duplicating.
   const idRemap = new Map<string, string>();
+  // Stored node names for the relations index; an endpoint not in this delta
+  // is read once.
+  const nameById = new Map<string, string>();
+  const nameOf = async (id: string): Promise<string | null> => {
+    const known = nameById.get(id);
+    if (known) return known;
+    const row = await kv.get<GraphNode>(KV.graphNodes, id).catch(() => null);
+    if (row?.name) nameById.set(id, row.name);
+    return row?.name ?? null;
+  };
+  const indexRelation = async (e: GraphEdge): Promise<void> => {
+    if (!isIndexableEdge(e)) return;
+    const source = await nameOf(e.sourceNodeId);
+    const target = await nameOf(e.targetNodeId);
+    if (source && target) await upsertRelationsForEdge(kv, e, source, target);
+  };
 
   for (const node of nodes) {
     const normalizedNode: GraphNode = {
@@ -796,6 +813,7 @@ async function persistGraphDeltaUnlocked(
       idRemap.set(normalizedNode.id, existing.id);
       const merged = mergeNode(existing, normalizedNode, obsIds, capturedAt);
       await kv.set(KV.graphNodes, existing.id, merged);
+      nameById.set(existing.id, merged.name);
       // Update topNodes entry if present so a stale clone isn't
       // returned from the snapshot fast path.
       const topIdx = snap.topNodes.findIndex((n) => n.id === existing!.id);
@@ -807,6 +825,7 @@ async function persistGraphDeltaUnlocked(
       await kv.set(KV.graphNodes, normalizedNode.id, normalizedNode);
       await kv.set(KV.graphNameIndex, indexKey, normalizedNode.id);
       await kv.set(KV.graphNodeDegree, normalizedNode.id, 0);
+      nameById.set(normalizedNode.id, normalizedNode.name);
       snap.stats.totalNodes += 1;
       snap.stats.nodesByType[normalizedNode.type] =
         (snap.stats.nodesByType[normalizedNode.type] ?? 0) + 1;
@@ -850,6 +869,7 @@ async function persistGraphDeltaUnlocked(
     if (existing) {
       const merged = mergeEdge(existing, edge, obsIds);
       await kv.set(KV.graphEdges, existing.id, merged);
+      await indexRelation(merged);
       // Replace cached topEdges entry too if present.
       const topIdx = snap.topEdges.findIndex((e) => e.id === existing!.id);
       if (topIdx !== -1) {
@@ -859,6 +879,7 @@ async function persistGraphDeltaUnlocked(
     } else {
       await kv.set(KV.graphEdges, edge.id, edge);
       await kv.set(KV.graphEdgeKey, eKey, edge.id);
+      await indexRelation(edge);
       snap.stats.totalEdges += 1;
       snap.stats.edgesByType[edge.type] =
         (snap.stats.edgesByType[edge.type] ?? 0) + 1;

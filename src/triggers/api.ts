@@ -1872,6 +1872,25 @@ export function registerApiTriggers(
     config: { api_path: "/agentmemory/graph/type-backfill", http_method: "POST" },
   });
 
+  // Rebuild the per-project typed-relations index that mem::context reads
+  // (persist keeps it current; this is the backfill and the repair).
+  sdk.registerFunction("api::graph-relations-index-rebuild",
+    async (req: ApiRequest<Record<string, unknown>>): Promise<Response> => {
+      const authErr = checkAuth(req, secret);
+      if (authErr) return authErr;
+      const result = await sdk.trigger({
+        function_id: "mem::graph-relations-index-rebuild",
+        payload: {},
+      });
+      return { status_code: 200, body: result };
+    },
+  );
+  sdk.registerTrigger({
+    type: "http",
+    function_id: "api::graph-relations-index-rebuild",
+    config: { api_path: "/agentmemory/graph/relations-index/rebuild", http_method: "POST" },
+  });
+
   // #814 v2: clean-restart endpoint for legacy corpora too large for
   // safe rebuild. Wipes graph state without touching observations, so
   // recall + history stay intact while the graph rebuilds incrementally

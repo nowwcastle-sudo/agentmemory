@@ -61,6 +61,7 @@ import { registerEnrichFunction } from "./functions/enrich.js";
 import { registerClaudeBridgeFunction } from "./functions/claude-bridge.js";
 import { registerGraphFunction } from "./functions/graph.js";
 import { registerGraphTypeBackfill } from "./functions/graph-type-backfill.js";
+import { registerRelationsIndexFunction } from "./functions/graph-relations-index.js";
 import { registerGraphSourceProjectionFunction } from "./functions/graph-source-projection.js";
 import { ProjectionCoordinator } from "./functions/projection-coordinator.js";
 import { registerGraphImportFunction } from "./functions/graph-import.js";
@@ -301,6 +302,7 @@ async function main() {
   // Registered here rather than inside registerGraphFunction so the backfill
   // module can import persistGraphDelta from graph.ts without a cycle.
   registerGraphTypeBackfill(sdk, kv, provider);
+  registerRelationsIndexFunction(sdk, kv);
   const projectGraphSourcesCore = registerGraphSourceProjectionFunction(
     sdk,
     kv,
@@ -632,7 +634,7 @@ async function main() {
     `Ready. ${embeddingProvider ? "Triple-stream (BM25+Vector+Graph)" : "BM25+Graph"} search active.`,
   );
   bootLog(
-    `REST API: 136 endpoints at http://localhost:${config.restPort}/agentmemory/*`,
+    `REST API: 137 endpoints at http://localhost:${config.restPort}/agentmemory/*`,
   );
   bootLog(
     `MCP surface (opt-in via \`npx @agentmemory/mcp\`): ${getAllTools().length} tools · 6 resources · 3 prompts`,

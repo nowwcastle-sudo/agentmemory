@@ -12,6 +12,7 @@ import type {
 import { KV } from "../state/schema.js";
 import { StateKV } from "../state/kv.js";
 import { toIndexRow, type InsightIndexRow } from "./insight-index.js";
+import { readProjectRelationsIndex, renderRelationsBlock } from "./graph-relations-index.js";
 import { recordAccessBatch } from "./access-tracker.js";
 import { logger } from "../logger.js";
 import {
@@ -87,7 +88,7 @@ export function registerContextFunction(
         );
       }
 
-      const [pinnedSlots, profile, lessons, insights] = await Promise.all([
+      const [pinnedSlots, profile, lessons, insights, relationsIndex] = await Promise.all([
         isSlotsEnabled()
           ? listPinnedSlots(kv).catch(() => [] as MemorySlot[])
           : Promise.resolve([] as MemorySlot[]),
@@ -96,6 +97,8 @@ export function registerContextFunction(
           .catch(() => null),
         kv.list<Lesson>(KV.lessons).catch(() => [] as Lesson[]),
         listInsightRows(kv),
+        // One key: the project's typed relations, kept by the persist seam.
+        readProjectRelationsIndex(kv, data.project).catch(() => null),
       ]);
 
       const slotContent = renderPinnedContext(pinnedSlots);
@@ -235,6 +238,21 @@ export function registerContextFunction(
         });
       }
 
+      // Relations -- what the graph knows about this project, typed. Until
+      // 2026-09-11 nothing a session received mentioned a graph relation.
+      const relationsContent = renderRelationsBlock(
+        relationsIndex?.relations ?? [],
+        profile,
+      );
+      if (relationsContent) {
+        const updated = Date.parse(relationsIndex?.updatedAt ?? "");
+        blocks.push({
+          type: "memory",
+          content: relationsContent,
+          tokens: estimateTokens(relationsContent),
+          recency: Number.isFinite(updated) ? updated : 0,
+        });
+      }
       const allSessions = await kv.list<Session>(KV.sessions);
       const sessions = allSessions
         .filter(

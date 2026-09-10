@@ -80,6 +80,9 @@ export const KV = {
   // from the full scope by mem::insight-index-rebuild.
   insightIndex: "mem:insight:index",
   graphEdgeHistory: "mem:graph:edge-history",
+  // One row per project: its typed, live, latest relations with endpoint
+  // names, capped, so mem::context reads one key and never lists the graph.
+  graphRelationsIndex: "mem:graph:relations:index",
   enrichedChunks: (sessionId: string) => `mem:enriched:${sessionId}`,
   latentEmbeddings: (obsId: string) => `mem:latent:${obsId}`,
   retentionScores: "mem:retention",
