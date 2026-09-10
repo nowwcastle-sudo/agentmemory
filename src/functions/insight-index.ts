@@ -16,19 +16,34 @@ import type { Insight } from "../types.js";
 
 export const INSIGHT_PREVIEW_CHARS = 240;
 
+// Measured on the live store: the cluster field was 94% of the index (11.0 of
+// 11.7 MB) -- median 75 names per insight, p90 1,239, none duplicated. The
+// reader only needs an overlap ratio against a project profile's top concepts,
+// so the row keeps a bounded prefix and the true length: the ratio's
+// denominator stays exact, its numerator is exact up to the cap.
+// ponytail: names past the cap can't score a hit, so an insight whose only
+// matching concepts sit beyond position 64 loses at most the 0.5x overlap
+// boost. Raise the cap, or store the intersection with known profile
+// concepts, if that ever shows up in a ranking.
+export const INSIGHT_INDEX_CLUSTER_CAP = 64;
+
 export interface InsightIndexRow {
   id: string;
   title: string;
   preview: string;
   confidence: number;
   project?: string;
+  /** Lowercased, first INSIGHT_INDEX_CLUSTER_CAP names only. */
   sourceConceptCluster: string[];
+  /** True length of the insight's cluster, the overlap denominator. */
+  clusterSize: number;
   lastReinforcedAt?: string;
   updatedAt: string;
   deleted?: boolean;
 }
 
 export function toIndexRow(insight: Insight): InsightIndexRow {
+  const cluster = (insight.sourceConceptCluster ?? []).map((c) => c.toLowerCase());
   return {
     id: insight.id,
     title: insight.title,
@@ -40,7 +55,8 @@ export function toIndexRow(insight: Insight): InsightIndexRow {
       .slice(0, INSIGHT_PREVIEW_CHARS),
     confidence: insight.confidence,
     project: insight.project,
-    sourceConceptCluster: insight.sourceConceptCluster ?? [],
+    sourceConceptCluster: cluster.slice(0, INSIGHT_INDEX_CLUSTER_CAP),
+    clusterSize: cluster.length,
     lastReinforcedAt: insight.lastReinforcedAt,
     updatedAt: insight.updatedAt,
     deleted: insight.deleted,

@@ -194,6 +194,30 @@ describe("mem::context — reads the insight index, not the whole scope", () => 
     expect(listed).not.toContain(KV.insights);
   });
 
+  it("scores concept overlap against the true cluster size, not the stored prefix", async () => {
+    await seedProfile(kv, "/tmp/proj", ["alpha", "beta", "gamma", "delta"]);
+    // A: all four stored names match, cluster really is four -> overlap 1.0
+    //    score 0.80 * 1.5 = 1.20
+    // B: same four stored names match, but the true cluster is eight -> 0.5
+    //    score 0.85 * 1.25 = 1.0625; ranked by the prefix alone it would be
+    //    0.85 * 1.5 = 1.275 and B would wrongly come first.
+    const four = ["alpha", "beta", "gamma", "delta"];
+    await kv.set(KV.insightIndex, "ins_a", {
+      ...toIndexRow(makeInsight({ id: "ins_a", title: "exact-four-marker", confidence: 0.8, sourceConceptCluster: four })),
+      clusterSize: 4,
+    });
+    await kv.set(KV.insightIndex, "ins_b", {
+      ...toIndexRow(makeInsight({ id: "ins_b", title: "wide-eight-marker", confidence: 0.85, sourceConceptCluster: four })),
+      clusterSize: 8,
+    });
+    const result = await handler({ sessionId: "ses_size", project: "/tmp/proj" });
+    const a = result.context.indexOf("exact-four-marker");
+    const b = result.context.indexOf("wide-eight-marker");
+    expect(a).toBeGreaterThan(-1);
+    expect(b).toBeGreaterThan(-1);
+    expect(a).toBeLessThan(b);
+  });
+
   // Regression guard for stores that predate the index: behaviour is
   // unchanged, only slower, until mem::insight-index-rebuild has run.
   it("falls back to the full scope when the index is empty", async () => {

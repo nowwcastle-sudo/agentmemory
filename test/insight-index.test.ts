@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
   INSIGHT_PREVIEW_CHARS,
+  INSIGHT_INDEX_CLUSTER_CAP,
   toIndexRow,
   writeInsight,
   rebuildInsightIndex,
@@ -67,6 +68,18 @@ describe("insight index", () => {
       project: "/p",
       sourceConceptCluster: ["graph"],
     });
+  });
+
+  // On the live store the cluster field was 94% of the index (11.0 of 11.7 MB):
+  // median 75 names per insight, p90 1,239, none duplicated. The scorer only
+  // needs an overlap ratio, so the row keeps a bounded prefix and the true
+  // length -- the denominator stays exact, the numerator is exact up to the cap.
+  it("caps the stored cluster, lowercases it, and records the true cluster size", () => {
+    const cluster = Array.from({ length: 100 }, (_, i) => `Concept ${i}`);
+    const row = toIndexRow(makeInsight({ sourceConceptCluster: cluster }));
+    expect(row.sourceConceptCluster).toHaveLength(INSIGHT_INDEX_CLUSTER_CAP);
+    expect(row.sourceConceptCluster[0]).toBe("concept 0");
+    expect(row.clusterSize).toBe(100);
   });
 
   it("writes the insight and its index row together", async () => {

@@ -193,15 +193,20 @@ export function registerContextFunction(
       const profileConcepts = new Set(
         (profile?.topConcepts ?? []).map((c) => c.concept.toLowerCase()),
       );
-      const overlapOf = (cluster: string[]): number => {
-        if (cluster.length === 0 || profileConcepts.size === 0) return 0;
+      // Index rows carry a capped cluster plus its true size; rows written
+      // before the cap existed have no clusterSize, so fall back to the
+      // stored length rather than score them as empty.
+      const overlapOf = (i: InsightIndexRow): number => {
+        const cluster = i.sourceConceptCluster ?? [];
+        const size = i.clusterSize ?? cluster.length;
+        if (size === 0 || profileConcepts.size === 0) return 0;
         const hits = cluster.filter((c) => profileConcepts.has(c.toLowerCase())).length;
-        return hits / cluster.length;
+        return hits / size;
       };
       const scoreInsight = (i: InsightIndexRow): number =>
         (i.project === data.project ? 1.5 : 1) *
         i.confidence *
-        (1 + 0.5 * overlapOf(i.sourceConceptCluster ?? []));
+        (1 + 0.5 * overlapOf(i));
       const relevantInsights = insights
         .filter((i) => !i.deleted && (!i.project || i.project === data.project))
         .sort((a, b) => scoreInsight(b) - scoreInsight(a))
