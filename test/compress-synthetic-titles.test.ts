@@ -60,6 +60,15 @@ describe("synthesizeTitle", () => {
       .toBe("Subagent: Found graph race in persist");
   });
 
+  it("titles an assistant response by its first heading, however the hook carried it", () => {
+    expect(synthesizeTitle(raw({ hookType: "assistant_response" as never, assistantResponse: "## Session Summary\n\n### Tasks\n- done" })))
+      .toBe("Assistant: Session Summary");
+    expect(synthesizeTitle(raw({ hookType: "assistant_response" as never, raw: { response: "Login now works with magic links.\nTry it." } })))
+      .toBe("Assistant: Login now works with magic links.");
+    expect(synthesizeTitle(raw({ hookType: "assistant_response" as never, toolInput: {}, toolOutput: "{} | ## Session Summary" })))
+      .toBe("Assistant: {} | ## Session Summary");
+  });
+
   it("falls back to the tool name plus the output's first line, then the tool name alone", () => {
     expect(synthesizeTitle(raw({ toolName: "Monitor", toolInput: {}, toolOutput: "deploy finished at 02:14\nnext" })))
       .toBe("Monitor: deploy finished at 02:14");

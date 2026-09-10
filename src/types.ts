@@ -285,7 +285,10 @@ export type HookType =
   | "task_completed"
   | "stop"
   | "interrupt"
-  | "session_end";
+  | "session_end"
+  // Sent by the plugin hooks for the assistant's final message; rows with it
+  // were in the live store before the union named it (2026-09-11).
+  | "assistant_response";
 
 export interface HookPayload {
   hookType: HookType;

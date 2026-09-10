@@ -123,7 +123,7 @@ const BARE_TITLES = new Set([
   "prompt_submit", "post_tool_use", "pre_tool_use", "post_tool_failure",
   "session_start", "session_end", "stop", "subagent_stop", "subagent_start",
   "user_prompt_submit", "notification", "task_completed", "pre_compact",
-  "post_compact",
+  "post_compact", "assistant_response",
 ]);
 
 export function isBareTitle(title: string | undefined): boolean {
@@ -162,6 +162,20 @@ export function synthesizeTitle(raw: RawObservation): string {
   if (raw.hookType === "notification") {
     const message = str(data["message"]) ?? str(data["title"]);
     return message ? finishTitle(`Notification: ${firstLine(message)}`) : "Notification";
+  }
+  if (raw.hookType === "assistant_response") {
+    // The compaction summary the harness writes arrives here too ("## Session
+    // Summary"); its first heading is the right title.
+    const text =
+      raw.assistantResponse ??
+      str(data["response"]) ??
+      str(data["last_message"]) ??
+      str(data["message"]) ??
+      str(data["content"]) ??
+      (typeof raw.toolOutput === "string" ? raw.toolOutput : undefined) ??
+      "";
+    const line = firstLine(text).replace(/^[#>\-*\s]+/, "");
+    return line ? finishTitle(`Assistant: ${line}`) : "Assistant response";
   }
 
   const tool = toolName || "observation";
