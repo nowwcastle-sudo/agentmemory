@@ -3,7 +3,9 @@ import {
   selectTypingCandidates,
   buildTypingPrompt,
   parseTypingResponse,
+  pickEvidence,
   registerGraphTypeBackfill,
+  GRAPH_TYPING_SYSTEM,
 } from "../src/functions/graph-type-backfill.js";
 import { KV } from "../src/state/schema.js";
 import type { GraphEdge, GraphNode, CompressedObservation } from "../src/types.js";
@@ -105,6 +107,36 @@ describe("buildTypingPrompt", () => {
   });
 });
 
+// First trial on the live store (100 pairs): the model wrote `causes` for a
+// gateway creating a PID file and a report file, at weight 0.8, and typed a
+// file node literally named "memory". Two fixes, both here: the system prompt
+// defines what each type means (causes/caused_by/fixes/blocked_by are for
+// errors only), and an answer below minWeight is treated as none.
+describe("typing prompt definitions and evidence", () => {
+  it("defines the error-only types and the file-side types in the system prompt", () => {
+    expect(GRAPH_TYPING_SYSTEM).toMatch(/causes[^\n]*error/i);
+    expect(GRAPH_TYPING_SYSTEM).toMatch(/documents[^\n]*(explain|describ|record)/i);
+    expect(GRAPH_TYPING_SYSTEM).toMatch(/implements[^\n]*(realis|code)/i);
+  });
+
+  it("prefers evidence that names the file or the concept over generic titles", () => {
+    const picked = pickEvidence(
+      [
+        { title: "Daily learning drip cron manual execution session", narrative: "ran the cron" },
+        { title: "Scheduled forced restart of Hermes gateway", narrative: "wrote force_restart_hermes_gateway.py to kill and relaunch" },
+        { title: "Discord session: Japanese Python learning", narrative: "" },
+        { title: "gateway restart automation via hidden script", narrative: "" },
+      ],
+      "gateway restart automation",
+      "C:\\Users\\x\\force_restart_hermes_gateway.py",
+      2,
+    );
+    expect(picked[0]).toContain("force_restart_hermes_gateway.py");
+    expect(picked[1]).toContain("gateway restart automation");
+    expect(picked).toHaveLength(2);
+  });
+});
+
 describe("parseTypingResponse", () => {
   const candidates = [
     { edge: edge("e1", "related_to", "n_c", "n_f", ["o1"]), source: concept, target: file },
@@ -127,6 +159,12 @@ describe("parseTypingResponse", () => {
     expect(out.typed.map((t) => [t.candidate.edge.id, t.type, t.weight])).toEqual([["e1", "implements", 0.9]]);
     expect(out.none).toEqual(["e2"]);
     expect(out.rejected.map((r) => r.edgeId).sort()).toEqual(["e1", "e3"]);
+  });
+
+  it("treats an answer below minWeight as none rather than writing a weak typed edge", () => {
+    const out = parseTypingResponse('<pairs><pair i="1" type="uses" weight="0.4"/><pair i="2" type="uses" weight="0.6"/></pairs>', candidates, { minWeight: 0.6 });
+    expect(out.typed.map((t) => t.candidate.edge.id)).toEqual(["e2"]);
+    expect(out.none).toEqual(["e1"]);
   });
 });
 

@@ -75,10 +75,25 @@ export const GRAPH_TYPING_SYSTEM = `You classify the relationship between a conc
 For each numbered pair, output exactly one line:
 <pair i="N" type="${TYPING_TYPES.join("|")}|none" weight="0.1-1.0"/>
 
+What the types mean (concept -> file):
+- implements: the file is where the concept is realised in code
+- defines: the file declares the concept (schema, type, config, constant)
+- documents: the file explains, describes or records the concept (docs, notes, references)
+- tests: the file tests the concept
+- validates: the file checks or verifies the concept
+- uses: the concept's code or process runs, reads or relies on the file
+- depends_on: the concept cannot work without the file
+- modifies: work on the concept changed this file
+- imports: the concept's module imports the file
+- located_in: the concept lives at that path
+- contains / part_of: structural containment
+- causes, caused_by, fixes, blocked_by: ONLY for errors and failures. A component that writes a log, a PID file or a report does not "cause" it -- that is "uses" or none.
+- works_at, prefers, rejected, avoids, optimizes_for, succeeded_by: almost never right for a concept -> file pair; prefer none.
+
 Rules:
 - Only these types are valid; anything else is discarded.
-- Choose "none" when the evidence does not support a specific relationship. "none" is a good answer.
-- Weight is how strongly the evidence supports the relationship.
+- Choose "none" when the evidence does not support a specific relationship, or when the file is not a real source, config, doc or data file. "none" is a good answer.
+- Weight is how strongly the evidence supports the relationship; below 0.6 means you are guessing -- answer none instead.
 - Wrap the lines in <pairs></pairs> and output nothing else.`;
 
 export function buildTypingPrompt(
@@ -95,6 +110,38 @@ export function buildTypingPrompt(
   return `Classify these pairs. Answer "none" where unsure.\n\n${items.join("\n\n")}`;
 }
 
+/**
+ * Which observation titles to show for a pair: the ones that mention the
+ * file's basename or the concept first, generic session titles last. A
+ * narrative that mentions the file is quoted alongside its title. The first
+ * trial showed the model three generic "Discord session" titles for a
+ * gateway/PID-file pair and it guessed `causes`.
+ */
+export function pickEvidence(
+  observations: Array<{ title: string; narrative?: string }>,
+  conceptName: string,
+  fileName: string,
+  limit = EVIDENCE_TITLES_PER_PAIR,
+): string[] {
+  const base = fileName.split(/[\\/]/).pop()?.toLowerCase() ?? "";
+  const concept = conceptName.toLowerCase();
+  const scored = observations.map((o, i) => {
+    const title = o.title ?? "";
+    const narrative = o.narrative ?? "";
+    const text = `${title} ${narrative}`.toLowerCase();
+    const mentionsFile = base.length > 0 && text.includes(base);
+    const mentionsConcept = concept.length > 0 && text.includes(concept);
+    const score = (mentionsFile ? 2 : 0) + (mentionsConcept ? 1 : 0);
+    const line =
+      mentionsFile && narrative && !title.toLowerCase().includes(base)
+        ? `${title} -- ${narrative.slice(0, 160)}`
+        : title;
+    return { score, i, line };
+  });
+  scored.sort((a, b) => b.score - a.score || a.i - b.i);
+  return scored.slice(0, limit).map((s) => s.line);
+}
+
 export interface TypingParse {
   typed: Array<{ candidate: TypingCandidate; type: GraphEdge["type"]; weight: number }>;
   none: string[];
@@ -109,6 +156,7 @@ export interface TypingParse {
 export function parseTypingResponse(
   xml: string,
   candidates: TypingCandidate[],
+  { minWeight = 0.6 }: { minWeight?: number } = {},
 ): TypingParse {
   const out: TypingParse = { typed: [], none: [], rejected: [] };
   const pairRegex = /<pair\b([^>]*?)\/>/g;
@@ -129,6 +177,13 @@ export function parseTypingResponse(
     }
     const parsedWeight = Number.parseFloat(attrs["weight"] ?? "");
     const weight = Math.max(0, Math.min(1, Number.isFinite(parsedWeight) ? parsedWeight : 0.5));
+    // The model's confidence is the only calibration we have. A guess written
+    // at weight 0.4 would still outrank nothing, but it would be wrong data in
+    // a graph retrieval walks by weight; keep the related_to instead.
+    if (weight < minWeight) {
+      out.none.push(candidate.edge.id);
+      continue;
+    }
     const probe: GraphEdge = {
       ...candidate.edge,
       id: `probe:${candidate.edge.id}`,
@@ -155,6 +210,10 @@ export function parseTypingResponse(
 }
 
 const EVIDENCE_TITLES_PER_PAIR = 3;
+// How many backing observations to read before choosing the best few. Pairs
+// with a hundred backing observations are the interesting ones, and the
+// first three refs are whatever happened to be extracted first.
+const EVIDENCE_CANDIDATES_PER_PAIR = 12;
 
 async function evidenceFor(
   kv: StateKV,
@@ -162,16 +221,16 @@ async function evidenceFor(
 ): Promise<Map<string, string[]>> {
   const evidence = new Map<string, string[]>();
   for (const c of candidates) {
-    const titles: string[] = [];
+    const observations: Array<{ title: string; narrative?: string }> = [];
     for (const ref of c.edge.sourceRefs ?? []) {
-      if (titles.length >= EVIDENCE_TITLES_PER_PAIR) break;
+      if (observations.length >= EVIDENCE_CANDIDATES_PER_PAIR) break;
       if (ref.sourceKind !== "observation" || !ref.sessionId) continue;
       const observation = await kv
         .get<CompressedObservation>(KV.observations(ref.sessionId), ref.sourceId)
         .catch(() => null);
-      if (observation?.title) titles.push(observation.title);
+      if (observation?.title) observations.push({ title: observation.title, narrative: observation.narrative });
     }
-    evidence.set(c.edge.id, titles);
+    evidence.set(c.edge.id, pickEvidence(observations, c.source.name, c.target.name));
   }
   return evidence;
 }
