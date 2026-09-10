@@ -247,6 +247,13 @@ export async function reconcilePipelineMarkers(
 const AUTOMATIC_RETRY_BASE_MS = 30_000;
 const AUTOMATIC_RETRY_MAX_MS = 5 * 60_000;
 const AUTOMATIC_RETRY_BATCH_SIZE = 1;
+/**
+ * Automatic retries stop here. Live store 2026-09-11: two compression
+ * projections at 433 and 180 attempts, each retry a 180 s state::set timeout,
+ * retried every five minutes -- a coordinator slot held by a doomed call
+ * most of the time. A manual reconcile (automatic: false) still retries them.
+ */
+export const AUTOMATIC_RETRY_MAX_ATTEMPTS = 25;
 
 function isRetryDue(
   state: {
@@ -259,6 +266,7 @@ function isRetryDue(
 ): boolean {
   if (state.status === "succeeded") return false;
   if (!automatic) return true;
+  if (state.attempts >= AUTOMATIC_RETRY_MAX_ATTEMPTS) return false;
 
   const updatedAt = Date.parse(state.updatedAt);
   if (!Number.isFinite(updatedAt)) return true;

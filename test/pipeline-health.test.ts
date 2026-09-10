@@ -93,6 +93,44 @@ describe("pipeline health markers", () => {
     expect(status.compression).toMatchObject({ pending: 0, failed: 0 });
   });
 
+  // Live store 2026-09-11: two compression projections at 433 and 180
+  // attempts, each retry timing out after 180 s on state::set, retried every
+  // five minutes forever -- a coordinator slot held by a doomed call most of
+  // the time. Automatic retries stop after a cap; a manual reconcile still
+  // retries everything.
+  it("stops automatic retries after the attempt cap, but a manual reconcile still retries", async () => {
+    const { reconcilePipelineWork, AUTOMATIC_RETRY_MAX_ATTEMPTS } = await import("../src/health/pipeline.js");
+    const kv = mockKV();
+    const sdk = mockSdk();
+    const retried: string[] = [];
+    sdk.registerFunction("mem::project-observation", async (data: unknown) => {
+      const id = (data as { observationId: string }).observationId;
+      retried.push(id);
+      // The real function writes the row through the helper; so does the stub.
+      const row = await kv.get<Record<string, unknown>>(KV.observationProjections, id);
+      await writeObservationProjection(kv as never, { ...row, status: "succeeded", updatedAt: new Date().toISOString() } as never);
+      return { success: true };
+    });
+    sdk.registerFunction("mem::project-graph-sources", async () => ({ success: true }));
+    const old = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+    await writeObservationProjection(kv as never, {
+      observationId: "obs-doomed", captureId: "c1", sessionId: "s1", status: "failed",
+      attempts: AUTOMATIC_RETRY_MAX_ATTEMPTS, updatedAt: old, lastError: "Invocation timeout after 180000ms: state::set",
+    } as never);
+    await writeObservationProjection(kv as never, {
+      observationId: "obs-young", captureId: "c2", sessionId: "s1", status: "failed",
+      attempts: 3, updatedAt: old, lastError: "boom",
+    } as never);
+
+    await reconcilePipelineWork(sdk as never, kv as never, { automatic: true });
+    expect(retried).toEqual(["obs-young"]);
+
+    // obs-young succeeded above; a manual reconcile still retries the capped one.
+    retried.length = 0;
+    await reconcilePipelineWork(sdk as never, kv as never, { automatic: false });
+    expect(retried).toEqual(["obs-doomed"]);
+  });
+
   it("does not rewrite unchanged canonical projection markers", async () => {
     const { reconcilePipelineMarkers } = await import(
       "../src/health/pipeline.js"

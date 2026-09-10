@@ -19,8 +19,9 @@ data-*/
 agentmemory-debug/
 .gstack/
 
-# Lock files — never commit (see feedback_no_lockfiles memory)
-package-lock.json
+# Lock files. Upstream never commits them; this fork runs on one desktop and
+# is deployed from its own build, so package-lock.json is tracked to make two
+# installs the same build (2026-09-11). The other managers stay ignored.
 pnpm-lock.yaml
 yarn.lock
 integrations/hermes/__pycache__/

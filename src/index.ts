@@ -62,6 +62,8 @@ import { registerClaudeBridgeFunction } from "./functions/claude-bridge.js";
 import { registerGraphFunction } from "./functions/graph.js";
 import { registerGraphTypeBackfill } from "./functions/graph-type-backfill.js";
 import { registerRelationsIndexFunction } from "./functions/graph-relations-index.js";
+import { registerGraphStatsRecount } from "./functions/graph-stats-recount.js";
+import { configuredRecoveryIntervalMs } from "./functions/observation-projection.js";
 import { registerGraphSourceProjectionFunction } from "./functions/graph-source-projection.js";
 import { ProjectionCoordinator } from "./functions/projection-coordinator.js";
 import { registerGraphImportFunction } from "./functions/graph-import.js";
@@ -303,6 +305,7 @@ async function main() {
   // module can import persistGraphDelta from graph.ts without a cycle.
   registerGraphTypeBackfill(sdk, kv, provider);
   registerRelationsIndexFunction(sdk, kv);
+  registerGraphStatsRecount(sdk, kv);
   const projectGraphSourcesCore = registerGraphSourceProjectionFunction(
     sdk,
     kv,
@@ -621,7 +624,14 @@ async function main() {
   );
   const pipelineReconcileLoop = startPipelineReconcileLoop(sdk);
   const connectorOutboxReplayLoop = startConnectorOutboxReplayLoop(sdk, 30_000);
-  bootLog("Projection recovery: enabled (every 1m)");
+  // The interval is what the drain actually uses (env-driven, default 2 s);
+  // this line said "every 1m" for months regardless.
+  const recoveryMs = configuredRecoveryIntervalMs();
+  bootLog(
+    recoveryMs > 0
+      ? `Projection recovery: enabled (every ${recoveryMs >= 1000 ? `${recoveryMs / 1000}s` : `${recoveryMs}ms`})`
+      : "Projection recovery: disabled (interval 0)",
+  );
   bootLog(
     "Connector outbox replay: enabled (bounded current-envelope replay every 30s)",
   );
@@ -634,7 +644,7 @@ async function main() {
     `Ready. ${embeddingProvider ? "Triple-stream (BM25+Vector+Graph)" : "BM25+Graph"} search active.`,
   );
   bootLog(
-    `REST API: 137 endpoints at http://localhost:${config.restPort}/agentmemory/*`,
+    `REST API: 138 endpoints at http://localhost:${config.restPort}/agentmemory/*`,
   );
   bootLog(
     `MCP surface (opt-in via \`npx @agentmemory/mcp\`): ${getAllTools().length} tools · 6 resources · 3 prompts`,

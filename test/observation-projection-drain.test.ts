@@ -156,6 +156,18 @@ describe("observation projection backlog recovery", () => {
     }
   });
 
+  it("reports the interval the drain actually uses: 2 s by default, 0 when disabled", async () => {
+    const { configuredRecoveryIntervalMs } = await import(
+      "../src/functions/observation-projection.js"
+    );
+    delete process.env["AGENTMEMORY_PROJECTION_RECOVERY_INTERVAL_MS"];
+    expect(configuredRecoveryIntervalMs()).toBe(2_000);
+    process.env["AGENTMEMORY_PROJECTION_RECOVERY_INTERVAL_MS"] = "0";
+    expect(configuredRecoveryIntervalMs()).toBe(0);
+    process.env["AGENTMEMORY_PROJECTION_RECOVERY_INTERVAL_MS"] = "junk";
+    expect(configuredRecoveryIntervalMs()).toBe(2_000);
+  });
+
   it("treats an interval of 0 as disabled", async () => {
     const sdk = mockSdk({ looseTrigger: true });
     const kv = mockKV();

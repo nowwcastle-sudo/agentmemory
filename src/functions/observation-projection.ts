@@ -64,7 +64,7 @@ const DEFAULT_RECOVERY_INTERVAL_MS = 2_000;
 const EMPTY_BACKLOG_RESCAN_MS = 30_000;
 
 /** `0` disables paced recovery, matching the *_ENABLED switches in index.ts. */
-function configuredRecoveryIntervalMs(): number {
+export function configuredRecoveryIntervalMs(): number {
   const configured = process.env["AGENTMEMORY_PROJECTION_RECOVERY_INTERVAL_MS"];
   if (configured === undefined || configured.trim() === "") {
     return DEFAULT_RECOVERY_INTERVAL_MS;
