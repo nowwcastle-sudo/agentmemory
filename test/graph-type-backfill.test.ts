@@ -4,6 +4,7 @@ import {
   buildTypingPrompt,
   parseTypingResponse,
   pickEvidence,
+  isTypeableConcept,
   registerGraphTypeBackfill,
   GRAPH_TYPING_SYSTEM,
 } from "../src/functions/graph-type-backfill.js";
@@ -89,6 +90,18 @@ describe("selectTypingCandidates", () => {
   // Second trial: four of twenty-four typed edges pointed at file nodes named
   // "memory", "user" and "gosulgoseul-entertainer" -- not files. A file node
   // with neither a path separator nor an extension is not worth a model call.
+  it("skips concept nodes that are commands or tool names", () => {
+    const command = node("n_cmd", "concept", "git status");
+    const tool = node("n_tool", "concept", "Bash");
+    const edges = [
+      edge("e_cmd", "related_to", "n_cmd", "n_f", ["o1", "o2"]),
+      edge("e_tool", "related_to", "n_tool", "n_f", ["o1", "o2"]),
+      edge("e_ok", "related_to", "n_c", "n_f", ["o1", "o2"]),
+    ];
+    const picked = selectTypingCandidates([concept, file, command, tool], edges, { minBacking: 2 });
+    expect(picked.map((c) => c.edge.id)).toEqual(["e_ok"]);
+  });
+
   it("skips file nodes that have neither a path nor an extension", () => {
     const junk = node("n_junk", "file", "memory");
     const bare = node("n_bare", "file", "README");
@@ -134,11 +147,17 @@ describe("typing prompt definitions and evidence", () => {
     expect(GRAPH_TYPING_SYSTEM).toMatch(/implements[^\n]*(realis|code)/i);
   });
 
-  it("prefers evidence that names the file or the concept over generic titles", () => {
+  // Trial 3 (2026-09-10): the evidence selector ranked titles that merely
+  // mentioned the file, so a file-list observation ("Updated persistent
+  // memory: ... names many files") typed "BOM documents Hermes_Gateway.cmd" at
+  // 0.9. Evidence is now a gate, not a ranking: a snippet counts only when the
+  // file and the concept sit in one window with a relation verb, and a
+  // list-shaped observation never counts.
+  it("keeps only observations that state a relation between the concept and the file", () => {
     const picked = pickEvidence(
       [
         { title: "Daily learning drip cron manual execution session", narrative: "ran the cron" },
-        { title: "Scheduled forced restart of Hermes gateway", narrative: "wrote force_restart_hermes_gateway.py to kill and relaunch" },
+        { title: "Scheduled forced restart of Hermes gateway", narrative: "automated the gateway restart: wrote force_restart_hermes_gateway.py to kill and relaunch the process" },
         { title: "Discord session: Japanese Python learning", narrative: "" },
         { title: "gateway restart automation via hidden script", narrative: "" },
       ],
@@ -146,9 +165,58 @@ describe("typing prompt definitions and evidence", () => {
       "C:\\Users\\x\\force_restart_hermes_gateway.py",
       2,
     );
+    expect(picked).toHaveLength(1);
     expect(picked[0]).toContain("force_restart_hermes_gateway.py");
-    expect(picked[1]).toContain("gateway restart automation");
-    expect(picked).toHaveLength(2);
+    expect(picked[0]).toContain("Scheduled forced restart of Hermes gateway");
+  });
+
+  it("rejects a file-list observation even though it names both, and one with no relation verb", () => {
+    const picked = pickEvidence(
+      [
+        { title: "Updated persistent memory: PowerShell BOM issue", narrative: "files: Hermes_Gateway.cmd, gateway_state.json, notes.md, run.ps1, setup.sh, README.md; BOM noted" },
+        { title: "BOM", narrative: "BOM Hermes_Gateway.cmd" },
+      ],
+      "BOM",
+      "C:\\hermes\\Hermes_Gateway.cmd",
+    );
+    expect(picked).toEqual([]);
+  });
+
+  it("accepts a bare-title observation whose narrative states the relation, without the bare title", () => {
+    const picked = pickEvidence(
+      [{ title: "Bash", narrative: "the retry policy is implemented in src/retry.ts with exponential backoff" }],
+      "retry policy",
+      "src/retry.ts",
+    );
+    expect(picked).toHaveLength(1);
+    expect(picked[0]).toContain("implemented in src/retry.ts");
+    expect(picked[0]).not.toMatch(/^Bash --/);
+  });
+});
+
+describe("isTypeableConcept", () => {
+  it("rejects shell commands, tool names, paths, and sentences", () => {
+    for (const bad of [
+      "git status",
+      "git log",
+      "commit range",
+      "PowerShell command execution",
+      "npm run build --watch",
+      "Bash",
+      "Read",
+      "prompt_submit",
+      "src/auth.ts",
+      "ab",
+      "Inspecting the projection coordinator for a race on the retry path",
+    ]) {
+      expect(isTypeableConcept(bad), bad).toBe(false);
+    }
+  });
+
+  it("accepts domain concepts", () => {
+    for (const good of ["JSON schema validation", "GitHub Actions workflow", "keyed mutex", "BOM", "retry policy", "pytest"]) {
+      expect(isTypeableConcept(good), good).toBe(true);
+    }
   });
 });
 
@@ -223,6 +291,36 @@ describe("mem::graph-type-backfill", () => {
     expect(await kv.get(KV.graphEdgeHistory, "e_rel")).toMatchObject({ supersededBy: typed!.id });
   });
 
+  it("does not ask the model about a pair whose evidence only lists files, and reports it as skipped", async () => {
+    const kv = mockKV();
+    const sdk = mockSdk();
+    for (const n of [concept, file]) await kv.set(KV.graphNodes, n.id, n);
+    const rel = edge("e_rel", "related_to", "n_c", "n_f", ["o1", "o2"], {
+      sourceRefs: [
+        { sourceKind: "observation", sourceId: "o1", sessionId: "ses_1" },
+        { sourceKind: "observation", sourceId: "o2", sessionId: "ses_1" },
+      ] as GraphEdge["sourceRefs"],
+    });
+    await kv.set(KV.graphEdges, rel.id, rel);
+    const list = obs("o1", "Updated persistent memory notes");
+    list.narrative = "files: src/retry.ts, src/a.ts, src/b.ts, src/c.ts, docs/d.md, e.json; retry policy noted";
+    await kv.set(KV.observations("ses_1"), "o1", list);
+    await kv.set(KV.observations("ses_1"), "o2", obs("o2", "Retry policy backoff tuning"));
+
+    const provider = { name: "test", compress: vi.fn(), summarize: vi.fn() };
+    registerGraphTypeBackfill(sdk as never, kv as never, provider as never);
+
+    const result = (await sdk.trigger("mem::graph-type-backfill", { minBacking: 2, batchSize: 20, maxBatches: 1 })) as {
+      candidates: number; asked: number; typed: number; skipped: number; attemptedEdgeIds: string[];
+    };
+
+    expect(provider.compress).not.toHaveBeenCalled();
+    expect(result).toMatchObject({ candidates: 1, asked: 0, typed: 0, skipped: 1, attemptedEdgeIds: ["e_rel"] });
+    const edges = await kv.list<GraphEdge>(KV.graphEdges);
+    expect(edges).toHaveLength(1);
+    expect(edges[0]).toMatchObject({ id: "e_rel", type: "related_to" });
+  });
+
   // Trial 2 re-typed pairs whose trial-1 typed edge had been reverted (stale).
   // persistGraphDelta merged the new decision into that same-key row, which
   // stayed stale, and the related_to was superseded anyway -- 34 pairs with
@@ -231,7 +329,11 @@ describe("mem::graph-type-backfill", () => {
     const kv = mockKV();
     const sdk = mockSdk();
     for (const n of [concept, file]) await kv.set(KV.graphNodes, n.id, n);
-    await kv.set(KV.graphEdges, "e_rel", edge("e_rel", "related_to", "n_c", "n_f", ["o1", "o2"]));
+    await kv.set(KV.graphEdges, "e_rel", edge("e_rel", "related_to", "n_c", "n_f", ["o1", "o2"], {
+      sourceRefs: [{ sourceKind: "observation", sourceId: "o1", sessionId: "ses_1" }] as GraphEdge["sourceRefs"],
+    }));
+    // The evidence gate asks only pairs with an observation stating the relation.
+    await kv.set(KV.observations("ses_1"), "o1", obs("o1", "Implement retry policy in src/retry.ts"));
     const reverted = edge("e_old_typed", "implements", "n_c", "n_f", ["o1"], { stale: true, isLatest: false, weight: 0.5 });
     await kv.set(KV.graphEdges, reverted.id, reverted);
     await kv.set(KV.graphEdgeKey, "n_c|n_f|implements", reverted.id);

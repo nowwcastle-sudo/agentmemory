@@ -45,6 +45,43 @@ const isLive = (n: GraphNode | undefined): n is GraphNode =>
 // word is never right, so those pairs are not candidates.
 const looksLikeFile = (name: string): boolean => /[\\/]/.test(name) || /\.[A-Za-z0-9]+$/.test(name);
 
+// Trial 3 (2026-09-10): 8 of 24 wrong answers had a concept node that was a
+// shell command ("git status", "commit range", "PowerShell command
+// execution"). A command is an action, not a domain concept, and the file
+// was listed by it, not used by it. The names below are never asked about.
+const COMMAND_WORDS = new Set([
+  "git", "npm", "npx", "node", "pwsh", "powershell", "bash", "sh", "cd", "ls",
+  "cat", "grep", "curl", "wsl", "docker", "pip", "py", "python", "python3",
+  "tee", "sed", "awk", "echo", "rm", "mkdir", "mv", "cp", "chmod", "ssh",
+  "tar", "find", "head", "tail", "wc", "sort", "uniq", "kill", "taskkill",
+  "sudo", "apt", "brew", "make", "cargo", "dotnet", "yarn", "pnpm", "start",
+  "stop", "restart",
+]);
+const TOOL_NAMES = new Set([
+  "bash", "read", "edit", "write", "grep", "glob", "powershell", "monitor",
+  "agent", "skill", "todowrite", "webfetch", "websearch", "task",
+  "notebookedit", "multiedit", "ls", "prompt_submit", "post_tool_use",
+  "pre_tool_use", "session_start", "session_end", "stop", "subagent_stop",
+  "user_prompt_submit", "post_tool_failure",
+]);
+const ACTION_TAILS = /\b(command|commands|execution|invocation|range|output|status|log|logs|run|call)$/;
+const ACTION_HEADS = /^(run|ran|running|execute|executed|executing|inspect|inspecting|inspected|update|updated|updating|check|checked|checking|read|reading)\b/;
+
+export function isTypeableConcept(name: string): boolean {
+  const trimmed = name.trim();
+  if (trimmed.length < 3) return false;
+  const lower = trimmed.toLowerCase();
+  if (TOOL_NAMES.has(lower)) return false;
+  if (looksLikeFile(trimmed)) return false;
+  const words = lower.split(/\s+/);
+  if (words.length > 6) return false;
+  if (words.length > 1 && COMMAND_WORDS.has(words[0])) return false;
+  if (/\s-{1,2}[a-z]/.test(lower)) return false;
+  if (ACTION_TAILS.test(lower)) return false;
+  if (ACTION_HEADS.test(lower)) return false;
+  return true;
+}
+
 /**
  * Live concept-file related_to edges with at least `minBacking` observations
  * behind them, most evidence first. Superseded edges and edges touching a
@@ -65,6 +102,7 @@ export function selectTypingCandidates(
     if (!isLive(source) || !isLive(target)) continue;
     if (source.type !== "concept" || target.type !== "file") continue;
     if (!looksLikeFile(target.name)) continue;
+    if (!isTypeableConcept(source.name)) continue;
     out.push({ edge, source, target });
   }
   out.sort(
@@ -124,6 +162,43 @@ export function buildTypingPrompt(
  * trial showed the model three generic "Discord session" titles for a
  * gateway/PID-file pair and it guessed `causes`.
  */
+// Words that carry no concept on their own when matching evidence.
+const CONCEPT_STOP_WORDS = new Set([
+  "the", "and", "for", "with", "from", "into", "that", "this", "file",
+  "files", "code", "issue", "issues", "session", "sessions", "work", "task",
+  "tasks",
+]);
+
+// A concept's tokens that must all appear near the file mention: 4+ letters,
+// compared by their first six characters so "automation" meets "automated".
+function significantTokens(concept: string): string[] {
+  const tokens = concept
+    .toLowerCase()
+    .split(/[^\p{L}\p{N}_]+/u)
+    .filter((t) => t.length >= 4 && !CONCEPT_STOP_WORDS.has(t))
+    .map((t) => t.slice(0, 6));
+  if (tokens.length > 0) return [...new Set(tokens)];
+  const whole = concept.trim().toLowerCase();
+  return whole.length >= 3 ? [whole] : [];
+}
+
+const RELATION_VERB =
+  /\b(us(e|es|ed|ing)|import(s|ed|ing)?|requir(e|es|ed|ing)|call(s|ed|ing)?|invok(e|es|ed|ing)|defin(e|es|ed|ing)|declar(e|es|ed|ing)|implement(s|ed|ing|ation)?|extend(s|ed|ing)?|test(s|ed|ing)?|verif(y|ies|ied|ying)|validat(e|es|ed|ing|ion)|check(s|ed|ing)?|fix(es|ed|ing)?|resolv(e|es|ed|ing)|caus(e|es|ed|ing)|break(s|ing)?|broke|fail(s|ed|ing|ure)?|depend(s|ed|ing|ency)?|read(s|ing)?|writ(e|es|ing|ten)|wrote|load(s|ed|ing)?|sav(e|es|ed|ing)|pars(e|es|ed|ing)|generat(e|es|ed|ing)|configur(e|es|ed|ing)|document(s|ed|ing)?|describ(e|es|ed|ing)|explain(s|ed|ing)?|record(s|ed|ing)?|mov(e|es|ed|ing)|renam(e|es|ed|ing)|delet(e|es|ed|ing)|add(s|ed|ing)?|remov(e|es|ed|ing)|updat(e|es|ed|ing)|modif(y|ies|ied|ying)|refactor(s|ed|ing)?|register(s|ed|ing)?|expos(e|es|ed|ing)|handl(e|es|ed|ing)|schedul(e|es|ed|ing)|run(s|ning)?|ran|execut(e|es|ed|ing)|creat(e|es|ed|ing)|build(s|ing)?|built|patch(es|ed|ing)?|appl(y|ies|ied|ying)|instal(l|ls|led|ling)|wrap(s|ped|ping)?|emit(s|ted|ting)?|persist(s|ed|ing)?|stor(e|es|ed|ing)|automat(e|es|ed|ing|ion)|kill(s|ed|ing)?|relaunch(es|ed)?|restart(s|ed|ing)?|migrat(e|es|ed|ing))\b/i;
+
+const FILE_MENTION =
+  /(?:[A-Za-z0-9_.-]+[\\/])+[A-Za-z0-9_.-]+|\b[A-Za-z0-9_-]+\.(?:ts|js|mjs|cjs|tsx|jsx|py|ps1|sh|md|json|yaml|yml|toml|txt|cmd|bat|rs|go|java|cs|html|css|sql|env)\b/g;
+// An observation naming this many files is a list, not a relation.
+const LIST_SHAPED_FILE_MENTIONS = 5;
+const EVIDENCE_WINDOW = 120;
+
+/**
+ * Evidence as a gate, not a ranking (trial 3, 2026-09-10: titles that merely
+ * mentioned the file typed "BOM documents Hermes_Gateway.cmd" at 0.9 from a
+ * file-list observation). An observation counts only when the file's basename
+ * and every significant token of the concept sit in one window that also
+ * carries a relation verb, and only when the observation is not a file list.
+ * A bare tool-name title ("Bash") is dropped; its narrative still counts.
+ */
 export function pickEvidence(
   observations: Array<{ title: string; narrative?: string }>,
   conceptName: string,
@@ -131,22 +206,36 @@ export function pickEvidence(
   limit = EVIDENCE_TITLES_PER_PAIR,
 ): string[] {
   const base = fileName.split(/[\\/]/).pop()?.toLowerCase() ?? "";
-  const concept = conceptName.toLowerCase();
-  const scored = observations.map((o, i) => {
-    const title = o.title ?? "";
+  if (!base) return [];
+  const tokens = significantTokens(conceptName);
+  if (tokens.length === 0) return [];
+  const out: string[] = [];
+  for (const o of observations) {
+    const rawTitle = (o.title ?? "").trim();
+    const bareTitle = !rawTitle || TOOL_NAMES.has(rawTitle.toLowerCase());
+    const title = bareTitle ? "" : rawTitle;
     const narrative = o.narrative ?? "";
-    const text = `${title} ${narrative}`.toLowerCase();
-    const mentionsFile = base.length > 0 && text.includes(base);
-    const mentionsConcept = concept.length > 0 && text.includes(concept);
-    const score = (mentionsFile ? 2 : 0) + (mentionsConcept ? 1 : 0);
-    const line =
-      mentionsFile && narrative && !title.toLowerCase().includes(base)
-        ? `${title} -- ${narrative.slice(0, 160)}`
-        : title;
-    return { score, i, line };
-  });
-  scored.sort((a, b) => b.score - a.score || a.i - b.i);
-  return scored.slice(0, limit).map((s) => s.line);
+    const text = title ? `${title}. ${narrative}` : narrative;
+    const mentions = new Set((text.match(FILE_MENTION) ?? []).map((m) => m.toLowerCase()));
+    if (mentions.size >= LIST_SHAPED_FILE_MENTIONS) continue;
+    const lower = text.toLowerCase();
+    let snippet: string | null = null;
+    for (let at = lower.indexOf(base); at >= 0; at = lower.indexOf(base, at + 1)) {
+      const window = text.slice(
+        Math.max(0, at - EVIDENCE_WINDOW),
+        Math.min(text.length, at + base.length + EVIDENCE_WINDOW),
+      );
+      const windowLower = window.toLowerCase();
+      if (tokens.every((t) => windowLower.includes(t)) && RELATION_VERB.test(window)) {
+        snippet = window.trim();
+        break;
+      }
+    }
+    if (!snippet) continue;
+    out.push(!title || snippet.includes(title) ? snippet : `${title} -- ${snippet}`);
+    if (out.length >= limit) break;
+  }
+  return out;
 }
 
 export interface TypingParse {
@@ -257,6 +346,8 @@ export interface TypeBackfillResult {
   typed: number;
   none: number;
   rejected: number;
+  /** candidates never asked because no backing observation states a relation */
+  skipped: number;
   attemptedEdgeIds: string[];
   dryRun: boolean;
   error?: string;
@@ -295,6 +386,7 @@ export function registerGraphTypeBackfill(
         typed: 0,
         none: 0,
         rejected: 0,
+        skipped: 0,
         attemptedEdgeIds: [],
         dryRun,
       };
@@ -303,7 +395,15 @@ export function registerGraphTypeBackfill(
       for (let start = 0; start < candidates.length; start += batchSize) {
         const batch = candidates.slice(start, start + batchSize);
         const evidence = await evidenceFor(kv, batch);
-        const prompt = buildTypingPrompt(batch, evidence);
+        // A pair with no gated evidence is not asked: the model would answer
+        // from the names alone, which is what trials 1-3 measured at 40-70%.
+        // It still counts as attempted so the driver never brings it back.
+        const asked = batch.filter((c) => (evidence.get(c.edge.id) ?? []).length > 0);
+        const skipped = batch.filter((c) => !asked.includes(c));
+        result.skipped += skipped.length;
+        result.attemptedEdgeIds.push(...skipped.map((c) => c.edge.id));
+        if (asked.length === 0) continue;
+        const prompt = buildTypingPrompt(asked, evidence);
         let response: string;
         try {
           response = await provider.compress(GRAPH_TYPING_SYSTEM, prompt);
@@ -313,10 +413,10 @@ export function registerGraphTypeBackfill(
           logger.error("graph-type-backfill provider call failed", { error: result.error });
           return result;
         }
-        result.asked += batch.length;
-        result.attemptedEdgeIds.push(...batch.map((c) => c.edge.id));
+        result.asked += asked.length;
+        result.attemptedEdgeIds.push(...asked.map((c) => c.edge.id));
 
-        const parsed = parseTypingResponse(response, batch);
+        const parsed = parseTypingResponse(response, asked);
         result.none += parsed.none.length;
         result.rejected += parsed.rejected.length;
 
