@@ -65,6 +65,30 @@ describe("mem::context relations block", () => {
     expect(listed).not.toContain(KV.graphRelationsIndex);
   });
 
+  it("lets the session's first prompt and files decide which relations lead", async () => {
+    const kv = mockKV();
+    await kv.set(KV.profiles, "p1", profile);
+    await kv.set(KV.graphRelationsIndex, "p1", {
+      project: "p1",
+      updatedAt: "2026-09-11T00:00:00.000Z",
+      relations: [
+        { source: "retry policy", type: "implements", target: "src/retry.ts", weight: 0.7, backing: 3, edgeId: "e1" },
+        { source: "cache", type: "implements", target: "src/cache.ts", weight: 0.95, backing: 80, edgeId: "e2" },
+        { source: "logging", type: "uses", target: "src/log.ts", weight: 0.6, backing: 5, edgeId: "e3" },
+      ],
+    });
+    // The current session: its row carries the first prompt; its observations name files.
+    await kv.set(KV.sessions, "s_now", { id: "s_now", project: "p1", cwd: "/r", startedAt: "2026-09-11T00:00:00.000Z", status: "active", observationCount: 1, firstPrompt: "why does logging drop lines" });
+    await kv.set(KV.observations("s_now"), "o1", { id: "o1", sessionId: "s_now", timestamp: "2026-09-11T00:00:00.000Z", type: "file_edit", title: "Edit log.ts", facts: [], narrative: "", concepts: [], files: ["src/log.ts"], importance: 5 });
+
+    const context = wireContext(kv);
+    const result = await context({ sessionId: "s_now", project: "p1" });
+    const i = (s: string) => result.context.indexOf(s);
+    expect(i("- logging --uses--> src/log.ts")).toBeGreaterThan(-1);
+    expect(i("- logging --uses--> src/log.ts")).toBeLessThan(i("- retry policy --implements-->"));
+    expect(i("- retry policy --implements-->")).toBeLessThan(i("- cache --implements-->"));
+  });
+
   it("omits the block when the project has no index row", async () => {
     const kv = mockKV();
     await kv.set(KV.profiles, "p1", profile);

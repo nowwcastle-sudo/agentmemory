@@ -5,6 +5,7 @@ import {
   rebuildRelationsIndex,
   readProjectRelations,
   renderRelationsBlock,
+  buildFocus,
   RELATIONS_INDEX_CAP,
   type ProjectRelationsIndex,
   type RelationRow,
@@ -144,6 +145,34 @@ describe("renderRelationsBlock", () => {
 
   it("returns null when there is nothing to say", () => {
     expect(renderRelationsBlock([], profile, 12)).toBeNull();
+  });
+
+  // Cycle I: the block was the project's heaviest relations whatever the
+  // session was doing. A session about the cache should hear about the cache.
+  it("ranks relations touching the session's focus above profile matches and score", () => {
+    const relations = [
+      row("logging", "uses", "src/log.ts", 0.6, 5, "e_log"),
+      row("retry policy", "implements", "src/retry.ts", 0.7, 3, "e_retry"),
+      row("cache", "implements", "src/cache.ts", 0.95, 80, "e_cache"),
+      row("misc", "documents", "docs/misc.md", 0.9, 40, "e_misc"),
+    ];
+    const focus = buildFocus("Fix the cache warmup on startup", [{ title: "Edit cache.ts", files: ["src/cache.ts"] }]);
+    const items = renderRelationsBlock(relations, profile, 4, focus)!.split("\n").filter((l) => l.startsWith("- "));
+    expect(items[0]).toBe("- cache --implements--> src/cache.ts (80 obs)");
+    // Then the profile-touching ones by score, then the rest.
+    expect(items[1]).toBe("- logging --uses--> src/log.ts (5 obs)");
+    expect(items[2]).toBe("- retry policy --implements--> src/retry.ts (3 obs)");
+    expect(items[3]).toBe("- misc --documents--> docs/misc.md (40 obs)");
+  });
+
+  it("builds focus terms from the first prompt and the session's files and titles, skipping short words", () => {
+    const focus = buildFocus("Fix the retry policy backoff", [
+      { title: "Edit functions/cache.ts", files: ["D:\\repo\\src\\functions\\cache.ts"] },
+      { title: "Bash: npm test", files: [] },
+    ]);
+    for (const term of ["retry", "policy", "backoff", "cache.ts", "cache", "functions/cache.ts", "test"]) expect(focus.has(term), term).toBe(true);
+    for (const absent of ["fix", "the", "npm", "d:", "repo"]) expect(focus.has(absent), absent).toBe(false);
+    expect(buildFocus(undefined, []).size).toBe(0);
   });
 
   it("shortens absolute paths to their last two segments and leaves plain names alone", () => {

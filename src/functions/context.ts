@@ -12,7 +12,7 @@ import type {
 import { KV } from "../state/schema.js";
 import { StateKV } from "../state/kv.js";
 import { toIndexRow, type InsightIndexRow } from "./insight-index.js";
-import { readProjectRelationsIndex, renderRelationsBlock } from "./graph-relations-index.js";
+import { buildFocus, readProjectRelationsIndex, renderRelationsBlock } from "./graph-relations-index.js";
 import { recordAccessBatch } from "./access-tracker.js";
 import { logger } from "../logger.js";
 import {
@@ -88,7 +88,7 @@ export function registerContextFunction(
         );
       }
 
-      const [pinnedSlots, profile, lessons, insights, relationsIndex] = await Promise.all([
+      const [pinnedSlots, profile, lessons, insights, relationsIndex, currentSession, currentObservations] = await Promise.all([
         isSlotsEnabled()
           ? listPinnedSlots(kv).catch(() => [] as MemorySlot[])
           : Promise.resolve([] as MemorySlot[]),
@@ -99,6 +99,12 @@ export function registerContextFunction(
         listInsightRows(kv),
         // One key: the project's typed relations, kept by the persist seam.
         readProjectRelationsIndex(kv, data.project).catch(() => null),
+        // What this session is about: its row (first prompt) and its own
+        // observations so far -- one small scope, empty for a fresh session.
+        kv.get<Session>(KV.sessions, data.sessionId).catch(() => null),
+        kv
+          .list<CompressedObservation>(KV.observations(data.sessionId))
+          .catch(() => [] as CompressedObservation[]),
       ]);
 
       const slotContent = renderPinnedContext(pinnedSlots);
@@ -243,6 +249,8 @@ export function registerContextFunction(
       const relationsContent = renderRelationsBlock(
         relationsIndex?.relations ?? [],
         profile,
+        undefined,
+        buildFocus(currentSession?.firstPrompt, currentObservations),
       );
       if (relationsContent) {
         const updated = Date.parse(relationsIndex?.updatedAt ?? "");

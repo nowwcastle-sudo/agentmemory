@@ -158,23 +158,89 @@ export async function rebuildRelationsIndex(
   });
 }
 
+// Words that name nothing on their own in a prompt or a title.
+const FOCUS_STOP_WORDS = new Set([
+  "the", "and", "for", "with", "from", "into", "that", "this", "what", "when",
+  "where", "which", "does", "then", "than", "them", "they", "their", "there",
+  "some", "such", "only", "also", "been", "were", "will", "would", "should",
+  "could", "about", "just", "like", "make", "made", "take", "used", "using",
+  "have", "here", "your", "please", "want", "need", "help", "code", "file",
+  "files", "bash", "read", "edit", "write", "grep", "glob", "prompt",
+  "assistant", "session", "summary", "user",
+]);
+
+const focusTokens = (text: string): string[] =>
+  text
+    .toLowerCase()
+    .split(/[^\p{L}\p{N}_.\-]+/u)
+    .map((t) => t.replace(/^[.\-_]+|[.\-_]+$/g, ""))
+    .filter((t) => t.length >= 4 && !FOCUS_STOP_WORDS.has(t));
+
 /**
- * The block mem::context injects: relations touching the profile's top
- * concepts or files first, then by weight and evidence, up to `limit`.
+ * What the current session is about, as lower-cased terms: words of its
+ * first prompt, and the file names and title words of its observations so
+ * far. A path contributes its basename, the basename's stem and its last
+ * two segments. Empty for a fresh session, which then falls back to the
+ * profile-based ranking.
+ */
+export function buildFocus(
+  firstPrompt: string | undefined,
+  observations: Array<{ title?: string; files?: string[] }>,
+): Set<string> {
+  const focus = new Set<string>();
+  for (const t of focusTokens(firstPrompt ?? "")) focus.add(t);
+  for (const o of observations) {
+    for (const t of focusTokens(o.title ?? "")) focus.add(t);
+    for (const file of o.files ?? []) {
+      const parts = file.split(/[\\/]+/).filter((p) => p.length > 0);
+      const base = parts[parts.length - 1]?.toLowerCase();
+      if (!base) continue;
+      focus.add(base);
+      focus.add(base.replace(/\.[a-z0-9]+$/i, ""));
+      if (parts.length >= 2) focus.add(parts.slice(-2).join("/").toLowerCase());
+    }
+  }
+  return focus;
+}
+
+const nameTerms = (name: string): string[] => {
+  const lower = name.toLowerCase();
+  const out = new Set<string>([lower]);
+  const parts = lower.split(/[\\/]+/).filter((p) => p.length > 0);
+  if (parts.length > 0) {
+    const base = parts[parts.length - 1];
+    out.add(base);
+    out.add(base.replace(/\.[a-z0-9]+$/i, ""));
+    if (parts.length >= 2) out.add(parts.slice(-2).join("/"));
+  }
+  for (const t of lower.split(/[^\p{L}\p{N}_.\-]+/u)) if (t.length >= 4) out.add(t);
+  return [...out];
+};
+
+/**
+ * The block mem::context injects: relations touching the session's focus
+ * first, then those touching the profile's top concepts or files, then by
+ * weight and evidence, up to `limit`.
  */
 export function renderRelationsBlock(
   relations: RelationRow[],
   profile: ProjectProfile | null,
   limit = RELATIONS_BLOCK_LIMIT,
+  focus: Set<string> = new Set(),
 ): string | null {
   if (relations.length === 0) return null;
   const names = new Set<string>();
   for (const c of profile?.topConcepts ?? []) names.add(c.concept.toLowerCase());
   for (const f of profile?.topFiles ?? []) names.add(f.file.toLowerCase());
-  const touches = (r: RelationRow): number =>
+  const touchesProfile = (r: RelationRow): number =>
     names.has(r.source.toLowerCase()) || names.has(r.target.toLowerCase()) ? 1 : 0;
+  const touchesFocus = (r: RelationRow): number =>
+    focus.size > 0 && [...nameTerms(r.source), ...nameTerms(r.target)].some((t) => focus.has(t)) ? 1 : 0;
   const ranked = [...relations].sort(
-    (a, b) => touches(b) - touches(a) || relationScore(b) - relationScore(a),
+    (a, b) =>
+      touchesFocus(b) - touchesFocus(a) ||
+      touchesProfile(b) - touchesProfile(a) ||
+      relationScore(b) - relationScore(a),
   );
   const items = ranked
     .slice(0, limit)
