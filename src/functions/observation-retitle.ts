@@ -3,7 +3,8 @@ import type { StateKV } from "../state/kv.js";
 import { KV } from "../state/schema.js";
 import type { CompressedObservation, RawObservation, Session } from "../types.js";
 import { buildSyntheticCompression, isBareTitle } from "./compress-synthetic.js";
-import { getSearchIndex, scheduleIndexSave } from "./search.js";
+import { getSearchIndex, getVectorIndex, scheduleIndexSave, vectorIndexAddGuarded } from "./search.js";
+import { observationRetrievalMetadata } from "../state/retrieval-scope.js";
 import { logger } from "../logger.js";
 
 // Rewrite the bare titles the synthetic compressor left behind.
@@ -26,18 +27,26 @@ export interface RetitleOptions {
   /** resume after this session id (exclusive) */
   cursor?: string;
   dryRun?: boolean;
+  /**
+   * Re-embed every synthetic row in the page with its current title and
+   * narrative. The retitle passes re-indexed BM25 only; the vector index
+   * kept the embedding of "old title + narrative". One embedding call per
+   * row, so run it paged and in the background.
+   */
+  reembed?: boolean;
 }
 
 export interface RetitleResult {
   sessions: number;
   scanned: number;
   retitled: number;
+  reembedded: number;
   nextCursor: string | null;
 }
 
 export async function retitleObservations(
   kv: StateKV,
-  { maxSessions = 25, cursor, dryRun = false }: RetitleOptions = {},
+  { maxSessions = 25, cursor, dryRun = false, reembed = false }: RetitleOptions = {},
 ): Promise<RetitleResult> {
   const all = (await kv.list<Session>(KV.sessions))
     .filter((s) => s && typeof s.id === "string")
@@ -45,8 +54,20 @@ export async function retitleObservations(
     .sort();
   const start = cursor ? all.findIndex((id) => id > cursor) : 0;
   const ids = start < 0 ? [] : all.slice(start, start + Math.max(1, maxSessions));
-  const result: RetitleResult = { sessions: 0, scanned: 0, retitled: 0, nextCursor: null };
+  const result: RetitleResult = { sessions: 0, scanned: 0, retitled: 0, reembedded: 0, nextCursor: null };
   const index = getSearchIndex();
+  const reembedRow = async (row: CompressedObservation): Promise<void> => {
+    if (!reembed || dryRun) return;
+    getVectorIndex()?.remove(row.id);
+    const added = await vectorIndexAddGuarded(
+      row.id,
+      row.sessionId,
+      `${row.title} ${row.narrative || ""}`,
+      { kind: "synthetic", logId: row.id },
+      observationRetrievalMetadata(row),
+    );
+    if (added) result.reembedded += 1;
+  };
   for (const sessionId of ids) {
     result.sessions += 1;
     const compressed = await kv.list<CompressedObservation>(KV.observations(sessionId)).catch(() => []);
@@ -61,19 +82,30 @@ export async function retitleObservations(
       if (!raw) continue;
       const fresh = buildSyntheticCompression(raw);
       const bare = isBareTitle(row.title);
-      const changed = (bare && fresh.title !== row.title) || fresh.importance !== row.importance;
-      if (!changed) continue;
+      // A row whose importance the compressor now judges differently (a
+      // harness notice, a compaction request) is re-derived whole.
+      const reclassified = fresh.importance !== row.importance;
+      const changed = (bare && fresh.title !== row.title) || reclassified;
+      if (!changed) {
+        await reembedRow(row);
+        continue;
+      }
       result.retitled += 1;
       if (dryRun) continue;
-      const next: CompressedObservation = { ...row, title: bare ? fresh.title : row.title, importance: fresh.importance };
+      const next: CompressedObservation = {
+        ...row,
+        title: bare || reclassified ? fresh.title : row.title,
+        importance: fresh.importance,
+      };
       await kv.set(KV.observations(sessionId), row.id, next);
       if (index.has(row.id)) {
         index.remove(row.id);
         index.add(next);
       }
+      await reembedRow(next);
     }
   }
-  if (!dryRun && result.retitled > 0) scheduleIndexSave();
+  if (!dryRun && (result.retitled > 0 || result.reembedded > 0)) scheduleIndexSave();
   const last = ids[ids.length - 1];
   result.nextCursor = last !== undefined && start + ids.length < all.length ? last : null;
   logger.info("Observation retitle pass", { ...result, dryRun });

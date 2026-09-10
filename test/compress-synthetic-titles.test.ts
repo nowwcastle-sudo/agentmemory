@@ -102,6 +102,21 @@ describe("the harness compaction prompt", () => {
   });
 });
 
+describe("harness notices captured as prompts", () => {
+  // This session: 220 of 2,656 observations titled "Prompt: <task-notification>".
+  const notice = '<task-notification>\n<task-id>b7kcb7r2o</task-id>\n<summary>Monitor event: "supervisor log" fired</summary>\n</task-notification>';
+  const reminder = "[SYSTEM NOTIFICATION - NOT USER INPUT]\nThis is an automated background-task event.";
+
+  it("titles a task notification by its summary and a system notice by its first line, at low importance", () => {
+    const a = buildSyntheticCompression(raw({ hookType: "prompt_submit", userPrompt: notice }));
+    expect(a.title).toBe('Harness notice: Monitor event: "supervisor log" fired');
+    expect(a.importance).toBe(1);
+    const b = buildSyntheticCompression(raw({ hookType: "prompt_submit", userPrompt: reminder }));
+    expect(b.title).toBe("Harness notice: [SYSTEM NOTIFICATION - NOT USER INPUT]");
+    expect(b.importance).toBe(1);
+  });
+});
+
 describe("buildSyntheticCompression", () => {
   it("uses the synthesised title and keeps a real user prompt at normal importance", () => {
     const compressed = buildSyntheticCompression(raw({ toolName: "Bash", toolInput: { command: "git log --oneline -3" } }));

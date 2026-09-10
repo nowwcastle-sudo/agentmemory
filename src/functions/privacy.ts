@@ -5,9 +5,12 @@ const PRIVATE_TAG_RE = /<private>[\s\S]*?<\/private>/gi;
 const SECRET_PATTERN_SOURCES = [
   /(?:api[_-]?key|secret|token|password|credential|auth)[\s]*[=:]\s*["']?[A-Za-z0-9_\-/.+]{20,}["']?/gi,
   /Bearer\s+[A-Za-z0-9._\-+/=]{20,}/gi,
-  /sk-proj-[A-Za-z0-9\-_]{20,}/g,
-  /(?:sk|pk|rk|ak)-[A-Za-z0-9][A-Za-z0-9\-_]{19,}/g,
-  /sk-ant-[A-Za-z0-9\-_]{20,}/g,
+  // A key prefix only counts at the start of a token: "task-1-report-...",
+  // "mask-...", "desk-..." carry "sk-" mid-word and were redacted inside
+  // file paths on the live graph (2026-09-11).
+  /(?<![A-Za-z0-9])sk-proj-[A-Za-z0-9\-_]{20,}/g,
+  /(?<![A-Za-z0-9])(?:sk|pk|rk|ak)-[A-Za-z0-9][A-Za-z0-9\-_]{19,}/g,
+  /(?<![A-Za-z0-9])sk-ant-[A-Za-z0-9\-_]{20,}/g,
   /gh[pus]_[A-Za-z0-9]{36,}/g,
   /github_pat_[A-Za-z0-9_]{22,}/g,
   /xoxb-[A-Za-z0-9\-]+/g,

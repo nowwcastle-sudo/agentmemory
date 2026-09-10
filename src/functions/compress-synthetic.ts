@@ -145,6 +145,20 @@ export function isBareTitle(title: string | undefined): boolean {
   return colon > 0 && HOOK_NAMES.has(lower.slice(0, colon).trim());
 }
 
+/**
+ * Task notifications, system notices and CI events reach the prompt hook as
+ * if the user had typed them (this session: 220 of 2,656 observations).
+ */
+export function isHarnessNotice(text: string): boolean {
+  return /^\s*(<task-notification>|\[SYSTEM NOTIFICATION|<system-reminder>|<ci-monitor-event>)/i.test(text);
+}
+
+function harnessNoticeTitle(text: string): string {
+  const summary = /<summary>([\s\S]*?)<\/summary>/i.exec(text)?.[1];
+  const line = summary ? oneLine(summary) : firstLine(text);
+  return finishTitle(`Harness notice: ${line}`);
+}
+
 /** The harness asks for a compaction summary through the same prompt hook. */
 export function isCompactionPrompt(text: string): boolean {
   const head = text.trim().slice(0, 400);
@@ -163,6 +177,7 @@ export function synthesizeTitle(raw: RawObservation): string {
   if (raw.hookType === "prompt_submit") {
     const prompt = raw.userPrompt ?? str(data["prompt"]) ?? "";
     if (isCompactionPrompt(prompt)) return "Auto-compact summary request";
+    if (isHarnessNotice(prompt)) return harnessNoticeTitle(prompt);
     const line = firstLine(prompt).replace(/^[#>\-*\s]+/, "");
     return line ? finishTitle(`Prompt: ${line}`) : "Prompt";
   }
@@ -258,7 +273,8 @@ export function buildSyntheticCompression(
     files: extractFiles(raw.toolInput),
     // The harness's own compaction request is not the user's work: keep it
     // out of every "important observations" cut.
-    importance: raw.hookType === "prompt_submit" && isCompactionPrompt(promptStr) ? 1 : 5,
+    importance:
+      raw.hookType === "prompt_submit" && (isCompactionPrompt(promptStr) || isHarnessNotice(promptStr)) ? 1 : 5,
     confidence: 0.3,
   };
   if (raw.modality) result.modality = raw.modality;

@@ -50,6 +50,18 @@ describe("stripPrivateData", () => {
     ).toBe("[REDACTED_SECRET]");
   });
 
+  // Live graph 2026-09-11: a file node named "...\ta[REDACTED_SECRET].md" --
+  // "task-1-report-20260907-1234567890.md" lost its tail because "sk-" inside
+  // "task-" matched the key pattern with no word boundary in front of it.
+  it("leaves words that merely contain a key prefix alone", () => {
+    const path = "records/task-1-report-20260907-1234567890abcdef.md";
+    expect(stripPrivateData(path)).toBe(path);
+    expect(stripPrivateData("mask-2026-09-11-abcdefghijklmnopqrstuv")).toBe("mask-2026-09-11-abcdefghijklmnopqrstuv");
+    expect(stripPrivateData("desk-ABCDEFGHIJKLMNOPQRSTUVWXYZ")).toBe("desk-ABCDEFGHIJKLMNOPQRSTUVWXYZ");
+    expect(stripPrivateData("key sk-ABCDEFGHIJKLMNOPQRSTUVWXYZ end")).toBe("key [REDACTED_SECRET] end");
+    expect(stripPrivateData("(sk-ABCDEFGHIJKLMNOPQRSTUVWXYZ)")).toBe("([REDACTED_SECRET])");
+  });
+
   it("strips sk- prefixed keys", () => {
     expect(stripPrivateData("sk-1234567890abcdefghijklmnopqr")).toBe(
       "[REDACTED_SECRET]",

@@ -62,6 +62,20 @@ describe("retitleObservations", () => {
     expect(hits).toContain("o1");
   });
 
+  it("re-derives a row the compressor now classifies as a harness notice, title included", async () => {
+    const kv = mockKV();
+    await kv.set(KV.sessions, "s1", session("s1"));
+    const notice = '<task-notification>\n<task-id>x</task-id>\n<summary>Monitor event: "supervisor log" fired</summary>\n</task-notification>';
+    await kv.set(KV.rawObservations("s1"), "o1", raw("o1", "s1", { hookType: "prompt_submit", userPrompt: notice }));
+    // Already retitled once by the first pass: descriptive-looking, but noise.
+    await kv.set(KV.observations("s1"), "o1", compressed("o1", "s1", "Prompt: <task-notification>", { type: "conversation" }));
+    const result = await retitleObservations(kv as never, { maxSessions: 10 });
+    expect(result.retitled).toBe(1);
+    const row = (await kv.get<CompressedObservation>(KV.observations("s1"), "o1"))!;
+    expect(row.title).toBe('Harness notice: Monitor event: "supervisor log" fired');
+    expect(row.importance).toBe(1);
+  });
+
   it("pages through sessions by cursor and stops when there are none left", async () => {
     const kv = mockKV();
     for (const sid of ["s1", "s2", "s3"]) {
@@ -73,6 +87,16 @@ describe("retitleObservations", () => {
     expect(first).toMatchObject({ sessions: 2, retitled: 2, nextCursor: "s2" });
     const second = await retitleObservations(kv as never, { maxSessions: 2, cursor: first.nextCursor! });
     expect(second).toMatchObject({ sessions: 1, retitled: 1, nextCursor: null });
+  });
+
+  it("accepts a re-embed request and reports what it re-embedded (nothing without a vector provider)", async () => {
+    const kv = mockKV();
+    await kv.set(KV.sessions, "s1", session("s1"));
+    await kv.set(KV.rawObservations("s1"), "o1", raw("o1", "s1", { toolName: "Bash", toolInput: { command: "ls" } }));
+    await kv.set(KV.observations("s1"), "o1", compressed("o1", "s1", "Bash: ls"));
+    const result = await retitleObservations(kv as never, { maxSessions: 10, reembed: true });
+    expect(result).toMatchObject({ scanned: 1, retitled: 0, reembedded: 0 });
+    expect((await kv.get<CompressedObservation>(KV.observations("s1"), "o1"))!.title).toBe("Bash: ls");
   });
 
   it("counts without writing in a dry run", async () => {
