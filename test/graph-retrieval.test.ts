@@ -341,8 +341,11 @@ describe("GraphRetrieval multi start-node characterisation", () => {
     expect(byObs.get("obs_a")!.pathLength).toBe(0);
     expect(byObs.get("obs_a")!.graphContext).toBe("[concept] Auth");
 
-    // The shared node is reached from n1 over the strongest edge (0.9).
-    expect(byObs.get("obs_shared")!.score).toBeCloseTo(0.45, 10);
+    // The shared node is reached from n1 over the strongest edge (0.9), and as
+    // the destination of a degree-3 node it takes the hub discount itself
+    // (2026-09-11: the destination stopped being exempt, because what gets
+    // scored is its observations and a hub hands out hundreds of them).
+    expect(byObs.get("obs_shared")!.score).toBeCloseTo(0.45 / (1 + Math.log(3)), 10);
     expect(byObs.get("obs_shared")!.pathLength).toBe(2);
 
     // n2 and n3 never reach their own self-scoring pass: n1's traversal got

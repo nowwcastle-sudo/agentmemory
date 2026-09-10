@@ -126,15 +126,20 @@ export class HybridSearch {
       }
     }
 
-    const entities =
-      entityHints && entityHints.length > 0
-        ? entityHints
-        : extractEntitiesFromQuery(query);
-    let graphResults: GraphRetrievalResult[] = [];
     // A zero weight multiplies the leg's contribution away, so running it only
     // buys full enumerations of the graph scopes for a result that cannot move
     // any ranking. Skip the traversal itself rather than its score.
     const graphLegEnabled = this.graphWeight > 0;
+    const hinted = Boolean(entityHints && entityHints.length > 0);
+    let entities = hinted ? entityHints! : extractEntitiesFromQuery(query);
+    if (graphLegEnabled && !hinted) {
+      // Lowercase queries name nodes too; the live graph says which.
+      const named = await this.graphRetrieval
+        .matchEntityNames(query)
+        .catch(() => [] as string[]);
+      entities = [...new Set([...entities, ...named])];
+    }
+    let graphResults: GraphRetrievalResult[] = [];
     if (graphLegEnabled && entities.length > 0) {
       try {
         graphResults = await this.graphRetrieval.searchByEntities(

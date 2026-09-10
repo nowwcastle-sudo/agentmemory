@@ -97,7 +97,7 @@ describe("HybridSearch graph-leg gate instrumentation", () => {
     expect(seen).toEqual([{ entities: true, vectorHits: true }]);
   });
 
-  it("reports the entity gate closed for an all-lowercase query", async () => {
+  it("opens the entity gate for a lowercase query that names a graph node", async () => {
     const bm25 = new SearchIndex();
     bm25.add(observation);
     const { vector, embedding } = withVector();
@@ -116,6 +116,29 @@ describe("HybridSearch graph-leg gate instrumentation", () => {
     );
 
     await search.search("auth middleware", 10);
+
+    expect(seen).toEqual([{ entities: true, vectorHits: true }]);
+  });
+
+  it("keeps the entity gate closed for a lowercase query that names no node", async () => {
+    const bm25 = new SearchIndex();
+    bm25.add(observation);
+    const { vector, embedding } = withVector();
+    const seen: Array<{ entities: boolean; vectorHits: boolean }> = [];
+
+    const search = new HybridSearch(
+      bm25,
+      vector,
+      embedding,
+      kvWith([node("n1", "Auth")], []) as never,
+      0.4,
+      0.6,
+      0.3,
+      false,
+      (entities, vectorHits) => seen.push({ entities, vectorHits }),
+    );
+
+    await search.search("qqq middleware", 10);
 
     expect(seen).toEqual([{ entities: false, vectorHits: true }]);
   });
@@ -137,7 +160,7 @@ describe("HybridSearch graph-leg gate instrumentation", () => {
       (entities, vectorHits) => seen.push({ entities, vectorHits }),
     );
 
-    await search.search("auth middleware", 10);
+    await search.search("qqq middleware", 10);
 
     expect(seen).toEqual([{ entities: false, vectorHits: false }]);
   });

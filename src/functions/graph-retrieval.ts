@@ -1,12 +1,15 @@
 import type {
   GraphNode,
   GraphEdge,
+  GraphSnapshot,
   GraphSourceLocator,
   RetrievalScope,
 } from "../types.js";
 import { KV } from "../state/schema.js";
 import type { StateKV } from "../state/kv.js";
 import { onKvWrite, type KvWriteEvent } from "../state/kv-write-hooks.js";
+import { belongsToCurrentGeneration, SNAPSHOT_KEY } from "./graph-generation.js";
+import { logger } from "../logger.js";
 import {
   locatorRetrievalMetadata,
   matchesRetrievalScope,
@@ -64,16 +67,19 @@ function edgeMatchesScope(edge: GraphEdge, scope?: RetrievalScope): boolean {
  *
  * A hop through a degree-2 node is evidence; a hop through a degree-400 node is
  * barely more than "these both exist in this corpus". Discounting by the log of
- * the degree says so without eliminating the hub route -- graph IDF. Endpoints
- * are exempt: the start node is what the query matched, and the destination is
- * the answer being scored, not a route through anything.
+ * the degree says so without eliminating the hub route -- graph IDF. The start
+ * node is exempt: it is what the query matched. The destination is not: what
+ * gets scored is its observations, and a degree-400 tool-name node hands out
+ * hundreds of them with no topical meaning (the 2026-09-09 A/B named `Bash`
+ * and `apply_patch`), so at depth 1 -- where there is no interior at all --
+ * the destination's degree is the only signal there is.
  */
 function hubDiscount(
   path: Array<{ node: GraphNode; edge?: GraphEdge }>,
   adjacency: Map<string, Array<{ neighborId: string; edge: GraphEdge }>>,
 ): number {
   let discount = 1;
-  for (const step of path.slice(1, -1)) {
+  for (const step of path.slice(1)) {
     const degree = Math.max(1, adjacency.get(step.node.id)?.length ?? 1);
     discount /= 1 + Math.log(degree);
   }
@@ -129,8 +135,47 @@ type TraversalIndex = {
 interface LiveGraphCache {
   nodes: Map<string, GraphNode>;
   edges: Map<string, GraphEdge>;
+  /** lower-cased node name -> node ids, for matching query words to nodes */
+  names: Map<string, Set<string>>;
+  /** the graph snapshot: its generation decides which rows are alive */
+  snapshot: GraphSnapshot | null;
   loadedAt: number;
 }
+
+const nameKey = (name: string | undefined): string => (name ?? "").trim().toLowerCase();
+
+function indexName(names: Map<string, Set<string>>, node: GraphNode): void {
+  const key = nameKey(node.name);
+  if (!key) return;
+  let ids = names.get(key);
+  if (!ids) {
+    ids = new Set();
+    names.set(key, ids);
+  }
+  ids.add(node.id);
+}
+
+function unindexName(names: Map<string, Set<string>>, node: GraphNode): void {
+  const key = nameKey(node.name);
+  const ids = names.get(key);
+  if (!ids) return;
+  ids.delete(node.id);
+  if (ids.size === 0) names.delete(key);
+}
+
+// Words that name nothing on their own. Kept short: a longer list starts
+// eating real node names ("state", "index").
+const QUERY_STOP_WORDS = new Set([
+  "the", "and", "for", "are", "but", "not", "you", "all", "any", "can", "had",
+  "has", "have", "her", "his", "him", "was", "were", "one", "our", "out", "get",
+  "how", "why", "who", "what", "when", "where", "which", "does", "did", "doing",
+  "this", "that", "these", "those", "with", "from", "into", "than", "then",
+  "them", "they", "their", "there", "some", "such", "only", "also", "been",
+  "over", "under", "after", "before", "between", "each", "more", "most",
+  "other", "same", "very", "just", "like", "use", "used", "using", "about",
+  "will", "would", "should", "could", "may", "might", "its", "let", "new",
+  "now", "old", "see", "too", "two", "way", "yes",
+]);
 
 function graphCacheTtlFromEnv(): number {
   const raw = process.env["AGENTMEMORY_GRAPH_CACHE_TTL_MS"];
@@ -162,11 +207,49 @@ export class GraphRetrieval {
     this.cache = null;
   }
 
+  /**
+   * Node names the query says outright, matched case-insensitively against
+   * the live graph: single words and two-word phrases of three characters or
+   * more, minus stop words. extractEntitiesFromQuery only sees quoted or
+   * Capitalised tokens, and the queries people type are lowercase, so without
+   * this the entity leg never opened on the real corpus (2026-09-09 A/B).
+   */
+  async matchEntityNames(query: string, cap = 5): Promise<string[]> {
+    const cache = await this.ensureCache();
+    const words = query
+      .toLowerCase()
+      .split(/[^\p{L}\p{N}_.\-]+/u)
+      .filter((word) => word.length >= 3 && !QUERY_STOP_WORDS.has(word));
+    const candidates: string[] = [];
+    for (let i = 0; i < words.length; i += 1) {
+      if (i + 1 < words.length) candidates.push(`${words[i]} ${words[i + 1]}`);
+      candidates.push(words[i]);
+    }
+    const found: string[] = [];
+    const seen = new Set<string>();
+    for (const candidate of candidates) {
+      if (seen.has(candidate)) continue;
+      const ids = cache.names.get(candidate);
+      if (!ids) continue;
+      for (const id of ids) {
+        const node = cache.nodes.get(id);
+        if (!node || node.stale || !belongsToCurrentGeneration(node, cache.snapshot)) continue;
+        seen.add(candidate);
+        found.push(node.name);
+        break;
+      }
+      if (found.length >= cap) break;
+    }
+    return found;
+  }
+
   private async liveGraph(): Promise<{ nodes: GraphNode[]; edges: GraphEdge[] }> {
     const cache = await this.ensureCache();
+    const alive = (row: GraphNode | GraphEdge): boolean =>
+      !row.stale && belongsToCurrentGeneration(row, cache.snapshot);
     return {
-      nodes: Array.from(cache.nodes.values()).filter((node) => !node.stale),
-      edges: Array.from(cache.edges.values()).filter((edge) => !edge.stale),
+      nodes: Array.from(cache.nodes.values()).filter(alive),
+      edges: Array.from(cache.edges.values()).filter(alive),
     };
   }
 
@@ -181,12 +264,34 @@ export class GraphRetrieval {
       this.pendingWrites = [];
       // Sequential on purpose: two 60-80 MB messages in flight at once is a
       // larger peak in the engine than one after the other.
+      const snapshot = await this.kv
+        .get<GraphSnapshot>(KV.graphSnapshot, SNAPSHOT_KEY)
+        .catch(() => null);
       const nodes = await this.kv.list<GraphNode>(KV.graphNodes);
       const edges = await this.kv.list<GraphEdge>(KV.graphEdges);
-      const cache: LiveGraphCache = { nodes: new Map(), edges: new Map(), loadedAt: this.now() };
-      for (const node of nodes) if (hasId(node)) cache.nodes.set(node.id, node);
+      const cache: LiveGraphCache = {
+        nodes: new Map(),
+        edges: new Map(),
+        names: new Map(),
+        snapshot,
+        loadedAt: this.now(),
+      };
+      for (const node of nodes) {
+        if (!hasId(node)) continue;
+        cache.nodes.set(node.id, node);
+        indexName(cache.names, node);
+      }
       for (const edge of edges) if (hasId(edge)) cache.edges.set(edge.id, edge);
       this.cache = cache;
+      const alive = (row: GraphNode | GraphEdge) => !row.stale && belongsToCurrentGeneration(row, snapshot);
+      logger.info("Graph retrieval cache loaded", {
+        nodes: cache.nodes.size,
+        edges: cache.edges.size,
+        liveNodes: nodes.filter(alive).length,
+        liveEdges: edges.filter(alive).length,
+        generation: snapshot?.graphGeneration ?? null,
+        resetAt: snapshot?.resetAt ?? null,
+      });
       const replay = this.pendingWrites;
       this.pendingWrites = null;
       for (const event of replay) this.applyWrite(event);
@@ -198,20 +303,47 @@ export class GraphRetrieval {
   }
 
   private applyWrite(event: KvWriteEvent): void {
-    if (event.scope !== KV.graphNodes && event.scope !== KV.graphEdges) return;
+    const isSnapshot = event.scope === KV.graphSnapshot && event.key === SNAPSHOT_KEY;
+    if (!isSnapshot && event.scope !== KV.graphNodes && event.scope !== KV.graphEdges) return;
     if (this.pendingWrites) {
       this.pendingWrites.push(event);
       return;
     }
     if (!this.cache) return;
-    const map: Map<string, unknown> =
-      event.scope === KV.graphNodes ? this.cache.nodes : this.cache.edges;
+    if (isSnapshot) {
+      // A reset or a persist wrote the snapshot; its generation decides what
+      // is alive. Without the row back there is nothing to decide from.
+      if (event.op === "delete") {
+        this.cache.snapshot = null;
+      } else if (event.value && typeof event.value === "object") {
+        this.cache.snapshot = event.value as GraphSnapshot;
+      } else {
+        this.cache = null;
+      }
+      return;
+    }
+    if (event.scope === KV.graphNodes) {
+      const previous = this.cache.nodes.get(event.key);
+      if (previous) unindexName(this.cache.names, previous);
+      if (event.op === "delete") {
+        this.cache.nodes.delete(event.key);
+        return;
+      }
+      if (hasId(event.value)) {
+        const node = event.value as GraphNode;
+        this.cache.nodes.set(event.key, node);
+        indexName(this.cache.names, node);
+        return;
+      }
+      this.cache = null;
+      return;
+    }
     if (event.op === "delete") {
-      map.delete(event.key);
+      this.cache.edges.delete(event.key);
       return;
     }
     if (hasId(event.value)) {
-      map.set(event.key, event.value);
+      this.cache.edges.set(event.key, event.value as GraphEdge);
       return;
     }
     // A partial update without the merged row: the row is unknown now, so

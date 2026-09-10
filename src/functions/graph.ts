@@ -64,7 +64,7 @@ const MAX_GRAPH_QUERY_LIMIT = 5000;
 // enumeration. Aggregate stats (nodesByType / edgesByType) are computed
 // fresh during rebuild and stored alongside.
 const SNAPSHOT_TOP_NODES = DEFAULT_GRAPH_QUERY_LIMIT;
-const SNAPSHOT_KEY = "current";
+import { SNAPSHOT_KEY, belongsToCurrentGeneration } from "./graph-generation.js";
 
 // `state::list` over a 75K-node scope can exceed the iii invocation
 // timeout. The query handler races the enumeration against this budget
@@ -107,18 +107,6 @@ function emptySnapshot(): GraphSnapshot {
     updatedAt: new Date(0).toISOString(),
     dirty: true,
   };
-}
-
-function belongsToCurrentGeneration(
-  record: GraphNode | GraphEdge,
-  snapshot: GraphSnapshot | null,
-): boolean {
-  if (!snapshot) return true;
-  if (snapshot.graphGeneration) {
-    return record.graphGeneration === snapshot.graphGeneration;
-  }
-  if (snapshot.resetAt) return record.createdAt >= snapshot.resetAt;
-  return true;
 }
 
 /**
