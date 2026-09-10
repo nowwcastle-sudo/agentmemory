@@ -17,6 +17,7 @@ import {
   type GraphRetrievalResult,
 } from "../functions/graph-retrieval.js";
 import { extractEntitiesFromQuery } from "../functions/query-expansion.js";
+import { isBareTitle } from "../functions/compress-synthetic.js";
 import { rerank } from "./reranker.js";
 
 const RRF_K = 60;
@@ -294,7 +295,9 @@ export class HybridSearch {
     const retrievalDepth = Math.max(limit, 20);
     const rerankWindow = 20;
     const diversified = this.diversifyBySession(combined, retrievalDepth);
-    const enriched = await this.enrichResults(diversified, retrievalDepth);
+    const enriched = this.demoteBareTitles(
+      await this.enrichResults(diversified, retrievalDepth),
+    );
 
     if (this.rerankEnabled && enriched.length > 1) {
       try {
@@ -308,6 +311,22 @@ export class HybridSearch {
     }
 
     return enriched.slice(0, limit);
+  }
+
+  /**
+   * A bare tool-name title ("Bash", "Read") says nothing to the caller: rank
+   * such a row below a descriptive one that scored the same. The safety net
+   * under the 2026-09-11 retitle pass; sort is stable, so ties keep order.
+   */
+  private demoteBareTitles(results: HybridSearchResult[]): HybridSearchResult[] {
+    const BARE_TITLE_FACTOR = 0.7;
+    return results
+      .map((r) =>
+        isBareTitle(r.observation?.title)
+          ? { ...r, combinedScore: r.combinedScore * BARE_TITLE_FACTOR }
+          : r,
+      )
+      .sort((a, b) => b.combinedScore - a.combinedScore);
   }
 
   private diversifyBySession(

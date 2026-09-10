@@ -63,6 +63,7 @@ import { registerGraphFunction } from "./functions/graph.js";
 import { registerGraphTypeBackfill } from "./functions/graph-type-backfill.js";
 import { registerRelationsIndexFunction } from "./functions/graph-relations-index.js";
 import { registerGraphStatsRecount } from "./functions/graph-stats-recount.js";
+import { registerObservationRetitle } from "./functions/observation-retitle.js";
 import { configuredRecoveryIntervalMs } from "./functions/observation-projection.js";
 import { registerGraphSourceProjectionFunction } from "./functions/graph-source-projection.js";
 import { ProjectionCoordinator } from "./functions/projection-coordinator.js";
@@ -306,6 +307,7 @@ async function main() {
   registerGraphTypeBackfill(sdk, kv, provider);
   registerRelationsIndexFunction(sdk, kv);
   registerGraphStatsRecount(sdk, kv);
+  registerObservationRetitle(sdk, kv);
   const projectGraphSourcesCore = registerGraphSourceProjectionFunction(
     sdk,
     kv,
@@ -644,7 +646,7 @@ async function main() {
     `Ready. ${embeddingProvider ? "Triple-stream (BM25+Vector+Graph)" : "BM25+Graph"} search active.`,
   );
   bootLog(
-    `REST API: 138 endpoints at http://localhost:${config.restPort}/agentmemory/*`,
+    `REST API: 139 endpoints at http://localhost:${config.restPort}/agentmemory/*`,
   );
   bootLog(
     `MCP surface (opt-in via \`npx @agentmemory/mcp\`): ${getAllTools().length} tools · 6 resources · 3 prompts`,

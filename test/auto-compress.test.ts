@@ -112,7 +112,8 @@ describe("mem::observe auto-compress gate (#138)", () => {
       confidence: number;
     };
     expect(obs.type).toBe("file_read");
-    expect(obs.title).toBe("Read");
+    // Since 2026-09-11 the synthetic title says what the tool did.
+    expect(obs.title).toBe("Read src/foo.ts");
     expect(obs.files).toContain("src/foo.ts");
     expect(obs.confidence).toBe(0.3);
   });
