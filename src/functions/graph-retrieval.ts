@@ -284,11 +284,20 @@ export class GraphRetrieval {
       for (const edge of edges) if (hasId(edge)) cache.edges.set(edge.id, edge);
       this.cache = cache;
       const alive = (row: GraphNode | GraphEdge) => !row.stale && belongsToCurrentGeneration(row, snapshot);
+      // The counts the snapshot's stats disagree with on the live store; each
+      // flag is a candidate explanation, so they are logged side by side.
       logger.info("Graph retrieval cache loaded", {
         nodes: cache.nodes.size,
         edges: cache.edges.size,
         liveNodes: nodes.filter(alive).length,
         liveEdges: edges.filter(alive).length,
+        staleNodes: nodes.filter((n) => n.stale).length,
+        staleEdges: edges.filter((e) => e.stale).length,
+        supersededEdges: edges.filter((e) => e.isLatest === false).length,
+        endedEdges: edges.filter((e) => Boolean(e.tvalidEnd)).length,
+        nodesWithGeneration: nodes.filter((n) => Boolean(n.graphGeneration)).length,
+        edgesWithGeneration: edges.filter((e) => Boolean(e.graphGeneration)).length,
+        snapshotTotals: snapshot ? { nodes: snapshot.stats.totalNodes, edges: snapshot.stats.totalEdges } : null,
         generation: snapshot?.graphGeneration ?? null,
         resetAt: snapshot?.resetAt ?? null,
       });
