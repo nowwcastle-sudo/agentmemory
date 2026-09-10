@@ -524,7 +524,7 @@ function paginate(
 // <relationship>) and silently dropped nodes/edges when the upstream
 // LLM emitted attributes in a different order — Codex in particular
 // likes to lead with `name=` (#635).
-function parseAttrs(raw: string): Record<string, string> {
+export function parseAttrs(raw: string): Record<string, string> {
   const attrs: Record<string, string> = {};
   const attrRegex = /([A-Za-z_][\w:-]*)="([^"]*)"/g;
   let m;

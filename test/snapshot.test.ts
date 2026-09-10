@@ -795,6 +795,20 @@ describe("Snapshot Functions", () => {
     expect(audits.length).toBe(1);
   });
 
+  it("POST /agentmemory/graph/type-backfill passes the body through to mem::graph-type-backfill", async () => {
+    const backfill = vi.fn().mockResolvedValue({ success: true, candidates: 3, asked: 3, typed: 2 });
+    sdk.registerFunction("mem::graph-type-backfill", backfill);
+    registerApiTriggers(sdk as never, kv as never);
+
+    const res = (await sdk.trigger("api::graph-type-backfill", {
+      body: { minBacking: 5, batchSize: 3, skipEdgeIds: ["e_done"] },
+      headers: {},
+    })) as { status_code: number; body: unknown };
+    expect(res.status_code).toBe(200);
+    expect(res.body).toEqual({ success: true, candidates: 3, asked: 3, typed: 2 });
+    expect(backfill).toHaveBeenCalledWith({ minBacking: 5, batchSize: 3, skipEdgeIds: ["e_done"] });
+  });
+
   it("POST /agentmemory/insight-index/rebuild triggers mem::insight-index-rebuild", async () => {
     const rebuild = vi.fn().mockResolvedValue({ success: true, rows: 3 });
     sdk.registerFunction("mem::insight-index-rebuild", rebuild);

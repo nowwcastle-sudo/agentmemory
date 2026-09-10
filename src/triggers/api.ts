@@ -1851,6 +1851,27 @@ export function registerApiTriggers(
     config: { api_path: "/agentmemory/insight-index/rebuild", http_method: "POST" },
   });
 
+  // Evidence-backed typing of related_to edges: one batch per call, so a
+  // resumable driver can pace it against a slow provider. Body is passed
+  // through as the function payload (minBacking, batchSize, maxBatches,
+  // skipEdgeIds, dryRun).
+  sdk.registerFunction("api::graph-type-backfill",
+    async (req: ApiRequest<Record<string, unknown>>): Promise<Response> => {
+      const authErr = checkAuth(req, secret);
+      if (authErr) return authErr;
+      const result = await sdk.trigger({
+        function_id: "mem::graph-type-backfill",
+        payload: req.body ?? {},
+      });
+      return { status_code: 200, body: result };
+    },
+  );
+  sdk.registerTrigger({
+    type: "http",
+    function_id: "api::graph-type-backfill",
+    config: { api_path: "/agentmemory/graph/type-backfill", http_method: "POST" },
+  });
+
   // #814 v2: clean-restart endpoint for legacy corpora too large for
   // safe rebuild. Wipes graph state without touching observations, so
   // recall + history stay intact while the graph rebuilds incrementally
