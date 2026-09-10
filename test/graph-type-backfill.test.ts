@@ -102,6 +102,16 @@ describe("selectTypingCandidates", () => {
     expect(picked.map((c) => c.edge.id)).toEqual(["e_ok"]);
   });
 
+  it("skips directory nodes: a path whose last segment has no extension", () => {
+    const dir = node("n_dir", "file", "C:\\Users\\x\\hermes-agent\\.worktrees\\discord-cs-quiz-core");
+    const edges = [
+      edge("e_dir", "related_to", "n_c", "n_dir", ["o1", "o2"]),
+      edge("e_ok", "related_to", "n_c", "n_f", ["o1", "o2"]),
+    ];
+    const picked = selectTypingCandidates([concept, file, dir], edges, { minBacking: 2 });
+    expect(picked.map((c) => c.edge.id)).toEqual(["e_ok"]);
+  });
+
   it("skips file nodes that have neither a path nor an extension", () => {
     const junk = node("n_junk", "file", "memory");
     const bare = node("n_bare", "file", "README");
@@ -287,8 +297,84 @@ describe("mem::graph-type-backfill", () => {
     const typed = edges.find((e) => e.type === "implements");
     const old = edges.find((e) => e.id === "e_rel");
     expect(typed).toMatchObject({ sourceNodeId: "n_c", targetNodeId: "n_f", weight: 0.85, sourceObservationIds: ["o1", "o2", "o3"] });
+    // The edge carries what the model was shown, so a reader can judge it later.
+    expect(typed!.context?.evidence?.[0]).toContain("Implement retry policy in src/retry.ts");
     expect(old).toMatchObject({ stale: true, isLatest: false, supersededBy: typed!.id });
     expect(await kv.get(KV.graphEdgeHistory, "e_rel")).toMatchObject({ supersededBy: typed!.id });
+  });
+
+  it("explains, in a dry run, why each candidate's evidence passes or fails the gate, asking nothing", async () => {
+    const kv = mockKV();
+    const sdk = mockSdk();
+    for (const n of [concept, file]) await kv.set(KV.graphNodes, n.id, n);
+    const rel = edge("e_rel", "related_to", "n_c", "n_f", ["o1", "o2", "o3"], {
+      sourceRefs: [
+        { sourceKind: "observation", sourceId: "o1", sessionId: "ses_1" },
+        { sourceKind: "observation", sourceId: "o2", sessionId: "ses_1" },
+        { sourceKind: "observation", sourceId: "o3", sessionId: "ses_1" },
+      ] as GraphEdge["sourceRefs"],
+    });
+    await kv.set(KV.graphEdges, rel.id, rel);
+    await kv.set(KV.observations("ses_1"), "o1", obs("o1", "Implement retry policy in src/retry.ts"));
+    const list = obs("o2", "Updated notes");
+    list.narrative = "files: src/retry.ts, src/a.ts, src/b.ts, src/c.ts, docs/d.md; retry policy noted";
+    await kv.set(KV.observations("ses_1"), "o2", list);
+    const noVerb = obs("o3", "retry policy src/retry.ts");
+    noVerb.narrative = "retry policy src/retry.ts";
+    await kv.set(KV.observations("ses_1"), "o3", noVerb);
+
+    const provider = { name: "test", compress: vi.fn(), summarize: vi.fn() };
+    registerGraphTypeBackfill(sdk as never, kv as never, provider as never);
+
+    const result = (await sdk.trigger("mem::graph-type-backfill", { minBacking: 2, dryRun: true, explain: true })) as {
+      asked: number; explained: Array<Record<string, unknown>>;
+    };
+
+    expect(provider.compress).not.toHaveBeenCalled();
+    expect(result.asked).toBe(0);
+    expect(result.explained).toHaveLength(1);
+    expect(result.explained[0]).toMatchObject({
+      edgeId: "e_rel", concept: "retry policy", file: "src/retry.ts", backing: 3,
+      // o1 states the relation; o2 names both with a verb ("Updated") but lists
+      // five files; o3 names both and has no verb at all.
+      read: 3, withFile: 3, listShaped: 1, withConcept: 3, withVerb: 2, gated: 1,
+    });
+    expect((await kv.list<GraphEdge>(KV.graphEdges)).map((e) => e.type)).toEqual(["related_to"]);
+  });
+
+  // Live store 2026-09-11 02:36: the top-100 candidates carry 100-298 backing
+  // observation ids each, but only 1-7 sourceRefs, and evidence was read
+  // through the refs alone -- so the gate saw two observations out of two
+  // hundred and passed nothing. The projection row of an observation knows its
+  // session, so ids without a ref are resolvable too.
+  it("reads evidence for backing observation ids that have no sourceRef, through their projection rows", async () => {
+    const kv = mockKV();
+    const sdk = mockSdk();
+    for (const n of [concept, file]) await kv.set(KV.graphNodes, n.id, n);
+    const rel = edge("e_rel", "related_to", "n_c", "n_f", ["o1", "o2", "o3"], {
+      sourceRefs: [{ sourceKind: "observation", sourceId: "o1", sessionId: "ses_1" }] as GraphEdge["sourceRefs"],
+    });
+    await kv.set(KV.graphEdges, rel.id, rel);
+    await kv.set(KV.observations("ses_1"), "o1", obs("o1", "Daily standup notes"));
+    // o2 has no ref; its projection row says which session holds it.
+    await kv.set(KV.observationProjections, "o2", { observationId: "o2", captureId: "c2", sessionId: "ses_2", status: "succeeded", attempts: 1, updatedAt: now });
+    await kv.set(KV.observations("ses_2"), "o2", obs("o2", "Implement retry policy in src/retry.ts"));
+
+    const provider = {
+      name: "test",
+      compress: vi.fn().mockResolvedValue('<pairs><pair i="1" type="implements" weight="0.85"/></pairs>'),
+      summarize: vi.fn(),
+    };
+    registerGraphTypeBackfill(sdk as never, kv as never, provider as never);
+
+    const explained = (await sdk.trigger("mem::graph-type-backfill", { minBacking: 2, dryRun: true, explain: true })) as {
+      explained: Array<{ read: number; refs: number; gated: number }>;
+    };
+    expect(explained.explained[0]).toMatchObject({ refs: 1, read: 2, gated: 1 });
+
+    const result = (await sdk.trigger("mem::graph-type-backfill", { minBacking: 2 })) as { asked: number; typed: number };
+    expect(result).toMatchObject({ asked: 1, typed: 1 });
+    expect(String(provider.compress.mock.calls[0][1])).toContain("Implement retry policy in src/retry.ts");
   });
 
   it("does not ask the model about a pair whose evidence only lists files, and reports it as skipped", async () => {

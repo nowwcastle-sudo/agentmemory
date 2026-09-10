@@ -6,6 +6,7 @@ import type {
   GraphEdge,
   GraphNode,
   MemoryProvider,
+  ObservationProjection,
 } from "../types.js";
 import { EDGE_TYPES, validateGraphDelta } from "./graph-schema.js";
 import { parseAttrs, persistGraphDelta } from "./graph.js";
@@ -43,7 +44,13 @@ const isLive = (n: GraphNode | undefined): n is GraphNode =>
 // observation's `files` list, and some of those are words ("memory", "user").
 // A real file has a path separator or an extension; typing a relation to a
 // word is never right, so those pairs are not candidates.
-const looksLikeFile = (name: string): boolean => /[\\/]/.test(name) || /\.[A-Za-z0-9]+$/.test(name);
+// A path whose last segment has no extension is a directory (trials 3 and 4
+// typed "pytest uses .../discord-cs-quiz-core" through the separator rule);
+// extension-less files (Makefile, LICENSE) are lost with them, on purpose.
+const looksLikeFile = (name: string): boolean => {
+  const last = name.split(/[\\/]/).pop() ?? "";
+  return /\.[A-Za-z0-9]+$/.test(last);
+};
 
 // Trial 3 (2026-09-10): 8 of 24 wrong answers had a concept node that was a
 // shell command ("git status", "commit range", "PowerShell command
@@ -199,26 +206,58 @@ const EVIDENCE_WINDOW = 120;
  * carries a relation verb, and only when the observation is not a file list.
  * A bare tool-name title ("Bash") is dropped; its narrative still counts.
  */
-export function pickEvidence(
+export interface EvidenceExplanation {
+  /** observations read for the pair */
+  read: number;
+  /** of those, how many mention the file's basename at all */
+  withFile: number;
+  /** ... and carry every significant concept token near that mention */
+  withConcept: number;
+  /** ... and carry a relation verb near that mention */
+  withVerb: number;
+  /** observations naming five or more files (never evidence) */
+  listShaped: number;
+  /** observations that passed the whole gate */
+  gated: number;
+  snippets: string[];
+  /** when nothing passed: the first two observation texts, so the reason can be read */
+  samples?: string[];
+}
+
+/** The gate with its reasons, so a dry run can say why a pair is not asked. */
+export function explainEvidence(
   observations: Array<{ title: string; narrative?: string }>,
   conceptName: string,
   fileName: string,
   limit = EVIDENCE_TITLES_PER_PAIR,
-): string[] {
+): EvidenceExplanation {
+  const out: EvidenceExplanation = {
+    read: observations.length,
+    withFile: 0,
+    withConcept: 0,
+    withVerb: 0,
+    listShaped: 0,
+    gated: 0,
+    snippets: [],
+  };
   const base = fileName.split(/[\\/]/).pop()?.toLowerCase() ?? "";
-  if (!base) return [];
+  if (!base) return out;
   const tokens = significantTokens(conceptName);
-  if (tokens.length === 0) return [];
-  const out: string[] = [];
+  if (tokens.length === 0) return out;
   for (const o of observations) {
     const rawTitle = (o.title ?? "").trim();
     const bareTitle = !rawTitle || TOOL_NAMES.has(rawTitle.toLowerCase());
     const title = bareTitle ? "" : rawTitle;
     const narrative = o.narrative ?? "";
     const text = title ? `${title}. ${narrative}` : narrative;
-    const mentions = new Set((text.match(FILE_MENTION) ?? []).map((m) => m.toLowerCase()));
-    if (mentions.size >= LIST_SHAPED_FILE_MENTIONS) continue;
     const lower = text.toLowerCase();
+    if (!lower.includes(base)) continue;
+    out.withFile += 1;
+    const mentions = new Set((text.match(FILE_MENTION) ?? []).map((m) => m.toLowerCase()));
+    const listShaped = mentions.size >= LIST_SHAPED_FILE_MENTIONS;
+    if (listShaped) out.listShaped += 1;
+    let conceptOk = false;
+    let verbOk = false;
     let snippet: string | null = null;
     for (let at = lower.indexOf(base); at >= 0; at = lower.indexOf(base, at + 1)) {
       const window = text.slice(
@@ -226,16 +265,35 @@ export function pickEvidence(
         Math.min(text.length, at + base.length + EVIDENCE_WINDOW),
       );
       const windowLower = window.toLowerCase();
-      if (tokens.every((t) => windowLower.includes(t)) && RELATION_VERB.test(window)) {
-        snippet = window.trim();
-        break;
-      }
+      const hasConcept = tokens.every((t) => windowLower.includes(t));
+      const hasVerb = RELATION_VERB.test(window);
+      if (hasConcept) conceptOk = true;
+      if (hasVerb) verbOk = true;
+      if (hasConcept && hasVerb && !snippet) snippet = window.trim();
     }
-    if (!snippet) continue;
-    out.push(!title || snippet.includes(title) ? snippet : `${title} -- ${snippet}`);
-    if (out.length >= limit) break;
+    if (conceptOk) out.withConcept += 1;
+    if (verbOk) out.withVerb += 1;
+    if (!snippet || listShaped) continue;
+    out.gated += 1;
+    if (out.snippets.length < limit) {
+      out.snippets.push(!title || snippet.includes(title) ? snippet : `${title} -- ${snippet}`);
+    }
+  }
+  if (out.gated === 0) {
+    out.samples = observations
+      .slice(0, 2)
+      .map((o) => `${(o.title ?? "").trim()} | ${(o.narrative ?? "").slice(0, 200)}`);
   }
   return out;
+}
+
+export function pickEvidence(
+  observations: Array<{ title: string; narrative?: string }>,
+  conceptName: string,
+  fileName: string,
+  limit = EVIDENCE_TITLES_PER_PAIR,
+): string[] {
+  return explainEvidence(observations, conceptName, fileName, limit).snippets;
 }
 
 export interface TypingParse {
@@ -309,24 +367,42 @@ const EVIDENCE_TITLES_PER_PAIR = 3;
 // How many backing observations to read before choosing the best few. Pairs
 // with a hundred backing observations are the interesting ones, and the
 // first three refs are whatever happened to be extracted first.
-const EVIDENCE_CANDIDATES_PER_PAIR = 12;
+const EVIDENCE_CANDIDATES_PER_PAIR = 24;
 
 async function evidenceFor(
   kv: StateKV,
   candidates: TypingCandidate[],
-): Promise<Map<string, string[]>> {
-  const evidence = new Map<string, string[]>();
+): Promise<Map<string, EvidenceExplanation>> {
+  const evidence = new Map<string, EvidenceExplanation>();
   for (const c of candidates) {
     const observations: Array<{ title: string; narrative?: string }> = [];
+    const seen = new Set<string>();
+    const keep = (observation: CompressedObservation | null): void => {
+      if (observation && (observation.title || observation.narrative)) {
+        observations.push({ title: observation.title ?? "", narrative: observation.narrative });
+      }
+    };
     for (const ref of c.edge.sourceRefs ?? []) {
       if (observations.length >= EVIDENCE_CANDIDATES_PER_PAIR) break;
       if (ref.sourceKind !== "observation" || !ref.sessionId) continue;
-      const observation = await kv
-        .get<CompressedObservation>(KV.observations(ref.sessionId), ref.sourceId)
-        .catch(() => null);
-      if (observation?.title) observations.push({ title: observation.title, narrative: observation.narrative });
+      seen.add(ref.sourceId);
+      keep(await kv.get<CompressedObservation>(KV.observations(ref.sessionId), ref.sourceId).catch(() => null));
     }
-    evidence.set(c.edge.id, pickEvidence(observations, c.source.name, c.target.name));
+    // Live store 2026-09-11: pairs carried 100-298 backing ids but 1-7 refs,
+    // so reading through refs alone showed the gate two observations in two
+    // hundred. An id without a ref is resolved through its projection row,
+    // which knows the session that holds the observation.
+    for (const id of c.edge.sourceObservationIds ?? []) {
+      if (observations.length >= EVIDENCE_CANDIDATES_PER_PAIR) break;
+      if (seen.has(id)) continue;
+      seen.add(id);
+      const projection = await kv
+        .get<ObservationProjection>(KV.observationProjections, id)
+        .catch(() => null);
+      if (!projection?.sessionId) continue;
+      keep(await kv.get<CompressedObservation>(KV.observations(projection.sessionId), id).catch(() => null));
+    }
+    evidence.set(c.edge.id, explainEvidence(observations, c.source.name, c.target.name));
   }
   return evidence;
 }
@@ -337,6 +413,17 @@ export interface TypeBackfillRequest {
   maxBatches?: number;
   skipEdgeIds?: string[];
   dryRun?: boolean;
+  /** with dryRun: read each candidate's evidence and report why the gate passes or fails it */
+  explain?: boolean;
+}
+
+export interface TypingExplanation extends EvidenceExplanation {
+  edgeId: string;
+  concept: string;
+  file: string;
+  backing: number;
+  /** sourceRefs on the edge (the ids resolvable without a projection lookup) */
+  refs: number;
 }
 
 export interface TypeBackfillResult {
@@ -351,6 +438,7 @@ export interface TypeBackfillResult {
   attemptedEdgeIds: string[];
   dryRun: boolean;
   error?: string;
+  explained?: TypingExplanation[];
 }
 
 export function registerGraphTypeBackfill(
@@ -390,6 +478,24 @@ export function registerGraphTypeBackfill(
         attemptedEdgeIds: [],
         dryRun,
       };
+      if (dryRun && data.explain === true) {
+        // Read the evidence, ask nothing, write nothing: the gate's reasons
+        // per pair are what decides whether the gate or the corpus is at fault.
+        const evidence = await evidenceFor(kv, candidates);
+        result.explained = candidates.map((c) => {
+          const e = evidence.get(c.edge.id)!;
+          return {
+            edgeId: c.edge.id,
+            concept: c.source.name,
+            file: c.target.name,
+            backing: c.edge.sourceObservationIds.length,
+            refs: (c.edge.sourceRefs ?? []).length,
+            ...e,
+            snippets: e.snippets.slice(0, 1),
+          };
+        });
+        return result;
+      }
       if (dryRun || candidates.length === 0) return result;
 
       for (let start = 0; start < candidates.length; start += batchSize) {
@@ -398,12 +504,15 @@ export function registerGraphTypeBackfill(
         // A pair with no gated evidence is not asked: the model would answer
         // from the names alone, which is what trials 1-3 measured at 40-70%.
         // It still counts as attempted so the driver never brings it back.
-        const asked = batch.filter((c) => (evidence.get(c.edge.id) ?? []).length > 0);
+        const snippets = new Map(
+          Array.from(evidence, ([id, e]) => [id, e.snippets] as [string, string[]]),
+        );
+        const asked = batch.filter((c) => (snippets.get(c.edge.id) ?? []).length > 0);
         const skipped = batch.filter((c) => !asked.includes(c));
         result.skipped += skipped.length;
         result.attemptedEdgeIds.push(...skipped.map((c) => c.edge.id));
         if (asked.length === 0) continue;
-        const prompt = buildTypingPrompt(asked, evidence);
+        const prompt = buildTypingPrompt(asked, snippets);
         let response: string;
         try {
           response = await provider.compress(GRAPH_TYPING_SYSTEM, prompt);
@@ -435,7 +544,10 @@ export function registerGraphTypeBackfill(
             ...(old.actorAgentId ? { actorAgentId: old.actorAgentId } : {}),
             ...(old.visibility ? { visibility: old.visibility } : {}),
             createdAt: now,
-            context: { reasoning: `typed from related_to ${old.id} by graph-type-backfill` },
+            context: {
+              reasoning: `typed from related_to ${old.id} by graph-type-backfill`,
+              evidence: snippets.get(old.id) ?? [],
+            },
           };
           // Through the persist seam so the edge-key index, degree bookkeeping
           // and snapshot stay right. The endpoints ride along and merge into

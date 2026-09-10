@@ -728,6 +728,8 @@ export interface EdgeContext {
   alternatives?: string[];
   situationalFactors?: string[];
   confidence?: number;
+  /** the evidence snippets a typing pass showed the model, so a reader can judge the edge */
+  evidence?: string[];
 }
 
 export interface GraphQueryResult {
