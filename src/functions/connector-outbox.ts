@@ -645,19 +645,35 @@ export function registerConnectorOutboxReplayFunctions(
   );
 }
 
+// Newly accepted observations one automatic tick may deliver. One per tick
+// (the old value) made a slow minute's fallbacks land at 30 s each; twenty
+// per round is what overloaded the store during the 2026-09-11 drain. Five
+// per 30 s is a twelfth of that rate.
+const AUTOMATIC_ACCEPT_BUDGET = 5;
+
+export function automaticAcceptBudget(
+  env: Record<string, string | undefined> = process.env,
+): number {
+  const raw = env["AGENTMEMORY_OUTBOX_TICK_ACCEPT"]?.trim();
+  if (!raw) return AUTOMATIC_ACCEPT_BUDGET;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed >= 1 ? Math.min(20, parsed) : AUTOMATIC_ACCEPT_BUDGET;
+}
+
 export function startConnectorOutboxReplayLoop(
   sdk: ISdk,
   intervalMs = 30_000,
 ): { stop(): void } {
   let stopped = false;
   let running = false;
+  const accept = automaticAcceptBudget();
   const tick = async () => {
     if (stopped || running) return;
     running = true;
     try {
       await sdk.trigger({
         function_id: "mem::connector-outbox-replay",
-        payload: { limit: 20 },
+        payload: { limit: 20, accept },
       });
     } catch (error) {
       logger.warn("Connector outbox replay tick failed", {

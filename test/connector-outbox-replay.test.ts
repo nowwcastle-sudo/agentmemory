@@ -3,6 +3,7 @@ import { mkdir, mkdtemp, readFile, readdir, rm, utimes, writeFile } from "node:f
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  automaticAcceptBudget,
   defaultConnectorOutboxes,
   inspectConnectorOutboxes,
   recoverConnectorOutboxClaims,
@@ -901,6 +902,14 @@ describe("connector outbox replay", () => {
     }
   });
 
+  it("reads the automatic tick's accept budget from the environment, bounded to 1..20", () => {
+    expect(automaticAcceptBudget({})).toBe(5);
+    expect(automaticAcceptBudget({ AGENTMEMORY_OUTBOX_TICK_ACCEPT: "12" })).toBe(12);
+    expect(automaticAcceptBudget({ AGENTMEMORY_OUTBOX_TICK_ACCEPT: "50" })).toBe(20);
+    expect(automaticAcceptBudget({ AGENTMEMORY_OUTBOX_TICK_ACCEPT: "0" })).toBe(5);
+    expect(automaticAcceptBudget({ AGENTMEMORY_OUTBOX_TICK_ACCEPT: "many" })).toBe(5);
+  });
+
   it("registers an operator replay capped at twenty legacy envelopes", async () => {
     const root = await mkdtemp(join(tmpdir(), "agentmemory-outbox-legacy-cap-"));
     const codex = join(root, "codex");
@@ -957,16 +966,20 @@ describe("connector outbox replay", () => {
       await vi.advanceTimersByTimeAsync(29_999);
       expect(payloads).toEqual([]);
 
+      // accept 5: the tick used to stop after one new acceptance, so a
+      // handful of envelopes left by a slow minute took 30 s each to land
+      // (2026-09-11: 14 envelopes, 7 minutes). Five per tick is still a
+      // twelfth of the rate that overloaded the store during the big drain.
       await vi.advanceTimersByTimeAsync(1);
-      expect(payloads).toEqual([{ limit: 20 }]);
+      expect(payloads).toEqual([{ limit: 20, accept: 5 }]);
       await vi.advanceTimersByTimeAsync(90_000);
-      expect(payloads).toEqual([{ limit: 20 }]);
+      expect(payloads).toEqual([{ limit: 20, accept: 5 }]);
       expect(maxActive).toBe(1);
 
       release?.();
       await Promise.resolve();
       await vi.advanceTimersByTimeAsync(30_000);
-      expect(payloads).toEqual([{ limit: 20 }, { limit: 20 }]);
+      expect(payloads).toEqual([{ limit: 20, accept: 5 }, { limit: 20, accept: 5 }]);
       expect(maxActive).toBe(1);
       loop.stop();
     } finally {
@@ -997,7 +1010,7 @@ describe("connector outbox replay", () => {
       expect(sdk.trigger).toHaveBeenCalledTimes(1);
       expect(sdk.trigger).toHaveBeenCalledWith({
         function_id: "mem::connector-outbox-replay",
-        payload: { limit: 20 },
+        payload: { limit: 20, accept: 5 },
       });
       loop.stop();
     } finally {
