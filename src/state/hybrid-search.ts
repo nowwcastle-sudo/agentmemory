@@ -23,6 +23,46 @@ import { rerank } from "./reranker.js";
 const RRF_K = 60;
 
 /**
+ * How the graph leg finds its starting nodes.
+ *
+ * "entities": today's path -- entities extracted from the query (and lowercase
+ * words that name a node) seed a depth-2 traversal, then the top vector hits
+ * are expanded one hop. Three A/Bs on the live corpus (2026-09-09, cycles C
+ * and H) turned this off: a common word such as "fingerprint" reaches a
+ * homonym cluster and displaces rows the vector leg had right.
+ *
+ * "expand": no entity search at all. The leg only expands one hop from the
+ * top vector hits, and only when the query is long enough to be about a
+ * topic rather than a name -- short queries are answered by the vector hits
+ * themselves, and skipping the leg there also skips loading the graph cache.
+ */
+export type GraphLegMode = "entities" | "expand";
+
+export function graphLegModeFromEnv(
+  env: Record<string, string | undefined> = process.env,
+): GraphLegMode {
+  return env["AGENTMEMORY_GRAPH_MODE"]?.trim().toLowerCase() === "expand"
+    ? "expand"
+    : "entities";
+}
+
+const DEFAULT_GRAPH_MIN_QUERY_TOKENS = 3;
+
+export function graphMinQueryTokensFromEnv(
+  env: Record<string, string | undefined> = process.env,
+): number {
+  const raw = env["AGENTMEMORY_GRAPH_MIN_QUERY_TOKENS"]?.trim();
+  if (!raw) return DEFAULT_GRAPH_MIN_QUERY_TOKENS;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : DEFAULT_GRAPH_MIN_QUERY_TOKENS;
+}
+
+/** Whitespace-separated tokens that carry a letter or a digit, any script. */
+export function queryTokenCount(query: string): number {
+  return query.split(/\s+/).filter((token) => /[\p{L}\p{N}]/u.test(token)).length;
+}
+
+/**
  * Reports whether each graph-leg gate opened for one query. Both gates cost a
  * full enumeration of the graph scopes when they open, and they are gated on
  * different things: entities come from an ASCII-only extractor, so all-Korean
@@ -48,6 +88,8 @@ export class HybridSearch {
     private graphWeight = 0.3,
     private rerankEnabled = process.env.RERANK_ENABLED === "true",
     private reportGraphLegGates?: GraphLegGateReporter,
+    private graphMode: GraphLegMode = graphLegModeFromEnv(),
+    private graphMinQueryTokens: number = graphMinQueryTokensFromEnv(),
   ) {
     this.graphRetrieval = new GraphRetrieval(kv);
   }
@@ -131,9 +173,19 @@ export class HybridSearch {
     // buys full enumerations of the graph scopes for a result that cannot move
     // any ranking. Skip the traversal itself rather than its score.
     const graphLegEnabled = this.graphWeight > 0;
+    // Expand mode: no entity seeds at all (see GraphLegMode), and no leg for a
+    // query below the token gate.
+    const expandOnly = graphLegEnabled && this.graphMode === "expand";
+    const expansionAllowed =
+      graphLegEnabled &&
+      (!expandOnly || queryTokenCount(query) >= this.graphMinQueryTokens);
     const hinted = Boolean(entityHints && entityHints.length > 0);
-    let entities = hinted ? entityHints! : extractEntitiesFromQuery(query);
-    if (graphLegEnabled && !hinted) {
+    let entities = expandOnly
+      ? []
+      : hinted
+        ? entityHints!
+        : extractEntitiesFromQuery(query);
+    if (graphLegEnabled && !expandOnly && !hinted) {
       // Lowercase queries name nodes too; the live graph says which.
       const named = await this.graphRetrieval
         .matchEntityNames(query)
@@ -154,7 +206,7 @@ export class HybridSearch {
       }
     }
 
-    const topVectorObs = graphLegEnabled
+    const topVectorObs = expansionAllowed
       ? vectorResults.slice(0, 5).map((r) => r.obsId)
       : [];
     this.reportGraphLegGates?.(

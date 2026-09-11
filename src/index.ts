@@ -23,7 +23,11 @@ import {
 import { StateKV } from "./state/kv.js";
 import { KV } from "./state/schema.js";
 import { VectorIndex } from "./state/vector-index.js";
-import { HybridSearch } from "./state/hybrid-search.js";
+import {
+  HybridSearch,
+  graphLegModeFromEnv,
+  graphMinQueryTokensFromEnv,
+} from "./state/hybrid-search.js";
 import { IndexPersistence } from "./state/index-persistence.js";
 import { registerPrivacyFunction } from "./functions/privacy.js";
 import { registerObserveFunction } from "./functions/observe.js";
@@ -461,6 +465,12 @@ async function main() {
         entities && vectorHits,
       );
     },
+  );
+
+  bootLog(
+    graphWeight > 0
+      ? `Graph leg: on (weight ${graphWeight}, mode ${graphLegModeFromEnv()}, min query tokens ${graphMinQueryTokensFromEnv()})`
+      : "Graph leg: off (AGENTMEMORY_GRAPH_WEIGHT=0)",
   );
 
   const hybridRanker = (
