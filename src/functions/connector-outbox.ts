@@ -413,6 +413,10 @@ const TERMINAL_REJECTIONS = new Set(["legacy_identity_unverified", "capture_id_c
 async function terminalRejection(response: Response): Promise<string | null> {
   if (response.status < 400 || response.status >= 500) return null;
   if (response.status === 401 || response.status === 403 || response.status === 429) return null;
+  // A body the server cannot parse or validate stays that way on every
+  // retry (the last envelope of the 2026-09-11 drain: 400 "... are required
+  // strings" on all 130 rounds).
+  if (response.status === 400) return "bad_request";
   try {
     const body = (await response.clone().json()) as { error?: unknown };
     const error = typeof body?.error === "string" ? body.error : null;

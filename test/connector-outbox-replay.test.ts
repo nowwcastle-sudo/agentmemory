@@ -855,6 +855,52 @@ describe("connector outbox replay", () => {
     }
   });
 
+  // The last envelope of the 2026-09-11 drain: a codex post_tool_use body
+  // without project/cwd/timestamp, answered 400 "… are required strings" on
+  // all 130 rounds. The body will not change between retries, so a 400 is as
+  // terminal as a 409.
+  it("quarantines an envelope the server rejects as a bad request", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agentmemory-outbox-badreq-"));
+    const codex = join(root, "codex");
+    const fetchMock = vi.fn(async (_url: string | URL, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body || "{}")) as { captureId?: string };
+      if (body.captureId === "codex:malformed") {
+        return new Response(
+          JSON.stringify({ error: "hookType, sessionId, project, cwd, and timestamp are required strings" }),
+          { status: 400 },
+        );
+      }
+      return new Response(JSON.stringify({ deduplicated: false }), { status: 201 });
+    });
+    try {
+      await writeEnvelope(codex, "bad.json", {
+        schemaVersion: 2,
+        path: "/agentmemory/observe",
+        body: { captureId: "codex:malformed" },
+        createdAt: "2026-09-09T00:00:00.000Z",
+      });
+      await writeEnvelope(codex, "good.json", {
+        schemaVersion: 2,
+        path: "/agentmemory/observe",
+        body: { captureId: "codex:fine" },
+        createdAt: "2026-09-11T00:00:00.000Z",
+      });
+      const result = await replayConnectorOutboxes({
+        outboxes: [{ adapter: "codex", dir: codex }],
+        baseUrl: "http://127.0.0.1:3111",
+        fetchImpl: fetchMock,
+        timeoutMs: 50,
+        limit: 20,
+      });
+      expect(result).toMatchObject({ rejected: 1, delivered: 1, failed: 0 });
+      expect(result.rejectedByReason).toEqual({ bad_request: 1 });
+      expect((await readdir(codex)).filter((name) => name.endsWith(".json"))).toHaveLength(0);
+      expect(await readdir(join(codex, "rejected", "bad_request"))).toEqual(["bad.json"]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("registers an operator replay capped at twenty legacy envelopes", async () => {
     const root = await mkdtemp(join(tmpdir(), "agentmemory-outbox-legacy-cap-"));
     const codex = join(root, "codex");
