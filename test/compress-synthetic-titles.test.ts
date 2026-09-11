@@ -117,6 +117,33 @@ describe("harness notices captured as prompts", () => {
   });
 });
 
+describe("truncation never splits a surrogate pair", () => {
+  // Live store 2026-09-11: two projections retried 433 and 180 times, each a
+  // 180 s state::set timeout. Their narratives were cut at 400 characters in
+  // the middle of an emoji, leaving a lone high surrogate; the state worker
+  // never answers a set whose string is not valid UTF-8.
+  const LONE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+
+  it("keeps the narrative, subtitle and title valid wherever the cut lands inside an emoji", () => {
+    // Sweep the boundary so at least one filler length puts the pair across it.
+    for (let n = 360; n <= 410; n += 1) {
+      const out = buildSyntheticCompression(raw({ toolName: "Bash", toolInput: { command: "ls" }, toolOutput: `${"x".repeat(n)}🔥 done` }));
+      expect(LONE.test(out.narrative), `narrative at filler ${n}`).toBe(false);
+      expect(out.narrative.length).toBeLessThanOrEqual(400);
+    }
+    for (let n = 100; n <= 125; n += 1) {
+      const sub = buildSyntheticCompression(raw({ toolName: "Bash", toolInput: { command: "y".repeat(n) + "🎉🎉" } }));
+      expect(LONE.test(sub.subtitle ?? ""), `subtitle at ${n}`).toBe(false);
+      expect(LONE.test(sub.title), `title at ${n}`).toBe(false);
+    }
+    for (let n = 70; n <= 82; n += 1) {
+      const title = buildSyntheticCompression(raw({ hookType: "prompt_submit", userPrompt: "z".repeat(n) + "🚀 go" }));
+      expect(LONE.test(title.title), `prompt title at ${n}`).toBe(false);
+      expect(title.title.length).toBeLessThanOrEqual(80);
+    }
+  });
+});
+
 describe("buildSyntheticCompression", () => {
   it("uses the synthesised title and keeps a real user prompt at normal importance", () => {
     const compressed = buildSyntheticCompression(raw({ toolName: "Bash", toolInput: { command: "git log --oneline -3" } }));

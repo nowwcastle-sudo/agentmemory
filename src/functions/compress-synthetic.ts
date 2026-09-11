@@ -69,8 +69,18 @@ function stringifyForNarrative(v: unknown): string {
   }
 }
 
+/**
+ * Cut to at most `n` UTF-16 units without splitting a surrogate pair. Live
+ * store 2026-09-11: two narratives cut at 400 in the middle of an emoji kept a
+ * lone high surrogate, and the state worker never answers a set whose string
+ * is not valid UTF-8 -- 433 and 180 retries of a 180 s timeout.
+ */
 function truncate(s: string, n: number): string {
-  return s.length > n ? s.slice(0, n - 1) + "\u2026" : s;
+  if (s.length <= n) return s;
+  let end = n - 1;
+  const code = s.charCodeAt(end - 1);
+  if (end > 0 && code >= 0xd800 && code <= 0xdbff) end -= 1;
+  return s.slice(0, end) + "\u2026";
 }
 
 // --- titles -----------------------------------------------------------
