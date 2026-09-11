@@ -1,6 +1,11 @@
 #!/usr/bin/env node
 import { resolveProjectPayload, hookCwd } from "./_project.js";
-import { defaultHookDelivery, hookSessionId, stableHookCaptureId } from "./_delivery.js";
+import {
+  defaultHookDelivery,
+  hookEventLocator,
+  hookSessionId,
+  stableHookCaptureId,
+} from "./_delivery.js";
 
 function isSdkChildContext(payload: unknown): boolean {
   if (process.env["AGENTMEMORY_SDK_CHILD"] === "1") return true;
@@ -38,19 +43,20 @@ async function main() {
   const cwd = hookCwd(data) || process.cwd();
   const projectPayload = resolveProjectPayload(cwd);
   const delivery = defaultHookDelivery();
+  const capturedAt = new Date().toISOString();
 
   await delivery.deliver("/agentmemory/observe", {
     captureId: stableHookCaptureId(
       sessionId,
       "pre_compact",
-      data.turn_id ?? data.trigger ?? "pre-compact",
+      hookEventLocator([data.turn_id], capturedAt),
     ),
     hookType: "pre_compact",
     sessionId,
     ...projectPayload,
     cwd,
     ...(typeof data.agent_id === "string" ? { agentId: data.agent_id } : {}),
-    timestamp: new Date().toISOString(),
+    timestamp: capturedAt,
     data: {
       trigger: data.trigger,
       turn_id: data.turn_id,

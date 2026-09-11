@@ -4,9 +4,41 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   createHookDelivery,
+  hookEventLocator,
   hookSessionId,
   stableHookCaptureId,
 } from "../src/hooks/_delivery.js";
+
+// 125 envelopes quarantined as capture_id_conflict on 2026-09-11 were all
+// codex lifecycle hooks: subagent_stop keyed on the agent id alone (an agent
+// that stops once per turn repeats it), prompt_submit keyed on the prompt
+// text when Codex sends no turn_id ("진행" twice), compaction keyed on the
+// constant trigger word. The server keeps the first capture and rejects the
+// rest, so those events were lost. A lifecycle locator carries every natural
+// id the payload has, and the moment of capture when it has none.
+describe("hookEventLocator", () => {
+  it("keeps the agent and the turn apart, so one agent stopping twice is two events", () => {
+    const a = stableHookCaptureId("s1", "subagent_stop", hookEventLocator(["agent-1", "turn-1"], "t0"));
+    const b = stableHookCaptureId("s1", "subagent_stop", hookEventLocator(["agent-1", "turn-2"], "t0"));
+    const again = stableHookCaptureId("s1", "subagent_stop", hookEventLocator(["agent-1", "turn-1"], "t9"));
+    expect(a).not.toBe(b);
+    expect(again).toBe(a);
+  });
+
+  it("falls back to the capture moment when the payload carries no id", () => {
+    const first = stableHookCaptureId("s1", "prompt", hookEventLocator([undefined, ""], "2026-09-11T12:00:00.000Z"));
+    const second = stableHookCaptureId("s1", "prompt", hookEventLocator([undefined, ""], "2026-09-11T12:05:00.000Z"));
+    const retry = stableHookCaptureId("s1", "prompt", hookEventLocator([undefined, ""], "2026-09-11T12:00:00.000Z"));
+    expect(first).not.toBe(second);
+    expect(retry).toBe(first);
+  });
+
+  it("ignores a present id's neighbours that are missing", () => {
+    expect(hookEventLocator(["agent-1", undefined], "t0")).toEqual(["agent-1"]);
+    expect(hookEventLocator([undefined, "turn-1"], "t0")).toEqual(["turn-1"]);
+    expect(hookEventLocator([null, "  "], "t0")).toBe("t0");
+  });
+});
 
 describe("Codex hook durable delivery", () => {
   it("persists terminal priority for a SessionEnd delivery instance", async () => {

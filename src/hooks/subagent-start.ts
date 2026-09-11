@@ -1,6 +1,11 @@
 #!/usr/bin/env node
 import { resolveProjectPayload, hookCwd } from "./_project.js";
-import { defaultHookDelivery, hookSessionId, stableHookCaptureId } from "./_delivery.js";
+import {
+  defaultHookDelivery,
+  hookEventLocator,
+  hookSessionId,
+  stableHookCaptureId,
+} from "./_delivery.js";
 
 // Inlined from ./sdk-guard so each hook bundles to a single self-contained
 // .mjs (matches the pattern used by every other hook entry in tsdown.config).
@@ -32,15 +37,20 @@ async function main() {
   const agentType = data.agent_type || data.agentDisplayName || data.agentName;
 
   const cwd = hookCwd(data) || process.cwd();
+  const capturedAt = new Date().toISOString();
 
   await defaultHookDelivery().deliver("/agentmemory/observe", {
-    captureId: stableHookCaptureId(sessionId, "subagent_start", agentId ?? data.turn_id),
+    captureId: stableHookCaptureId(
+      sessionId,
+      "subagent_start",
+      hookEventLocator([agentId, data.turn_id], capturedAt),
+    ),
     hookType: "subagent_start",
     sessionId,
     ...resolveProjectPayload(cwd),
     cwd,
     ...(typeof agentId === "string" ? { agentId } : {}),
-    timestamp: new Date().toISOString(),
+    timestamp: capturedAt,
     data: {
       agent_id: agentId,
       agent_type: agentType,
