@@ -745,6 +745,77 @@ describe("connector outbox replay", () => {
     }
   });
 
+  // The automatic tick stops after one newly accepted observation so a
+  // recovering worker does not queue a projection per envelope. An operator
+  // draining a backlog (2026-09-11: 3,250 deliverable envelopes after the
+  // legacy prefix was quarantined) would otherwise wait for one acceptance
+  // per round -- hours -- so the operator call may raise that budget.
+  it("accepts up to the acceptance budget in one current-mode replay", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agentmemory-outbox-budget-"));
+    const codex = join(root, "codex");
+    const fetchMock = vi.fn(
+      async () => new Response(JSON.stringify({ deduplicated: false }), { status: 201 }),
+    );
+    try {
+      for (let index = 0; index < 4; index++) {
+        await writeEnvelope(codex, `${index}.json`, {
+          schemaVersion: 2,
+          path: "/agentmemory/observe",
+          body: { captureId: `codex:fresh-${index}` },
+          createdAt: `2026-09-11T00:00:0${index}.000Z`,
+        });
+      }
+      const result = await replayConnectorOutboxes({
+        outboxes: [{ adapter: "codex", dir: codex }],
+        baseUrl: "http://127.0.0.1:3111",
+        fetchImpl: fetchMock,
+        timeoutMs: 50,
+        limit: 20,
+        acceptBudget: 3,
+      });
+      expect(result).toMatchObject({ delivered: 3, newlyAccepted: 3, failed: 0 });
+      expect((await readdir(codex)).filter((name) => name.endsWith(".json"))).toHaveLength(1);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("passes the operator's accept budget through the registered function, capped at twenty", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agentmemory-outbox-budget-fn-"));
+    const codex = join(root, "codex");
+    const sdk = mockSdk();
+    const fetchMock = vi.fn(
+      async () => new Response(JSON.stringify({ deduplicated: false }), { status: 201 }),
+    );
+    try {
+      for (let index = 0; index < 22; index++) {
+        await writeEnvelope(codex, `${String(index).padStart(2, "0")}.json`, {
+          schemaVersion: 2,
+          path: "/agentmemory/observe",
+          body: { captureId: `codex:fresh-${index}` },
+          createdAt: `2026-09-11T00:00:${String(index).padStart(2, "0")}.000Z`,
+        });
+      }
+      registerConnectorOutboxReplayFunctions(sdk as never, {
+        outboxes: [{ adapter: "codex", dir: codex }],
+        baseUrl: "http://127.0.0.1:3111",
+        fetchImpl: fetchMock,
+        timeoutMs: 50,
+      });
+      const result = (await sdk.trigger("mem::connector-outbox-replay", {
+        limit: 20,
+        accept: 100,
+      })) as { delivered: number; newlyAccepted: number };
+      expect(result.newlyAccepted).toBe(20);
+      const single = (await sdk.trigger("mem::connector-outbox-replay", {
+        limit: 20,
+      })) as { newlyAccepted: number };
+      expect(single.newlyAccepted).toBe(1);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("registers an operator replay capped at twenty legacy envelopes", async () => {
     const root = await mkdtemp(join(tmpdir(), "agentmemory-outbox-legacy-cap-"));
     const codex = join(root, "codex");

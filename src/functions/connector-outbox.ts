@@ -480,9 +480,15 @@ export async function replayConnectorOutboxes(options: {
   limit?: number;
   scanLimit?: number;
   mode?: "current" | "legacy";
+  // Newly accepted observations one current-mode pass may deliver before it
+  // stops (each one queues a projection). The automatic tick keeps 1; an
+  // operator draining a backlog raises it.
+  acceptBudget?: number;
 }): Promise<ConnectorOutboxReplayResult> {
   const scanLimit = resolveOutboxScanLimit(options.scanLimit);
   const mode = options.mode ?? "current";
+  const acceptBudget = Math.max(1, Math.floor(options.acceptBudget ?? 1));
+  let accepted = 0;
   const { queues: readings, inspection } = await readOutboxes({
     outboxes: options.outboxes,
     scanLimit,
@@ -557,7 +563,8 @@ export async function replayConnectorOutboxes(options: {
       } else {
         if (acceptance === "projectionQueued") projectionQueued += 1;
         else newlyAccepted += 1;
-        if (mode === "current" && !replayingTerminalSession) break;
+        accepted += 1;
+        if (mode === "current" && !replayingTerminalSession && accepted >= acceptBudget) break;
       }
     } catch {
       await restoreClaim(claim, item.file);
@@ -596,9 +603,11 @@ export function registerConnectorOutboxReplayFunctions(
 
   sdk.registerFunction(
     "mem::connector-outbox-replay",
-    async (data: { mode?: "current" | "legacy"; limit?: number } = {}) => {
+    async (data: { mode?: "current" | "legacy"; limit?: number; accept?: number } = {}) => {
       const requestedLimit = Number.isFinite(data.limit) ? Number(data.limit) : 4;
       const limit = Math.min(20, Math.max(0, Math.floor(requestedLimit)));
+      const requestedAccept = Number.isFinite(data.accept) ? Number(data.accept) : 1;
+      const acceptBudget = Math.min(20, Math.max(1, Math.floor(requestedAccept)));
       const run = replayChain.then(() =>
         replayConnectorOutboxes({
           outboxes,
@@ -609,6 +618,7 @@ export function registerConnectorOutboxReplayFunctions(
           limit,
           scanLimit: options.scanLimit,
           mode: data.mode === "legacy" ? "legacy" : "current",
+          acceptBudget,
         }),
       );
       replayChain = run.then(
