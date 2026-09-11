@@ -257,6 +257,18 @@ function stableHookCaptureId(sessionId, eventType, locator) {
 		locator
 	])).digest("hex").slice(0, 32)}`;
 }
+/**
+* The locator of a lifecycle event for stableHookCaptureId: every natural id
+* the payload carries (agent id, turn id), or the moment of capture when it
+* carries none. Keyed on the agent alone, an agent that stops once per turn
+* repeated its capture id; keyed on the prompt text, "진행" typed twice did;
+* keyed on the trigger word, every compaction did -- 125 envelopes rejected
+* as capture_id_conflict on 2026-09-11, each one a lost event.
+*/
+function hookEventLocator(candidates, capturedAt) {
+	const present = candidates.filter((candidate) => typeof candidate === "string" ? candidate.trim().length > 0 : candidate != null);
+	return present.length > 0 ? present : capturedAt;
+}
 function hookSessionId(data) {
 	const value = [
 		data.session_id,
@@ -465,14 +477,15 @@ async function main() {
 	const agentId = data.agent_id || data.agentName;
 	const agentType = data.agent_type || data.agentDisplayName || data.agentName;
 	const cwd = hookCwd(data) || process.cwd();
+	const capturedAt = (/* @__PURE__ */ new Date()).toISOString();
 	await defaultHookDelivery().deliver("/agentmemory/observe", {
-		captureId: stableHookCaptureId(sessionId, "subagent_start", agentId ?? data.turn_id),
+		captureId: stableHookCaptureId(sessionId, "subagent_start", hookEventLocator([agentId, data.turn_id], capturedAt)),
 		hookType: "subagent_start",
 		sessionId,
 		...resolveProjectPayload(cwd),
 		cwd,
 		...typeof agentId === "string" ? { agentId } : {},
-		timestamp: (/* @__PURE__ */ new Date()).toISOString(),
+		timestamp: capturedAt,
 		data: {
 			agent_id: agentId,
 			agent_type: agentType,
