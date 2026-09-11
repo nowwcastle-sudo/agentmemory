@@ -1,11 +1,6 @@
 #!/usr/bin/env node
 import { resolveProjectPayload, hookCwd } from "./_project.js";
-import {
-  defaultHookDelivery,
-  hookEventLocator,
-  hookSessionId,
-  stableHookCaptureId,
-} from "./_delivery.js";
+import { defaultHookDelivery, hookSessionId, stableHookCaptureId } from "./_delivery.js";
 
 function isSdkChildContext(payload: unknown): boolean {
   if (process.env["AGENTMEMORY_SDK_CHILD"] === "1") return true;
@@ -36,12 +31,13 @@ async function main() {
 
   const prompt = data.prompt ?? data.userPrompt;
   const capturedAt = new Date().toISOString();
+  // The prompt's locator must stay reproducible from the rollout file:
+  // session-end reconciliation rebuilds it as `turn_id || message`
+  // (codex-transcript.ts) to dedupe against the live capture. A capture-moment
+  // fallback here would make every reconciled prompt a duplicate, so the
+  // same text twice in one session without turn ids stays one capture.
   await defaultHookDelivery().deliver("/agentmemory/observe", {
-    captureId: stableHookCaptureId(
-      sessionId,
-      "prompt",
-      hookEventLocator([data.turn_id], capturedAt),
-    ),
+    captureId: stableHookCaptureId(sessionId, "prompt", data.turn_id ?? prompt),
     hookType: "prompt_submit",
     sessionId,
     ...resolveProjectPayload(cwd),
