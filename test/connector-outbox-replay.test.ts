@@ -112,6 +112,48 @@ describe("connector outbox replay", () => {
     }
   });
 
+  // Live outbox 2026-09-11: 3,791 envelopes, and every replay tick took the
+  // same oldest twenty, each answered 409 legacy_identity_unverified (their
+  // observations already exist as pre-fingerprint rows), restored the claim,
+  // and moved on to nothing. A terminal rejection is quarantined instead.
+  it("quarantines an envelope the server rejects for good, so the queue advances", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agentmemory-outbox-reject-"));
+    const codex = join(root, "codex");
+    const fetchMock = vi.fn(async (url: string | URL, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body || "{}")) as { captureId?: string };
+      if (body.captureId === "codex:legacy-dup") {
+        return new Response(JSON.stringify({ success: false, error: "legacy_identity_unverified" }), { status: 409 });
+      }
+      return new Response(JSON.stringify({ deduplicated: false }), { status: 201 });
+    });
+    try {
+      await writeEnvelope(codex, "old.json", {
+        schemaVersion: 2,
+        path: "/agentmemory/observe",
+        body: { captureId: "codex:legacy-dup" },
+        createdAt: "2026-09-04T00:00:00.000Z",
+      });
+      await writeEnvelope(codex, "new.json", {
+        schemaVersion: 2,
+        path: "/agentmemory/observe",
+        body: { captureId: "codex:fresh" },
+        createdAt: "2026-09-11T00:00:00.000Z",
+      });
+      const result = await replayConnectorOutboxes({
+        outboxes: [{ adapter: "codex", dir: codex }],
+        baseUrl: "http://127.0.0.1:3111",
+        secret: "local-secret",
+        fetchImpl: fetchMock as never,
+        limit: 2,
+      });
+      expect(result).toMatchObject({ rejected: 1, delivered: 1, failed: 0 });
+      expect((await readdir(codex)).filter((n) => n.endsWith(".json"))).toEqual([]);
+      expect(await readdir(join(codex, "rejected", "legacy_identity_unverified"))).toEqual(["old.json"]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("keeps a failed claim pending without blocking another adapter", async () => {
     const root = await mkdtemp(join(tmpdir(), "agentmemory-outbox-failure-"));
     const codex = join(root, "codex");

@@ -1,5 +1,5 @@
-import { readFile, readdir, rename, rm, stat } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { mkdir, readFile, readdir, rename, rm, stat } from "node:fs/promises";
+import { basename, dirname, join, resolve } from "node:path";
 import type { ISdk } from "../iii-compat.js";
 import { resolvePathLayout } from "../runtime-paths.js";
 import { logger } from "../logger.js";
@@ -104,6 +104,9 @@ export type ConnectorOutboxReplayResult = ConnectorOutboxInspection & {
   newlyAccepted: number;
   projectionQueued: number;
   failed: number;
+  /** Envelopes the server rejects on every retry, moved under <outbox>/rejected/<reason>/. */
+  rejected: number;
+  rejectedByReason: Record<string, number>;
   legacySkipped: number;
 };
 
@@ -400,6 +403,32 @@ function terminalSessionSelection(
   return group.slice(0, limit);
 }
 
+// Rejections the server will give again on every retry. Live outbox
+// 2026-09-11: 3,791 envelopes whose observations already existed as
+// pre-fingerprint rows; every tick took the same oldest twenty, each answered
+// 409 legacy_identity_unverified, and the queue never advanced. Such an
+// envelope is moved under <outbox>/rejected/<reason>/ and counted.
+const TERMINAL_REJECTIONS = new Set(["legacy_identity_unverified", "capture_id_conflict"]);
+
+async function terminalRejection(response: Response): Promise<string | null> {
+  if (response.status < 400 || response.status >= 500) return null;
+  if (response.status === 401 || response.status === 403 || response.status === 429) return null;
+  try {
+    const body = (await response.clone().json()) as { error?: unknown };
+    const error = typeof body?.error === "string" ? body.error : null;
+    return error && TERMINAL_REJECTIONS.has(error) ? error : null;
+  } catch {
+    return null;
+  }
+}
+
+async function quarantineClaim(claim: string, pending: string, reason: string): Promise<void> {
+  const dir = join(dirname(pending), "rejected", reason);
+  await mkdir(dir, { recursive: true });
+  await rename(claim, join(dir, basename(pending)));
+  await rm(pending, { force: true });
+}
+
 async function restoreClaim(claim: string, pending: string): Promise<void> {
   try {
     await rename(claim, pending);
@@ -483,6 +512,8 @@ export async function replayConnectorOutboxes(options: {
   let newlyAccepted = 0;
   let projectionQueued = 0;
   let failed = 0;
+  let rejected = 0;
+  const rejectedByReason: Record<string, number> = {};
 
   for (const item of selected) {
     const claim = `${item.file}.replaying`;
@@ -502,7 +533,16 @@ export async function replayConnectorOutboxes(options: {
           signal: AbortSignal.timeout(timeoutMs),
         },
       );
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      if (!response.ok) {
+        const reason = await terminalRejection(response);
+        if (reason) {
+          await quarantineClaim(claim, item.file, reason);
+          rejected += 1;
+          rejectedByReason[reason] = (rejectedByReason[reason] ?? 0) + 1;
+          continue;
+        }
+        throw new Error(`HTTP ${response.status}`);
+      }
       const acceptance = mode === "current"
         ? await replayAcceptance(item, response)
         : "newlyAccepted";
@@ -533,6 +573,8 @@ export async function replayConnectorOutboxes(options: {
     newlyAccepted,
     projectionQueued,
     failed,
+    rejected,
+    rejectedByReason,
     legacySkipped: mode === "current" ? inspection.legacy : 0,
   };
 }

@@ -86,6 +86,22 @@ describe("observation projection active index", () => {
     expect(rows[0].observationId).toBe("b");
   });
 
+  // Live store 2026-09-11: a row read "running" in the index while its
+  // canonical row said "succeeded" -- the worker was killed between the two
+  // writes of the helper (canonical first, then the index delete). The
+  // canonical row is the truth; a reader drops an index row it contradicts.
+  it("drops an index row whose canonical row has already succeeded", async () => {
+    const kv = mockKV();
+    await kv.set(KV.observationProjectionsActive, "__built", { builtAt: "2026-09-11T00:00:00Z", rows: 2 });
+    await kv.set(KV.observationProjections, "a", row("a", "succeeded", 1));
+    await kv.set(KV.observationProjectionsActive, "a", row("a", "running", 1));
+    await kv.set(KV.observationProjections, "b", row("b", "pending"));
+    await kv.set(KV.observationProjectionsActive, "b", row("b", "pending"));
+    const rows = await listActiveProjections(kv as never);
+    expect(rows.map((r) => r.observationId)).toEqual(["b"]);
+    expect(await kv.get(KV.observationProjectionsActive, "a")).toBeNull();
+  });
+
   it("no source file writes the full projection scope except through the helper", () => {
     // A direct write leaves the index stale and the readers blind to that
     // row. The helper is the only writer; this test keeps it that way.

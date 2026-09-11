@@ -80,6 +80,21 @@ export async function listActiveProjections(
   if (!built) {
     await rebuildActiveProjectionIndex(kv);
   }
-  const rows = await kv.list<unknown>(KV.observationProjectionsActive);
-  return rows.filter(isRow);
+  const rows = await kv.list<unknown>(KV.observationProjectionsActive).then((r) => r.filter(isRow));
+  // The canonical row is the truth. A worker killed between the helper's two
+  // writes (canonical first, index second) leaves an index row that says
+  // running for a row that has succeeded; the active set is small, so one
+  // get per row is cheap, and a contradicted row is dropped here.
+  const live: ObservationProjection[] = [];
+  for (const row of rows) {
+    const canonical = await kv
+      .get<ObservationProjection>(KV.observationProjections, row.observationId)
+      .catch(() => null);
+    if (canonical && canonical.status === "succeeded") {
+      await kv.delete(KV.observationProjectionsActive, row.observationId).catch(() => {});
+      continue;
+    }
+    live.push(canonical ?? row);
+  }
+  return live;
 }
