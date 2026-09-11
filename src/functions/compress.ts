@@ -8,6 +8,7 @@ import type {
   MemoryProvider,
 } from "../types.js";
 import { KV, STREAM } from "../state/schema.js";
+import { publishStreamItems } from "./stream-publish.js";
 import { StateKV } from "../state/kv.js";
 import {
   COMPRESSION_SYSTEM,
@@ -226,44 +227,36 @@ export function registerCompressFunction(
         );
         scheduleIndexSave();
 
-        const streamResults = await Promise.allSettled([
-          sdk.trigger({
-            function_id: "stream::set",
-            payload: {
-              stream_name: STREAM.name,
-              group_id: STREAM.group(data.sessionId),
-              item_id: data.observationId,
-              data: { type: "compressed", observation: compressed },
-            },
-          }),
-          sdk.trigger({
-            function_id: "stream::send",
-            payload: {
-              stream_name: STREAM.name,
-              group_id: STREAM.viewerGroup,
-              id: `compressed-${data.observationId}`,
-              type: "compressed_observation",
-              data: {
-                type: "compressed",
-                observation: compressed,
-                sessionId: data.sessionId,
+        await publishStreamItems(
+          sdk,
+          [
+            {
+              function_id: "stream::set",
+              payload: {
+                stream_name: STREAM.name,
+                group_id: STREAM.group(data.sessionId),
+                item_id: data.observationId,
+                data: { type: "compressed", observation: compressed },
               },
             },
-            action: TriggerAction.Void(),
-          }),
-        ]);
-        for (const result of streamResults) {
-          if (result.status === "rejected") {
-            logger.warn("Non-fatal stream publish failure after compress", {
-              sessionId: data.sessionId,
-              observationId: data.observationId,
-              error:
-                result.reason instanceof Error
-                  ? result.reason.message
-                  : String(result.reason),
-            });
-          }
-        }
+            {
+              function_id: "stream::send",
+              payload: {
+                stream_name: STREAM.name,
+                group_id: STREAM.viewerGroup,
+                id: `compressed-${data.observationId}`,
+                type: "compressed_observation",
+                data: {
+                  type: "compressed",
+                  observation: compressed,
+                  sessionId: data.sessionId,
+                },
+              },
+              action: TriggerAction.Void(),
+            },
+          ],
+          { where: "compress", sessionId: data.sessionId, observationId: data.observationId },
+        );
 
         const latencyMs = Date.now() - startMs;
         if (metricsStore) {

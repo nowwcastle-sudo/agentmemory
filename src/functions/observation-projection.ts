@@ -6,6 +6,7 @@ import type {
   SessionProjection,
 } from "../types.js";
 import { KV, STREAM } from "../state/schema.js";
+import { publishStreamItems } from "./stream-publish.js";
 import { StateKV } from "../state/kv.js";
 import { withKeyedLock } from "../state/keyed-mutex.js";
 import {
@@ -361,43 +362,35 @@ export function registerObservationProjectionFunction(
             );
             scheduleIndexSave();
 
-            const streamResults = await Promise.allSettled([
-              sdk.trigger({
-                function_id: "stream::set",
-                payload: {
-                  stream_name: STREAM.name,
-                  group_id: STREAM.group(data.sessionId),
-                  item_id: data.observationId,
-                  data: { type: "compressed", observation: synthetic },
-                },
-              }),
-              sdk.trigger({
-                function_id: "stream::set",
-                payload: {
-                  stream_name: STREAM.name,
-                  group_id: STREAM.viewerGroup,
-                  item_id: data.observationId,
-                  data: {
-                    type: "compressed",
-                    observation: synthetic,
-                    sessionId: data.sessionId,
+            await publishStreamItems(
+              sdk,
+              [
+                {
+                  function_id: "stream::set",
+                  payload: {
+                    stream_name: STREAM.name,
+                    group_id: STREAM.group(data.sessionId),
+                    item_id: data.observationId,
+                    data: { type: "compressed", observation: synthetic },
                   },
                 },
-                action: TriggerAction.Void(),
-              }),
-            ]);
-            for (const result of streamResults) {
-              if (result.status === "rejected") {
-                logger.warn("Non-fatal stream publish failure after projection", {
-                  sessionId: data.sessionId,
-                  observationId: data.observationId,
-                  error:
-                    result.reason instanceof Error
-                      ? result.reason.message
-                      : String(result.reason),
-                });
-              }
-            }
+                {
+                  function_id: "stream::set",
+                  payload: {
+                    stream_name: STREAM.name,
+                    group_id: STREAM.viewerGroup,
+                    item_id: data.observationId,
+                    data: {
+                      type: "compressed",
+                      observation: synthetic,
+                      sessionId: data.sessionId,
+                    },
+                  },
+                  action: TriggerAction.Void(),
+                },
+              ],
+              { where: "projection", sessionId: data.sessionId, observationId: data.observationId },
+            );
           }
 
           try {

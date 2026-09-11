@@ -9,6 +9,7 @@ import type {
 
 const TOOL_HOOKS = new Set(["pre_tool_use", "post_tool_use", "post_tool_failure"]);
 import { KV, STREAM, fingerprintId, generateId } from "../state/schema.js";
+import { publishStreamItems } from "./stream-publish.js";
 import { StateKV } from "../state/kv.js";
 import { DedupMap } from "./dedup.js";
 import { withKeyedLock } from "../state/keyed-mutex.js";
@@ -421,45 +422,36 @@ export function registerObserveFunction(
       );
 
       if (isNewCapture) {
-        void Promise.allSettled([
-          sdk.trigger({
-            function_id: "stream::set",
-            payload: {
-              stream_name: STREAM.name,
-              group_id: STREAM.group(payload.sessionId),
-              item_id: obsId,
-              data: { type: "raw", observation: raw },
-            },
-          }),
-          sdk.trigger({
-            function_id: "stream::send",
-            payload: {
-              stream_name: STREAM.name,
-              group_id: STREAM.viewerGroup,
-              id: `raw-${obsId}`,
-              type: "raw_observation",
-              data: {
-                type: "raw",
-                observation: raw,
-                sessionId: payload.sessionId,
+        void publishStreamItems(
+          sdk,
+          [
+            {
+              function_id: "stream::set",
+              payload: {
+                stream_name: STREAM.name,
+                group_id: STREAM.group(payload.sessionId),
+                item_id: obsId,
+                data: { type: "raw", observation: raw },
               },
             },
-            action: TriggerAction.Void(),
-          }),
-        ]).then((streamResults) => {
-          for (const result of streamResults) {
-            if (result.status === "rejected") {
-              logger.warn("Non-fatal raw observation stream publish failure", {
-                observationId: obsId,
-                sessionId: payload.sessionId,
-                error:
-                  result.reason instanceof Error
-                    ? result.reason.message
-                    : String(result.reason),
-              });
-            }
-          }
-        });
+            {
+              function_id: "stream::send",
+              payload: {
+                stream_name: STREAM.name,
+                group_id: STREAM.viewerGroup,
+                id: `raw-${obsId}`,
+                type: "raw_observation",
+                data: {
+                  type: "raw",
+                  observation: raw,
+                  sessionId: payload.sessionId,
+                },
+              },
+              action: TriggerAction.Void(),
+            },
+          ],
+          { where: "observe", sessionId: payload.sessionId, observationId: obsId },
+        );
       }
 
       void sdk
