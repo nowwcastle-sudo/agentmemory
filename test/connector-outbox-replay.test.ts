@@ -12,6 +12,7 @@ import {
   startConnectorOutboxReplayLoop,
 } from "../src/functions/connector-outbox.js";
 import { mockSdk } from "./helpers/mocks.js";
+import { logger } from "../src/logger.js";
 
 async function writeEnvelope(
   dir: string,
@@ -812,6 +813,44 @@ describe("connector outbox replay", () => {
       })) as { newlyAccepted: number };
       expect(single.newlyAccepted).toBe(1);
     } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  // A failed envelope is restored and counted, and nothing else: during the
+  // 2026-09-11 drain one envelope failed on every round for 50 rounds and the
+  // log had no line saying which one or why.
+  it("names the envelope and the error when a replay fails", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agentmemory-outbox-failed-"));
+    const codex = join(root, "codex");
+    const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
+    const fetchMock = vi.fn(async (_url: string | URL, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body || "{}")) as { captureId?: string };
+      if (body.captureId === "codex:poison") throw new TypeError("fetch failed: socket hang up");
+      return new Response(JSON.stringify({ deduplicated: false }), { status: 201 });
+    });
+    try {
+      await writeEnvelope(codex, "poison.json", {
+        schemaVersion: 2,
+        path: "/agentmemory/observe",
+        body: { captureId: "codex:poison" },
+        createdAt: "2026-09-04T00:00:00.000Z",
+      });
+      const result = await replayConnectorOutboxes({
+        outboxes: [{ adapter: "codex", dir: codex }],
+        baseUrl: "http://127.0.0.1:3111",
+        fetchImpl: fetchMock,
+        timeoutMs: 50,
+        limit: 20,
+      });
+      expect(result).toMatchObject({ failed: 1, delivered: 0 });
+      expect(await readdir(codex)).toEqual(["poison.json"]);
+      const line = warn.mock.calls.find(([message]) => String(message).includes("replay failed"));
+      expect(line).toBeDefined();
+      expect(JSON.stringify(line?.[1])).toContain("poison.json");
+      expect(JSON.stringify(line?.[1])).toContain("socket hang up");
+    } finally {
+      warn.mockRestore();
       await rm(root, { recursive: true, force: true });
     }
   });

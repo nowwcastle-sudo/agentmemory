@@ -566,7 +566,14 @@ export async function replayConnectorOutboxes(options: {
         accepted += 1;
         if (mode === "current" && !replayingTerminalSession && accepted >= acceptBudget) break;
       }
-    } catch {
+    } catch (error) {
+      // The envelope goes back to the queue; without this line a poison
+      // envelope fails on every pass and nothing says which one or why.
+      logger.warn("Connector outbox replay failed for an envelope", {
+        file: basename(item.file),
+        path: requestPath(item.envelope.path),
+        error: error instanceof Error ? error.message : String(error),
+      });
       await restoreClaim(claim, item.file);
       failed += 1;
       if (replayingTerminalSession) break;
