@@ -16,6 +16,8 @@ import type { IndexPersistenceStatus } from "../types.js";
 // (floor 1 s). Deletes still flush immediately through flushIndexSave().
 const DEFAULT_DEBOUNCE_MS = 60_000;
 const MIN_DEBOUNCE_MS = 1_000;
+/** Under continuous mutation a save is forced after this many debounce intervals. */
+const MAX_WAIT_DEBOUNCES = 5;
 const FAILURE_LOG_THROTTLE_MS = 60_000;
 
 export function indexSaveDebounceMs(
@@ -109,6 +111,8 @@ function isValidShardDescriptor(
 
 export class IndexPersistence {
   private timer: ReturnType<typeof setTimeout> | null = null;
+  /** When the oldest unsaved mutation arrived; null once a save has started. */
+  private firstPendingAt: number | null = null;
   private lastFailureLogAt = 0;
   private status: IndexPersistenceStatus = { dirty: false };
   private statusWrite: Promise<void> = Promise.resolve();
@@ -133,13 +137,22 @@ export class IndexPersistence {
       void this.persistStatus();
     }
     if (this.timer) clearTimeout(this.timer);
+    // A trailing debounce alone never fires while mutations keep arriving
+    // (live 2026-09-12 11:13-11:17: a projection every few seconds, no save
+    // for four minutes, and a crash would have left the index without them).
+    // Once the first pending mutation is MAX_WAIT_DEBOUNCES intervals old
+    // the save runs on the next tick regardless.
+    const now = Date.now();
+    if (this.firstPendingAt === null) this.firstPendingAt = now;
+    const debounce = this.options.debounceMs ?? indexSaveDebounceMs();
+    const overdue = now - this.firstPendingAt >= debounce * MAX_WAIT_DEBOUNCES;
     // setTimeout discards the returned promise, so any rejection inside
     // save() would surface as unhandledRejection and crash the process
     // under sustained iii-engine write timeouts (issue #204). Funnel
     // rejections through logFailure() instead.
     this.timer = setTimeout(() => {
       void this.save();
-    }, this.options.debounceMs ?? indexSaveDebounceMs());
+    }, overdue ? 0 : debounce);
   }
 
   save(): Promise<boolean> {
@@ -156,6 +169,7 @@ export class IndexPersistence {
       clearTimeout(this.timer);
       this.timer = null;
     }
+    this.firstPendingAt = null;
     const savingVersion = this.mutationVersion;
     const attemptAt = new Date().toISOString();
     this.status = {

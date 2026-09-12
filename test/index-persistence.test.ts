@@ -123,6 +123,19 @@ describe("IndexPersistence", () => {
     await vi.advanceTimersByTimeAsync(250);
     expect(await quickKv.get(BM25_SCOPE, BM25_MANIFEST_KEY)).not.toBeNull();
 
+    // A trailing debounce alone never fires while mutations keep coming
+    // (live 2026-09-12 11:13-11:17: projections every few seconds, no save
+    // for four minutes). A save is forced once the first pending mutation is
+    // five debounce intervals old.
+    const busyKv = mockKV();
+    const busy = new IndexPersistence(busyKv as never, bm25, null, { debounceMs: 1_000 });
+    for (let tick = 0; tick < 12; tick += 1) {
+      busy.scheduleSave();
+      await vi.advanceTimersByTimeAsync(500);
+      if (tick === 8) expect(await busyKv.get(BM25_SCOPE, BM25_MANIFEST_KEY)).toBeNull();
+    }
+    expect(await busyKv.get(BM25_SCOPE, BM25_MANIFEST_KEY)).not.toBeNull();
+
     expect(indexSaveDebounceMs({})).toBe(60_000);
     expect(indexSaveDebounceMs({ AGENTMEMORY_INDEX_SAVE_DEBOUNCE_MS: "15000" })).toBe(15_000);
     expect(indexSaveDebounceMs({ AGENTMEMORY_INDEX_SAVE_DEBOUNCE_MS: "10" })).toBe(1_000);
