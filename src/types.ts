@@ -389,6 +389,16 @@ export interface HealthSnapshot {
   alerts: string[];
   notes?: string[];
   pipeline?: PipelineHealth;
+  /** Top scopes by whole-scope list volume since boot (problem 1 accounting). */
+  kvLists?: Array<{
+    scope: string;
+    calls: number;
+    rows: number;
+    maxRows: number;
+    estBytes: number;
+    lastAt: string;
+    callers: Record<string, number>;
+  }>;
   connectorOutbox?: {
     /**
      * Counted over the bounded scan window, not the whole directory. When

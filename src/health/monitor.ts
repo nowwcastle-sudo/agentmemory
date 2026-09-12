@@ -3,6 +3,7 @@ import v8 from "node:v8";
 import type { HealthSnapshot } from "../types.js";
 import type { StateKV } from "../state/kv.js";
 import { KV } from "../state/schema.js";
+import { getKvListStats } from "../state/kv-list-stats.js";
 import { evaluateHealth } from "./thresholds.js";
 import { collectPipelineHealth } from "./pipeline.js";
 import { getIndexPersistenceStatus } from "../functions/search.js";
@@ -92,6 +93,7 @@ export function registerHealthMonitor(
       eventLoopLagMs,
       uptimeSeconds: uptime,
       kvConnectivity,
+      kvLists: getKvListStats(20),
       status: "healthy",
       alerts: [],
     };

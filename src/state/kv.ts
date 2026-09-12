@@ -1,5 +1,6 @@
 import type { ISdk } from 'iii-sdk'
 import { emitKvWrite } from './kv-write-hooks.js'
+import { kvListCaller, recordKvList } from './kv-list-stats.js'
 
 // A lone surrogate cannot be encoded as UTF-8. The state worker never answers
 // a set carrying one, and the caller waits out its invocation timeout (live
@@ -80,9 +81,12 @@ export class StateKV {
   }
 
   async list<T = unknown>(scope: string): Promise<T[]> {
-    return this.sdk.trigger<{ scope: string }, T[]>({
+    const caller = kvListCaller()
+    const rows = await this.sdk.trigger<{ scope: string }, T[]>({
       function_id: 'state::list',
       payload: { scope },
     })
+    recordKvList(scope, rows as unknown[], caller)
+    return rows
   }
 }
