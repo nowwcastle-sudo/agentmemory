@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { IndexPersistence } from "../src/state/index-persistence.js";
+import { IndexPersistence, indexSaveDebounceMs } from "../src/state/index-persistence.js";
 import { SearchIndex } from "../src/state/search-index.js";
 import { VectorIndex } from "../src/state/vector-index.js";
 import type { CompressedObservation } from "../src/types.js";
@@ -98,6 +98,35 @@ describe("IndexPersistence", () => {
     } else {
       process.env.AGENTMEMORY_AUDIT_INDEX_PERSIST = previousAuditFlag;
     }
+  });
+
+  // Every debounced save serialises the whole BM25 index (51.8 MB on the live
+  // corpus) and the whole vector index (145.9 MB) on the main thread; at the
+  // old 5 s cadence that was one 2-5 s event-loop stall after any burst of
+  // mutations (2026-09-12: health 503, /sessions timeouts, the outbox grew
+  // from 44 to 231 while hooks fell back). The cadence is an option now,
+  // read from AGENTMEMORY_INDEX_SAVE_DEBOUNCE_MS, one minute by default.
+  it("waits the configured debounce before a save, one minute by default", async () => {
+    const bm25 = new SearchIndex();
+    bm25.add(makeObs({ id: "obs_1", title: "auth handler" }));
+    const persistence = new IndexPersistence(kv as never, bm25, null);
+
+    persistence.scheduleSave();
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(await kv.get(BM25_SCOPE, BM25_MANIFEST_KEY)).toBeNull();
+    await vi.advanceTimersByTimeAsync(55_000);
+    expect(await kv.get(BM25_SCOPE, BM25_MANIFEST_KEY)).not.toBeNull();
+
+    const quickKv = mockKV();
+    const quick = new IndexPersistence(quickKv as never, bm25, null, { debounceMs: 250 });
+    quick.scheduleSave();
+    await vi.advanceTimersByTimeAsync(250);
+    expect(await quickKv.get(BM25_SCOPE, BM25_MANIFEST_KEY)).not.toBeNull();
+
+    expect(indexSaveDebounceMs({})).toBe(60_000);
+    expect(indexSaveDebounceMs({ AGENTMEMORY_INDEX_SAVE_DEBOUNCE_MS: "15000" })).toBe(15_000);
+    expect(indexSaveDebounceMs({ AGENTMEMORY_INDEX_SAVE_DEBOUNCE_MS: "10" })).toBe(1_000);
+    expect(indexSaveDebounceMs({ AGENTMEMORY_INDEX_SAVE_DEBOUNCE_MS: "soon" })).toBe(60_000);
   });
 
   it("saves and loads BM25 index round-trip", async () => {

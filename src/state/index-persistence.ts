@@ -7,8 +7,26 @@ import { logger } from "../logger.js";
 import { safeAudit } from "../functions/audit.js";
 import type { IndexPersistenceStatus } from "../types.js";
 
-const DEBOUNCE_MS = 5000;
+// A save serialises the whole BM25 index and the whole vector index on the
+// main thread (51.8 MB and 145.9 MB of JSON on the 2026-09-12 corpus), hashes
+// every 2 MB shard, and ships the changed shards through the engine. At the
+// old 5 s cadence any burst of projections became one 2-5 s event-loop stall
+// after another: health 503, /sessions timeouts, hooks falling back to the
+// outbox. One minute by default; AGENTMEMORY_INDEX_SAVE_DEBOUNCE_MS overrides
+// (floor 1 s). Deletes still flush immediately through flushIndexSave().
+const DEFAULT_DEBOUNCE_MS = 60_000;
+const MIN_DEBOUNCE_MS = 1_000;
 const FAILURE_LOG_THROTTLE_MS = 60_000;
+
+export function indexSaveDebounceMs(
+  env: Record<string, string | undefined> = process.env,
+): number {
+  const raw = env["AGENTMEMORY_INDEX_SAVE_DEBOUNCE_MS"]?.trim();
+  if (!raw) return DEFAULT_DEBOUNCE_MS;
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed)) return DEFAULT_DEBOUNCE_MS;
+  return Math.max(MIN_DEBOUNCE_MS, parsed);
+}
 const INDEX_PERSISTENCE_FUNCTION_ID = "mem::index-persistence";
 const BM25_KEY = "data";
 const BM25_MANIFEST_KEY = "data:manifest";
@@ -37,6 +55,8 @@ type IndexShardManifest = {
 type IndexPersistenceOptions = {
   shardChars?: number;
   createGeneration?: () => string;
+  /** Delay between the last mutation and the save it triggers. */
+  debounceMs?: number;
 };
 
 function shardChars(options: IndexPersistenceOptions): number {
@@ -119,7 +139,7 @@ export class IndexPersistence {
     // rejections through logFailure() instead.
     this.timer = setTimeout(() => {
       void this.save();
-    }, DEBOUNCE_MS);
+    }, this.options.debounceMs ?? indexSaveDebounceMs());
   }
 
   save(): Promise<boolean> {

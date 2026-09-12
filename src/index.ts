@@ -28,7 +28,7 @@ import {
   graphLegModeFromEnv,
   graphMinQueryTokensFromEnv,
 } from "./state/hybrid-search.js";
-import { IndexPersistence } from "./state/index-persistence.js";
+import { IndexPersistence, indexSaveDebounceMs } from "./state/index-persistence.js";
 import { registerPrivacyFunction } from "./functions/privacy.js";
 import { registerObserveFunction } from "./functions/observe.js";
 import { registerObservationProjectionFunction } from "./functions/observation-projection.js";
@@ -486,7 +486,11 @@ async function main() {
   registerEventTriggers(sdk, kv);
   registerMcpEndpoints(sdk, kv, secret);
 
-  const indexPersistence = new IndexPersistence(kv, bm25Index, vectorIndex);
+  const indexSaveDebounce = indexSaveDebounceMs();
+  const indexPersistence = new IndexPersistence(kv, bm25Index, vectorIndex, {
+    debounceMs: indexSaveDebounce,
+  });
+  bootLog(`Index persistence: debounce ${indexSaveDebounce} ms (AGENTMEMORY_INDEX_SAVE_DEBOUNCE_MS)`);
   // Wire the persistence hook so delete paths can flush BM25/vector
   // index mutations to disk. Without this, an in-memory remove can be
   // lost across a hard process exit and the persisted snapshot
