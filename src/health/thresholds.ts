@@ -26,6 +26,32 @@ const DEFAULTS: ThresholdConfig = {
   nowMs: 0,
 };
 
+/**
+ * The HTTP code for GET /agentmemory/health: whether the service can answer
+ * at all, not how loaded it is. "critical" covers a busy CPU and a slow event
+ * loop; on 2026-09-12 a worker that captured and searched fine answered 503
+ * for most of an hour and every monitor read it as down. 503 only when the
+ * store cannot be reached or the engine connection is gone; load stays in the
+ * body's status and alerts.
+ */
+export function healthHttpStatus(
+  snapshot:
+    | Pick<HealthSnapshot, "connectionState" | "kvConnectivity">
+    | null
+    | undefined,
+): 200 | 503 {
+  if (!snapshot) return 200;
+  if (
+    snapshot.connectionState === "disconnected" ||
+    snapshot.connectionState === "failed"
+  ) {
+    return 503;
+  }
+  const kv = snapshot.kvConnectivity?.status;
+  if (kv && kv !== "ok") return 503;
+  return 200;
+}
+
 export function evaluateHealth(
   snapshot: HealthSnapshot,
   config: Partial<ThresholdConfig> = {},
