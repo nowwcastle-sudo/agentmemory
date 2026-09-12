@@ -24,6 +24,7 @@ import { stripPrivateData } from "./privacy.js";
 import { logger } from "../logger.js";
 import { graphSourceFingerprint } from "../state/source-fingerprint.js";
 import { withKeyedLock } from "../state/keyed-mutex.js";
+import { writeGraphProjection } from "./graph-projection-index.js";
 import {
   markProjectionFailed,
   markProjectionPending,
@@ -280,7 +281,7 @@ export function registerGraphSourceProjectionFunction(
                 key,
                 previous?.updatedAt ?? projection.updatedAt,
               );
-              await kv.set(KV.graphProjections, key, projection);
+              await writeGraphProjection(kv, key, projection);
               return {
                 kind: "pending",
                 item: { key, source, projection },
@@ -303,7 +304,7 @@ export function registerGraphSourceProjectionFunction(
                   : {}),
                 lastError: projectionError(error),
               };
-              await kv.set(KV.graphProjections, key, failed);
+              await writeGraphProjection(kv, key, failed);
               await markProjectionFailed(
                 kv,
                 "graph",
@@ -403,7 +404,7 @@ export function registerGraphSourceProjectionFunction(
                 ...(outcome ? { outcome } : {}),
                 updatedAt: new Date().toISOString(),
               };
-              await kv.set(KV.graphProjections, item.key, succeeded);
+              await writeGraphProjection(kv, item.key, succeeded);
               await markProjectionSucceeded(kv, "graph", item.key);
             });
           }
@@ -428,7 +429,7 @@ export function registerGraphSourceProjectionFunction(
                 updatedAt: new Date().toISOString(),
                 lastError,
               };
-              await kv.set(KV.graphProjections, item.key, failed);
+              await writeGraphProjection(kv, item.key, failed);
               await markProjectionFailed(
                 kv,
                 "graph",

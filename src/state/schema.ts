@@ -12,6 +12,8 @@ export const KV = {
   sessionProjections: "mem:session:projections",
   maintenanceProjections: "mem:maintenance:projections",
   graphProjections: "mem:graph:projections",
+  // Non-succeeded graph projection rows only; kept by graph-projection-index.ts.
+  graphProjectionsActive: "mem:graph:projections:active",
   projectionPending: (stage: "compression" | "summary" | "graph") =>
     `mem:pipeline:${stage}:pending`,
   projectionFailed: (stage: "compression" | "summary" | "graph") =>

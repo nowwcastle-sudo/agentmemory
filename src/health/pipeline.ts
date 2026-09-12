@@ -13,6 +13,7 @@ import type { StateKV } from "../state/kv.js";
 import { KV } from "../state/schema.js";
 import { withKeyedLock } from "../state/keyed-mutex.js";
 import { listActiveProjections } from "../functions/observation-projection-index.js";
+import { listActiveGraphProjections } from "../functions/graph-projection-index.js";
 import { isAutoCompressEnabled } from "../config.js";
 import type { ProjectionCoordinator } from "../functions/projection-coordinator.js";
 
@@ -147,7 +148,8 @@ export async function reconcilePipelineMarkers(
     // the "not known" branch below, the same outcome as before.
     listActiveProjections(kv),
     kv.list<SessionProjection>(KV.sessionProjections),
-    kv.list<GraphProjection>(KV.graphProjections),
+    // Non-succeeded rows only: the full scope is 130k rows / 46.6 MB live.
+    listActiveGraphProjections(kv),
   ]);
 
   const reconcileStage = async (
@@ -340,7 +342,7 @@ export async function reconcilePipelineWork(
     }
     if (summary.length > 0) providerWorkRemaining = 0;
 
-    const graphStates = await kv.list<GraphProjection>(KV.graphProjections);
+    const graphStates = await listActiveGraphProjections(kv);
     const dueGraph = graphStates.filter((projection) =>
       isRetryDue(projection, automatic, now),
     );
