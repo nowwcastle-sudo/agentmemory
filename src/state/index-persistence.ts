@@ -248,6 +248,13 @@ export class IndexPersistence {
     // Files first; a store from before the files still answers through the
     // KV shards, and the next save writes the files.
     if (this.options.files) {
+      const swept = await this.options.files.sweepTemporaries().catch(() => 0);
+      if (swept > 0) {
+        logger.info("Removed index temp files left by an interrupted save", {
+          dir: this.options.files.dir,
+          removed: swept,
+        });
+      }
       const fileBm25 = await this.options.files.readBm25().catch((err) => {
         logger.warn("Index file unreadable; falling back to KV shards", {
           file: this.options.files?.bm25Path,

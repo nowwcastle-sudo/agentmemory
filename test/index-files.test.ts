@@ -113,6 +113,26 @@ describe("IndexFileStore", () => {
     }
   });
 
+  it("sweeps temp files left by a process killed mid-write, and keeps its own", async () => {
+    // Live 2026-09-12 11:55: vectors.bin.tmp-18116 beside vectors.bin after a
+    // worker was force-stopped during a save.
+    const dir = await mkdtemp(join(tmpdir(), "agentmemory-index-files-"));
+    try {
+      const store = new IndexFileStore(dir);
+      await store.writeVectors(sampleVectors());
+      const { writeFile } = await import("node:fs/promises");
+      await writeFile(join(dir, "vectors.bin.tmp-18116"), "half");
+      await writeFile(join(dir, "bm25.json.tmp-4"), "half");
+      await writeFile(join(dir, `bm25.json.tmp-${process.pid}`), "mine");
+      const removed = await store.sweepTemporaries();
+      expect(removed).toBe(2);
+      const files = (await readdir(dir)).sort();
+      expect(files).toEqual([`bm25.json.tmp-${process.pid}`, "vectors.bin"]);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   it("refuses a vector file whose header and block disagree", async () => {
     const dir = await mkdtemp(join(tmpdir(), "agentmemory-index-files-"));
     try {

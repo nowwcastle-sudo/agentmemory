@@ -1,4 +1,4 @@
-import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { VectorIndex, type VectorBinaryHeader } from "./vector-index.js";
 
@@ -93,6 +93,30 @@ export class IndexFileStore {
       if (isMissing(error)) return null;
       throw error;
     }
+  }
+
+  /**
+   * Removes `*.tmp-<pid>` files another process left behind when it was
+   * killed mid-write (a force-stopped worker during a save leaves one beside
+   * the real file). This process's own temp files are left alone.
+   */
+  async sweepTemporaries(): Promise<number> {
+    let names: string[];
+    try {
+      names = await readdir(this.dir);
+    } catch (error) {
+      if (isMissing(error)) return 0;
+      throw error;
+    }
+    const mine = `.tmp-${process.pid}`;
+    let removed = 0;
+    for (const name of names) {
+      const match = /^(vectors\.bin|bm25\.json)\.tmp-\d+$/.exec(name);
+      if (!match || name.endsWith(mine)) continue;
+      await rm(join(this.dir, name), { force: true }).catch(() => {});
+      removed += 1;
+    }
+    return removed;
   }
 
   private async writeAtomic(path: string, data: Buffer): Promise<void> {
