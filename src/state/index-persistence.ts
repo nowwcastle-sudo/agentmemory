@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { SearchIndex } from "./search-index.js";
 import { VectorIndex } from "./vector-index.js";
+import type { IndexFileStore } from "./index-files.js";
 import type { StateKV } from "./kv.js";
 import { KV, generateId } from "./schema.js";
 import { logger } from "../logger.js";
@@ -59,6 +60,12 @@ type IndexPersistenceOptions = {
   createGeneration?: () => string;
   /** Delay between the last mutation and the save it triggers. */
   debounceMs?: number;
+  /**
+   * Files on the worker's disk for both indexes. When set, saves go to the
+   * files only (nothing crosses the engine) and loads read the files first,
+   * falling back to the KV shards a store from before the files still holds.
+   */
+  files?: IndexFileStore;
 };
 
 function shardChars(options: IndexPersistenceOptions): number {
@@ -180,9 +187,14 @@ export class IndexPersistence {
     };
     await this.persistStatus().catch(() => {});
     try {
-      await this.saveBm25Index(this.bm25.serialize());
-      if (this.vector) {
-        await this.saveVectorIndex(this.vector.serialize());
+      if (this.options.files) {
+        await this.options.files.writeBm25(this.bm25.serialize());
+        if (this.vector) await this.options.files.writeVectors(this.vector);
+      } else {
+        await this.saveBm25Index(this.bm25.serialize());
+        if (this.vector) {
+          await this.saveVectorIndex(this.vector.serialize());
+        }
       }
       const lastSuccessAt = new Date().toISOString();
       const caughtUp = this.mutationVersion === savingVersion;
@@ -233,14 +245,39 @@ export class IndexPersistence {
     let bm25: SearchIndex | null = null;
     let vector: VectorIndex | null = null;
 
-    const bm25Data = await this.loadBm25Data();
-    if (bm25Data && typeof bm25Data === "string") {
-      bm25 = SearchIndex.deserialize(bm25Data);
+    // Files first; a store from before the files still answers through the
+    // KV shards, and the next save writes the files.
+    if (this.options.files) {
+      const fileBm25 = await this.options.files.readBm25().catch((err) => {
+        logger.warn("Index file unreadable; falling back to KV shards", {
+          file: this.options.files?.bm25Path,
+          error: errorMessage(err),
+        });
+        return null;
+      });
+      if (fileBm25) bm25 = SearchIndex.deserialize(fileBm25);
+      const fileVector = await this.options.files.readVectors().catch((err) => {
+        logger.warn("Index file unreadable; falling back to KV shards", {
+          file: this.options.files?.vectorsPath,
+          error: errorMessage(err),
+        });
+        return null;
+      });
+      if (fileVector) vector = fileVector;
     }
 
-    const vecData = await this.loadVectorData();
-    if (vecData && typeof vecData === "string") {
-      vector = VectorIndex.deserialize(vecData);
+    if (!bm25) {
+      const bm25Data = await this.loadBm25Data();
+      if (bm25Data && typeof bm25Data === "string") {
+        bm25 = SearchIndex.deserialize(bm25Data);
+      }
+    }
+
+    if (!vector) {
+      const vecData = await this.loadVectorData();
+      if (vecData && typeof vecData === "string") {
+        vector = VectorIndex.deserialize(vecData);
+      }
     }
 
     if (this.status.dirty && bm25 && (!this.vector || vector)) {

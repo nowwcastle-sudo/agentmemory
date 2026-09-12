@@ -43,6 +43,23 @@ function cosineSimilarity(a: Float32Array, b: Float32Array): number {
   return denom === 0 ? 0 : dot / denom;
 }
 
+export type VectorBinaryMeta = {
+  sourceKind?: GraphSourceKind;
+  projectId?: string;
+  actorAgentId?: string;
+  visibility?: GraphVisibility;
+};
+/** [obsId, sessionId, length, meta?] */
+export type VectorBinaryEntry =
+  | [string, string, number]
+  | [string, string, number, VectorBinaryMeta];
+export type VectorBinaryHeader = {
+  v: 1;
+  count: number;
+  floats: number;
+  entries: VectorBinaryEntry[];
+};
+
 export class VectorIndex {
   private vectors: Map<
     string,
@@ -124,6 +141,62 @@ export class VectorIndex {
 
   get size(): number {
     return this.vectors.size;
+  }
+
+  /**
+   * The index as one JSON header plus one Float32 block, for a file on the
+   * worker's disk. serialize() produces 145.9 MB of base64-in-JSON for the
+   * live 64k vectors and takes seconds on the main thread; this is a header
+   * of ids and metadata (a few MB) and a 99 MB memcpy. Vectors of differing
+   * length are kept: each entry records its own length.
+   */
+  toBinary(): { header: VectorBinaryHeader; block: Float32Array } {
+    let total = 0;
+    for (const entry of this.vectors.values()) total += entry.embedding.length;
+    const block = new Float32Array(total);
+    const entries: VectorBinaryEntry[] = [];
+    let offset = 0;
+    for (const [obsId, entry] of this.vectors) {
+      block.set(entry.embedding, offset);
+      const meta: VectorBinaryMeta = {};
+      if (entry.sourceKind) meta.sourceKind = entry.sourceKind;
+      if (entry.projectId) meta.projectId = entry.projectId;
+      if (entry.actorAgentId) meta.actorAgentId = entry.actorAgentId;
+      if (entry.visibility) meta.visibility = entry.visibility;
+      entries.push(
+        Object.keys(meta).length > 0
+          ? [obsId, entry.sessionId, entry.embedding.length, meta]
+          : [obsId, entry.sessionId, entry.embedding.length],
+      );
+      offset += entry.embedding.length;
+    }
+    return { header: { v: 1, count: entries.length, floats: total, entries }, block };
+  }
+
+  /** Inverse of toBinary. Returns null when the header and block disagree. */
+  static fromBinary(header: VectorBinaryHeader, block: Float32Array): VectorIndex | null {
+    if (!header || header.v !== 1 || !Array.isArray(header.entries)) return null;
+    let expected = 0;
+    for (const entry of header.entries) {
+      if (!Array.isArray(entry) || typeof entry[2] !== "number" || entry[2] < 0) return null;
+      expected += entry[2];
+    }
+    if (expected !== block.length || header.entries.length !== header.count) return null;
+    const idx = new VectorIndex();
+    let offset = 0;
+    for (const [obsId, sessionId, length, meta] of header.entries) {
+      if (typeof obsId !== "string" || typeof sessionId !== "string") return null;
+      idx.vectors.set(obsId, {
+        embedding: block.subarray(offset, offset + length),
+        sessionId,
+        ...(meta?.sourceKind ? { sourceKind: meta.sourceKind } : {}),
+        ...(meta?.projectId ? { projectId: meta.projectId } : {}),
+        ...(meta?.actorAgentId ? { actorAgentId: meta.actorAgentId } : {}),
+        ...(meta?.visibility ? { visibility: meta.visibility } : {}),
+      });
+      offset += length;
+    }
+    return idx;
   }
 
   // Walks every stored vector and returns the obsIds whose dimension

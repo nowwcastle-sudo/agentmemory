@@ -29,6 +29,7 @@ import {
   graphMinQueryTokensFromEnv,
 } from "./state/hybrid-search.js";
 import { IndexPersistence, indexSaveDebounceMs } from "./state/index-persistence.js";
+import { IndexFileStore } from "./state/index-files.js";
 import { registerPrivacyFunction } from "./functions/privacy.js";
 import { registerObserveFunction } from "./functions/observe.js";
 import { registerObservationProjectionFunction } from "./functions/observation-projection.js";
@@ -125,7 +126,7 @@ import { VERSION } from "./version.js";
 import { bootLog } from "./logger.js";
 import { runtimeMetadataPath } from "./runtime-paths.js";
 import { mkdirSync, writeFileSync, unlinkSync } from "node:fs";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
 
 function workerPidfilePath(): string {
   return runtimeMetadataPath("worker.pid");
@@ -487,10 +488,20 @@ async function main() {
   registerMcpEndpoints(sdk, kv, secret);
 
   const indexSaveDebounce = indexSaveDebounceMs();
+  // Both indexes live as files on this worker's disk (binary vectors, JSON
+  // BM25); nothing about them crosses the engine any more. AGENTMEMORY_INDEX_DIR
+  // overrides the location; the KV shards of an older store are read once as
+  // the fallback and the next save writes the files.
+  const indexDir =
+    process.env["AGENTMEMORY_INDEX_DIR"]?.trim() || join(config.dataDir, "index");
+  const indexFiles = new IndexFileStore(indexDir);
   const indexPersistence = new IndexPersistence(kv, bm25Index, vectorIndex, {
     debounceMs: indexSaveDebounce,
+    files: indexFiles,
   });
-  bootLog(`Index persistence: debounce ${indexSaveDebounce} ms (AGENTMEMORY_INDEX_SAVE_DEBOUNCE_MS)`);
+  bootLog(
+    `Index persistence: files in ${indexDir} (AGENTMEMORY_INDEX_DIR), debounce ${indexSaveDebounce} ms (AGENTMEMORY_INDEX_SAVE_DEBOUNCE_MS)`,
+  );
   // Wire the persistence hook so delete paths can flush BM25/vector
   // index mutations to disk. Without this, an in-memory remove can be
   // lost across a hard process exit and the persisted snapshot
