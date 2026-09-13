@@ -23,6 +23,8 @@ export function registerHealthMonitor(
   let connectionState = "connected";
   let prevCpuUsage = process.cpuUsage();
   let prevCpuTime = Date.now();
+  let collecting = false;
+  let stopped = false;
 
   if (typeof sdk.on === "function") {
     sdk.on("connection_state", (state?: unknown) => {
@@ -116,14 +118,25 @@ export function registerHealthMonitor(
     return snapshot;
   }
 
-  collectHealth().catch(() => {});
-  const interval = setInterval(() => {
-    collectHealth().catch(() => {});
-  }, 30_000);
+  const collectOnce = (): void => {
+    if (stopped || collecting) return;
+    collecting = true;
+    collectHealth()
+      .catch(() => {})
+      .finally(() => {
+        collecting = false;
+      });
+  };
+
+  collectOnce();
+  const interval = setInterval(collectOnce, 30_000);
   interval.unref();
 
   return {
-    stop: () => clearInterval(interval),
+    stop: () => {
+      stopped = true;
+      clearInterval(interval);
+    },
   };
 }
 

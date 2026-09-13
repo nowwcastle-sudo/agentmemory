@@ -26,6 +26,42 @@ const PREFIX_BYTES = 12;
 const isMissing = (error: unknown): boolean =>
   !!error && typeof error === "object" && (error as { code?: string }).code === "ENOENT";
 
+const WINDOWS_RENAME_RETRY_CODES = new Set(["EACCES", "EPERM", "EBUSY"]);
+const WINDOWS_RENAME_RETRY_BUDGET_MS = 30_000;
+
+export async function renameIndexFile(
+  from: string,
+  to: string,
+  options: {
+    platform?: NodeJS.Platform;
+    renameFile?: typeof rename;
+    sleep?: (delayMs: number) => Promise<void>;
+    budgetMs?: number;
+  } = {},
+): Promise<void> {
+  const platform = options.platform ?? process.platform;
+  const renameFile = options.renameFile ?? rename;
+  const sleep = options.sleep ?? ((delayMs) => new Promise((resolve) => setTimeout(resolve, delayMs)));
+  const budgetMs = options.budgetMs ?? WINDOWS_RENAME_RETRY_BUDGET_MS;
+  let waitedMs = 0;
+  let delayMs = 50;
+  for (;;) {
+    try {
+      await renameFile(from, to);
+      return;
+    } catch (error) {
+      const code = (error as { code?: string })?.code;
+      if (platform !== "win32" || !WINDOWS_RENAME_RETRY_CODES.has(code ?? "") || waitedMs >= budgetMs) {
+        throw error;
+      }
+      const waitMs = Math.min(delayMs, budgetMs - waitedMs);
+      await sleep(waitMs);
+      waitedMs += waitMs;
+      delayMs = Math.min(500, delayMs * 2);
+    }
+  }
+}
+
 export class IndexFileStore {
   constructor(readonly dir: string) {}
 
@@ -124,7 +160,7 @@ export class IndexFileStore {
     const temporary = `${path}.tmp-${process.pid}`;
     try {
       await writeFile(temporary, data);
-      await rename(temporary, path);
+      await renameIndexFile(temporary, path);
     } catch (error) {
       await rm(temporary, { force: true }).catch(() => {});
       throw error;

@@ -1,8 +1,8 @@
-import { describe, it, expect } from "vitest";
-import { mkdtemp, readdir, rm } from "node:fs/promises";
+import { describe, it, expect, vi } from "vitest";
+import { mkdtemp, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { IndexFileStore } from "../src/state/index-files.js";
+import { IndexFileStore, renameIndexFile } from "../src/state/index-files.js";
 import { IndexPersistence } from "../src/state/index-persistence.js";
 import { SearchIndex } from "../src/state/search-index.js";
 import { VectorIndex } from "../src/state/vector-index.js";
@@ -108,6 +108,42 @@ describe("IndexFileStore", () => {
       const back = SearchIndex.deserialize(text!);
       expect(back.size).toBe(1);
       expect(back.search("auth")).toHaveLength(1);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("retries transient Windows rename failures without deleting the destination", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "agentmemory-index-files-"));
+    try {
+      const destination = join(dir, "vectors.bin");
+      const temporary = `${destination}.tmp-test`;
+      await writeFile(destination, "previous");
+      await writeFile(temporary, "next");
+      let attempts = 0;
+      await renameIndexFile(temporary, destination, {
+        platform: "win32",
+        renameFile: async (from, to) => {
+          attempts += 1;
+          if (attempts === 1) throw Object.assign(new Error("locked"), { code: "EPERM" });
+          await rename(from, to);
+        },
+        sleep: async () => {},
+        budgetMs: 50,
+      });
+      expect(attempts).toBe(2);
+      expect(await readFile(destination, "utf8")).toBe("next");
+
+      await writeFile(temporary, "newer");
+      await expect(renameIndexFile(temporary, destination, {
+        platform: "win32",
+        renameFile: vi.fn(async () => {
+          throw Object.assign(new Error("still locked"), { code: "EPERM" });
+        }),
+        sleep: async () => {},
+        budgetMs: 50,
+      })).rejects.toMatchObject({ code: "EPERM" });
+      expect(await readFile(destination, "utf8")).toBe("next");
     } finally {
       await rm(dir, { recursive: true, force: true });
     }

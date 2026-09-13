@@ -250,6 +250,72 @@ async function main() {
   setVectorIndex(vectorIndex);
   setEmbeddingProvider(embeddingProvider);
 
+  // Hydrate both in-memory indexes before registering any function or external
+  // entrypoint that can mutate them. Otherwise an observation accepted during
+  // load can schedule a sparse save and then be overwritten by restoreFrom.
+  const bm25Index = getSearchIndex();
+  const indexSaveDebounce = indexSaveDebounceMs();
+  const indexDir =
+    process.env["AGENTMEMORY_INDEX_DIR"]?.trim() || join(config.dataDir, "index");
+  const indexFiles = new IndexFileStore(indexDir);
+  const indexPersistence = new IndexPersistence(kv, bm25Index, vectorIndex, {
+    debounceMs: indexSaveDebounce,
+    files: indexFiles,
+  });
+  bootLog(
+    `Index persistence: files in ${indexDir} (AGENTMEMORY_INDEX_DIR), debounce ${indexSaveDebounce} ms (AGENTMEMORY_INDEX_SAVE_DEBOUNCE_MS)`,
+  );
+  setIndexPersistence(indexPersistence);
+
+  const loaded = await indexPersistence.load();
+  if (loaded?.bm25 && loaded.bm25.size > 0) {
+    bm25Index.restoreFrom(loaded.bm25);
+    bootLog(`Loaded persisted BM25 index (${bm25Index.size} docs)`);
+  }
+  if (loaded?.vector && vectorIndex && loaded.vector.size > 0) {
+    const activeDim = embeddingProvider?.dimensions ?? 0;
+    const { mismatches, seenDimensions } =
+      activeDim > 0
+        ? loaded.vector.validateDimensions(activeDim)
+        : { mismatches: [], seenDimensions: new Set<number>() };
+
+    if (mismatches.length > 0) {
+      const sample = mismatches
+        .slice(0, 5)
+        .map((m) => `${m.obsId} (dim=${m.dim})`)
+        .join(", ");
+      const distinct = Array.from(seenDimensions).sort((a, b) => a - b).join(", ");
+      const dropStale = isDropStaleIndexEnabled();
+      if (dropStale) {
+        console.warn(
+          `[agentmemory] Persisted vector index has ${mismatches.length} of ` +
+            `${loaded.vector.size} vectors with the wrong dimension. Active ` +
+            `provider (${embeddingProvider?.name}) declares ${activeDim}; ` +
+            `dimensions seen on disk: ${distinct}. ` +
+            `AGENTMEMORY_DROP_STALE_INDEX=true is set — discarding the persisted ` +
+            `vectors. Live observations will rebuild the index over time.`,
+        );
+      } else {
+        throw new Error(
+          `[agentmemory] Refusing to start: persisted vector index has ` +
+            `${mismatches.length} of ${loaded.vector.size} vectors with the ` +
+            `wrong dimension. Active provider (${embeddingProvider?.name}) ` +
+            `declares ${activeDim}; dimensions seen on disk: ${distinct}. ` +
+            `First mismatched obsIds: ${sample}. Loading would silently corrupt ` +
+            `search (cross-dimension cosine returns 0). Choose one:\n` +
+            `  - Re-embed the existing index against the new provider, then start.\n` +
+            `  - Set AGENTMEMORY_DROP_STALE_INDEX=true to discard the persisted ` +
+            `vectors and rebuild from live observations.\n` +
+            `  - Switch the embedding provider back to the one that wrote the index.`,
+        );
+      }
+    } else {
+      vectorIndex.restoreFrom(loaded.vector);
+      bootLog(`Loaded persisted vector index (${vectorIndex.size} vectors)`);
+    }
+  }
+  if (indexPersistence.getStatus().dirty) indexPersistence.scheduleSave();
+
   const meterAccessor = hasGetMeter(sdk)
     ? (sdk.getMeter.bind(sdk) as (name: string) => unknown)
     : undefined;
@@ -443,7 +509,6 @@ async function main() {
     );
   }
 
-  const bm25Index = getSearchIndex();
   const graphWeight = parseFloat(getEnvVar("AGENTMEMORY_GRAPH_WEIGHT") || "0.3");
   const hybridSearch = new HybridSearch(
     bm25Index,
@@ -486,91 +551,6 @@ async function main() {
   registerApiTriggers(sdk, kv, secret, metricsStore, provider);
   registerEventTriggers(sdk, kv);
   registerMcpEndpoints(sdk, kv, secret);
-
-  const indexSaveDebounce = indexSaveDebounceMs();
-  // Both indexes live as files on this worker's disk (binary vectors, JSON
-  // BM25); nothing about them crosses the engine any more. AGENTMEMORY_INDEX_DIR
-  // overrides the location; the KV shards of an older store are read once as
-  // the fallback and the next save writes the files.
-  const indexDir =
-    process.env["AGENTMEMORY_INDEX_DIR"]?.trim() || join(config.dataDir, "index");
-  const indexFiles = new IndexFileStore(indexDir);
-  const indexPersistence = new IndexPersistence(kv, bm25Index, vectorIndex, {
-    debounceMs: indexSaveDebounce,
-    files: indexFiles,
-  });
-  bootLog(
-    `Index persistence: files in ${indexDir} (AGENTMEMORY_INDEX_DIR), debounce ${indexSaveDebounce} ms (AGENTMEMORY_INDEX_SAVE_DEBOUNCE_MS)`,
-  );
-  // Wire the persistence hook so delete paths can flush BM25/vector
-  // index mutations to disk. Without this, an in-memory remove can be
-  // lost across a hard process exit and the persisted snapshot
-  // restores the deleted entry at next boot.
-  setIndexPersistence(indexPersistence);
-
-  const loaded = await indexPersistence.load().catch((err) => {
-    console.warn(`[agentmemory] Failed to load persisted index:`, err);
-    return null;
-  });
-  if (loaded?.bm25 && loaded.bm25.size > 0) {
-    bm25Index.restoreFrom(loaded.bm25);
-    bootLog(
-      `Loaded persisted BM25 index (${bm25Index.size} docs)`,
-    );
-  }
-  if (loaded?.vector && vectorIndex && loaded.vector.size > 0) {
-    // Persisted vectors carry whatever dimension the provider had when
-    // they were written. If the active provider declares a different
-    // dimension — or if the on-disk index contains a mix of dimensions
-    // (legacy indexes written before the live-API guard in this PR) —
-    // restoring would silently corrupt search: cosineSimilarity returns
-    // 0 on cross-dim pairs, so affected observations stop matching
-    // anything and recall degrades without an error. Walk every stored
-    // vector instead of trusting the first; refuse to load if anything
-    // is off.
-    const activeDim = embeddingProvider?.dimensions ?? 0;
-    const { mismatches, seenDimensions } =
-      activeDim > 0
-        ? loaded.vector.validateDimensions(activeDim)
-        : { mismatches: [], seenDimensions: new Set<number>() };
-
-    if (mismatches.length > 0) {
-      const sample = mismatches
-        .slice(0, 5)
-        .map((m) => `${m.obsId} (dim=${m.dim})`)
-        .join(", ");
-      const distinct = Array.from(seenDimensions).sort((a, b) => a - b).join(", ");
-      const dropStale = isDropStaleIndexEnabled();
-      if (dropStale) {
-        console.warn(
-          `[agentmemory] Persisted vector index has ${mismatches.length} of ` +
-            `${loaded.vector.size} vectors with the wrong dimension. Active ` +
-            `provider (${embeddingProvider?.name}) declares ${activeDim}; ` +
-            `dimensions seen on disk: ${distinct}. ` +
-            `AGENTMEMORY_DROP_STALE_INDEX=true is set — discarding the persisted ` +
-            `vectors. Live observations will rebuild the index over time.`,
-        );
-      } else {
-        throw new Error(
-          `[agentmemory] Refusing to start: persisted vector index has ` +
-            `${mismatches.length} of ${loaded.vector.size} vectors with the ` +
-            `wrong dimension. Active provider (${embeddingProvider?.name}) ` +
-            `declares ${activeDim}; dimensions seen on disk: ${distinct}. ` +
-            `First mismatched obsIds: ${sample}. Loading would silently corrupt ` +
-            `search (cross-dimension cosine returns 0). Choose one:\n` +
-            `  - Re-embed the existing index against the new provider, then start.\n` +
-            `  - Set AGENTMEMORY_DROP_STALE_INDEX=true to discard the persisted ` +
-            `vectors and rebuild from live observations.\n` +
-            `  - Switch the embedding provider back to the one that wrote the index.`,
-        );
-      }
-    } else {
-      vectorIndex.restoreFrom(loaded.vector);
-      bootLog(
-        `Loaded persisted vector index (${vectorIndex.size} vectors)`,
-      );
-    }
-  }
 
   const needsRebuild = bm25Index.size === 0;
 

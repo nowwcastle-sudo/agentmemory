@@ -287,10 +287,6 @@ export class IndexPersistence {
       }
     }
 
-    if (this.status.dirty && bm25 && (!this.vector || vector)) {
-      this.scheduleSave();
-    }
-
     return { bm25, vector };
   }
 

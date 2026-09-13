@@ -156,6 +156,35 @@ describe("IndexPersistence", () => {
     expect(results.length).toBe(1);
   });
 
+  it("does not arm a dirty retry until the caller has hydrated the indexes", async () => {
+    const persisted = makeBm25("obs_persisted", "persisted snapshot");
+    await kv.set("mem:index:status", "current", { dirty: true });
+    const files = {
+      dir: "test-index",
+      bm25Path: "test-index/bm25.json",
+      vectorsPath: "test-index/vectors.bin",
+      sweepTemporaries: async () => 0,
+      readBm25: async () => persisted.serialize(),
+      readVectors: async () => null,
+      writeBm25: vi.fn(async () => ({ bytes: 1 })),
+      writeVectors: vi.fn(async () => ({ bytes: 1, count: 0 })),
+    };
+    const inMemory = new SearchIndex();
+    const persistence = new IndexPersistence(kv as never, inMemory, null, {
+      files: files as never,
+      debounceMs: 1_000,
+    });
+
+    const loaded = await persistence.load();
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(files.writeBm25).not.toHaveBeenCalled();
+
+    inMemory.restoreFrom(loaded.bm25!);
+    persistence.scheduleSave();
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(files.writeBm25).toHaveBeenCalledOnce();
+  });
+
   it("does not flood the governance audit log with index persistence rows by default", async () => {
     const persistence = new IndexPersistence(
       kv as never,
@@ -1177,7 +1206,7 @@ describe("IndexPersistence", () => {
     });
   });
 
-  it("retries a restart-visible dirty snapshot after loading a valid index", async () => {
+  it("retries a restart-visible dirty snapshot after the caller hydrates it", async () => {
     const original = makeBm25("obs_restart_dirty", "restart dirty index");
     const first = new IndexPersistence(kv as never, original, null);
     await first.save();
@@ -1192,6 +1221,7 @@ describe("IndexPersistence", () => {
     const loaded = await restarted.load();
     expect(loaded.bm25).not.toBeNull();
     restartedIndex.restoreFrom(loaded.bm25!);
+    restarted.scheduleSave();
 
     vi.advanceTimersByTime(5000);
     await vi.runAllTimersAsync();
