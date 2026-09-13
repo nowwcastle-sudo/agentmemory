@@ -44,6 +44,8 @@ export type ConnectorOutboxInspection = {
 
 const DEFAULT_OUTBOX_SCAN_LIMIT = 500;
 const OUTBOX_STAT_CONCURRENCY = 32;
+const OUTBOX_READ_CONCURRENCY = 8;
+const OUTBOX_READ_FAILED = Symbol("outbox-read-failed");
 
 export function resolveOutboxScanLimit(
   requested?: number,
@@ -213,51 +215,72 @@ async function readOutboxes(options: {
       : options.want === "legacy"
       ? legacyKept >= scanLimit
       : false;
-  for (const entry of entries) {
-    if (scanned >= parseCap || satisfied()) break;
-    scanned += 1;
-    const file = join(entry.outbox.dir, entry.name);
-    let value: unknown;
-    try {
-      value = JSON.parse(await readFile(file, "utf8"));
-    } catch {
-      malformed += 1;
-      continue;
-    }
-    const candidate = value as ConnectorEnvelope | null;
-    if (
-      typeof candidate?.path !== "string" ||
-      !candidate.body ||
-      typeof candidate.body !== "object" ||
-      Array.isArray(candidate.body)
-    ) {
-      malformed += 1;
-      continue;
-    }
-    const item = {
-      adapter: entry.outbox.adapter,
-      file,
-      envelope: candidate,
-    };
-    const legacyItem = candidate.schemaVersion !== 2;
-    if (legacyItem) legacySeen += 1;
-    else currentSeen += 1;
-    if (
-      candidate.priority === "terminal" ||
-      requestPath(candidate.path) === "/agentmemory/session/end"
-    ) {
-      if (held.length >= scanLimit) heldDropped = true;
-      else held.push({ queue: entry.queue, legacy: legacyItem, item });
-      continue;
-    }
-    if (legacyItem) {
-      if (legacyKept >= scanLimit) continue;
-      queues[entry.queue].legacy.push(item);
-      legacyKept += 1;
-    } else {
-      if (currentKept >= scanLimit) continue;
-      queues[entry.queue].current.push(item);
-      currentKept += 1;
+  for (
+    let offset = 0;
+    offset < parseCap && !satisfied();
+    offset += OUTBOX_READ_CONCURRENCY
+  ) {
+    const batch = entries.slice(
+      offset,
+      Math.min(offset + OUTBOX_READ_CONCURRENCY, parseCap),
+    );
+    const values = await Promise.all(
+      batch.map(async (entry) => {
+        try {
+          return JSON.parse(
+            await readFile(join(entry.outbox.dir, entry.name), "utf8"),
+          ) as unknown;
+        } catch {
+          return OUTBOX_READ_FAILED;
+        }
+      }),
+    );
+
+    for (let index = 0; index < batch.length; index += 1) {
+      if (satisfied()) break;
+      const entry = batch[index];
+      const value = values[index];
+      scanned += 1;
+      if (!entry || value === OUTBOX_READ_FAILED) {
+        malformed += 1;
+        continue;
+      }
+      const file = join(entry.outbox.dir, entry.name);
+      const candidate = value as ConnectorEnvelope | null;
+      if (
+        typeof candidate?.path !== "string" ||
+        !candidate.body ||
+        typeof candidate.body !== "object" ||
+        Array.isArray(candidate.body)
+      ) {
+        malformed += 1;
+        continue;
+      }
+      const item = {
+        adapter: entry.outbox.adapter,
+        file,
+        envelope: candidate,
+      };
+      const legacyItem = candidate.schemaVersion !== 2;
+      if (legacyItem) legacySeen += 1;
+      else currentSeen += 1;
+      if (
+        candidate.priority === "terminal" ||
+        requestPath(candidate.path) === "/agentmemory/session/end"
+      ) {
+        if (held.length >= scanLimit) heldDropped = true;
+        else held.push({ queue: entry.queue, legacy: legacyItem, item });
+        continue;
+      }
+      if (legacyItem) {
+        if (legacyKept >= scanLimit) continue;
+        queues[entry.queue].legacy.push(item);
+        legacyKept += 1;
+      } else {
+        if (currentKept >= scanLimit) continue;
+        queues[entry.queue].current.push(item);
+        currentKept += 1;
+      }
     }
   }
 
