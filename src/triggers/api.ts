@@ -1077,24 +1077,64 @@ export function registerApiTriggers(
       const filtered = filterAgentId
         ? sessions.filter((s) => s.agentId === filterAgentId)
         : sessions;
-      // Bounded fan-out: each kv.get is a full engine invocation, so
-      // Promise.all over hundreds of sessions saturates the invocation
-      // pool. Batch in chunks of 10 (parallel within a chunk, sequential
-      // across chunks); the summaries array stays index-aligned with
-      // `filtered`.
-      const summaries: Array<SessionSummary | null> = [];
-      for (let batch = 0; batch < filtered.length; batch += 10) {
-        const chunk = filtered.slice(batch, batch + 10);
-        const results = await Promise.all(
-          chunk.map((s) =>
-            kv.get<SessionSummary>(KV.summaries, s.id).catch(() => null),
-          ),
-        );
-        summaries.push(...results);
+      const rawLimit = req.query_params?.["limit"];
+      const parsedLimit =
+        typeof rawLimit === "string" && rawLimit.trim().length > 0
+          ? Number(rawLimit)
+          : Number.NaN;
+      if (
+        rawLimit !== undefined &&
+        (!Number.isSafeInteger(parsedLimit) || parsedLimit < 1)
+      ) {
+        return {
+          status_code: 400,
+          body: { error: "limit must be a positive safe integer" },
+        };
       }
-      const withSummary = filtered.map((s, i) =>
-        summaries[i] ? { ...s, summary: summaries[i] } : s,
-      );
+
+      const selected =
+        rawLimit === undefined ? filtered : filtered.slice(0, parsedLimit);
+      const summaries = await kv.list<SessionSummary>(KV.summaries);
+      const summariesBySessionId = new Map<string, SessionSummary>();
+      let hasLegacySummary = false;
+      for (const summary of summaries) {
+        if (
+          typeof summary?.sessionId === "string" &&
+          summary.sessionId.length > 0
+        ) {
+          summariesBySessionId.set(summary.sessionId, summary);
+        } else {
+          hasLegacySummary = true;
+        }
+      }
+
+      if (hasLegacySummary) {
+        const missing = selected.filter(
+          (session) => !summariesBySessionId.has(session.id),
+        );
+        for (let batch = 0; batch < missing.length; batch += 10) {
+          const chunk = missing.slice(batch, batch + 10);
+          const legacy = await Promise.all(
+            chunk.map((session) =>
+              kv
+                .get<SessionSummary>(KV.summaries, session.id)
+                .catch(() => null),
+            ),
+          );
+          for (let i = 0; i < chunk.length; i++) {
+            const session = chunk[i];
+            const summary = legacy[i];
+            if (session && summary) {
+              summariesBySessionId.set(session.id, summary);
+            }
+          }
+        }
+      }
+
+      const withSummary = selected.map((session) => {
+        const summary = summariesBySessionId.get(session.id);
+        return summary ? { ...session, summary } : session;
+      });
       return { status_code: 200, body: { sessions: withSummary } };
     },
   );

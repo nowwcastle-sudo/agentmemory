@@ -209,7 +209,9 @@ export class IndexPersistence {
           }
         : {
             dirty: true,
-            dirtySince: this.status.dirtySince ?? attemptAt,
+            // Earlier mutations are in this checkpoint; only changes made
+            // during the save can still be pending.
+            dirtySince: attemptAt,
             lastAttemptAt: attemptAt,
             lastSuccessAt,
             ...(this.status.lastFailureAt
