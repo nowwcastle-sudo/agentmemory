@@ -1,4 +1,5 @@
 import type { ISdk } from "../iii-compat.js";
+import { availableParallelism } from "node:os";
 import v8 from "node:v8";
 import type { HealthSnapshot } from "../types.js";
 import type { StateKV } from "../state/kv.js";
@@ -42,7 +43,10 @@ export function registerHealthMonitor(
     const userDelta = currentCpu.user - prevCpuUsage.user;
     const systemDelta = currentCpu.system - prevCpuUsage.system;
     const cpuPercent =
-      elapsedMs > 0 ? ((userDelta + systemDelta) / 1000 / elapsedMs) * 100 : 0;
+      elapsedMs > 0
+        ? (((userDelta + systemDelta) / 1000 / elapsedMs) * 100) /
+          availableParallelism()
+        : 0;
     prevCpuUsage = currentCpu;
     prevCpuTime = now;
 

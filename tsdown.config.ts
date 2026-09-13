@@ -70,6 +70,13 @@ export default defineConfig([
     clean: false,
     sourcemap: false,
   },
+  {
+    entry: ["src/providers/embedding/local-worker.ts"],
+    outDir: "dist",
+    ...shared,
+    clean: false,
+    sourcemap: false,
+  },
   // One entry per config block prevents tsdown from hoisting shared
   // helpers into hashed chunks across hooks.
   ...hookEntries.map((entry) => ({
