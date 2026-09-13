@@ -468,7 +468,7 @@ async function main() {
   );
   registerMaintenanceProjectionFunction(sdk, kv, projectionCoordinator);
   const connectorOutboxes = defaultConnectorOutboxes();
-  registerConnectorOutboxReplayFunctions(sdk, {
+  const connectorOutboxReplay = registerConnectorOutboxReplayFunctions(sdk, {
     outboxes: connectorOutboxes,
     baseUrl: `http://127.0.0.1:${config.restPort}`,
     secret,
@@ -630,7 +630,11 @@ async function main() {
     projectionCoordinator,
   );
   const pipelineReconcileLoop = startPipelineReconcileLoop(sdk);
-  const connectorOutboxReplayLoop = startConnectorOutboxReplayLoop(sdk, 30_000);
+  const connectorOutboxReplayLoop = startConnectorOutboxReplayLoop(
+    sdk,
+    30_000,
+    connectorOutboxReplay,
+  );
   // The interval is what the drain actually uses (env-driven, default 2 s);
   // this line said "every 1m" for months regardless.
   const recoveryMs = configuredRecoveryIntervalMs();

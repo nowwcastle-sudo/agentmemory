@@ -462,18 +462,33 @@ async function replayAcceptance(
   try {
     const body = await response.json() as {
       success?: boolean;
+      observationId?: string;
+      captureId?: string;
       deduplicated?: boolean;
       projectionQueued?: boolean;
     };
     if (body.success === false) return "rejected";
+    const accepted = body.success === true ||
+      (typeof body.observationId === "string" && body.observationId.trim().length > 0);
+    if (!accepted) return "rejected";
+    const expectedCaptureId = item.envelope.body.captureId ?? item.envelope.body.capture_id;
+    if (
+      typeof expectedCaptureId === "string" &&
+      typeof body.captureId === "string" &&
+      body.captureId !== expectedCaptureId
+    ) return "rejected";
     if (body.deduplicated !== true) return "newlyAccepted";
     return body.projectionQueued === true
       ? "projectionQueued"
       : "deduplicated";
   } catch {
-    return "newlyAccepted";
+    return "rejected";
   }
 }
+
+export type ConnectorOutboxReplayHandler = (
+  data?: { mode?: "current" | "legacy"; limit?: number; accept?: number },
+) => Promise<ConnectorOutboxReplayResult>;
 
 export async function replayConnectorOutboxes(options: {
   outboxes: ConnectorOutbox[];
@@ -607,14 +622,12 @@ export function registerConnectorOutboxReplayFunctions(
     timeoutMs?: number;
     scanLimit?: number;
   } = {},
-): void {
+): ConnectorOutboxReplayHandler {
   const outboxes = options.outboxes ?? defaultConnectorOutboxes();
   const baseUrl = options.baseUrl ?? "http://127.0.0.1:3111";
   let replayChain: Promise<unknown> = Promise.resolve();
 
-  sdk.registerFunction(
-    "mem::connector-outbox-replay",
-    async (data: { mode?: "current" | "legacy"; limit?: number; accept?: number } = {}) => {
+  const replay: ConnectorOutboxReplayHandler = async (data = {}) => {
       const requestedLimit = Number.isFinite(data.limit) ? Number(data.limit) : 4;
       const limit = Math.min(20, Math.max(0, Math.floor(requestedLimit)));
       const requestedAccept = Number.isFinite(data.accept) ? Number(data.accept) : 1;
@@ -637,12 +650,13 @@ export function registerConnectorOutboxReplayFunctions(
         () => undefined,
       );
       return run;
-    },
-  );
+    };
+  sdk.registerFunction("mem::connector-outbox-replay", replay);
 
   sdk.registerFunction("mem::connector-outbox-inspect", async () =>
     inspectConnectorOutboxes(outboxes, options.scanLimit),
   );
+  return replay;
 }
 
 // Newly accepted observations one automatic tick may deliver. One per tick
@@ -663,6 +677,7 @@ export function automaticAcceptBudget(
 export function startConnectorOutboxReplayLoop(
   sdk: ISdk,
   intervalMs = 30_000,
+  replay?: ConnectorOutboxReplayHandler,
 ): { stop(): void } {
   let stopped = false;
   let running = false;
@@ -671,10 +686,11 @@ export function startConnectorOutboxReplayLoop(
     if (stopped || running) return;
     running = true;
     try {
-      await sdk.trigger({
-        function_id: "mem::connector-outbox-replay",
-        payload: { limit: 20, accept },
-      });
+      if (replay) await replay({ limit: 20, accept });
+      else await sdk.trigger({
+          function_id: "mem::connector-outbox-replay",
+          payload: { limit: 20, accept },
+        });
     } catch (error) {
       logger.warn("Connector outbox replay tick failed", {
         error: error instanceof Error ? error.message : String(error),

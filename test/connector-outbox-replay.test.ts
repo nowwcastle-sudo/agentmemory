@@ -48,7 +48,7 @@ describe("connector outbox replay", () => {
       });
       return new Response(
         new URL(String(url)).pathname.endsWith("/observe")
-          ? JSON.stringify({ deduplicated: true })
+          ? JSON.stringify({ success: true, deduplicated: true })
           : "{}",
         { status: 201 },
       );
@@ -126,7 +126,7 @@ describe("connector outbox replay", () => {
       if (body.captureId === "codex:legacy-dup") {
         return new Response(JSON.stringify({ success: false, error: "legacy_identity_unverified" }), { status: 409 });
       }
-      return new Response(JSON.stringify({ deduplicated: false }), { status: 201 });
+      return new Response(JSON.stringify({ success: true, deduplicated: false }), { status: 201 });
     });
     try {
       await writeEnvelope(codex, "old.json", {
@@ -622,6 +622,33 @@ describe("connector outbox replay", () => {
     }
   });
 
+  it("keeps observe envelopes pending when a 2xx acknowledgement is missing or malformed", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agentmemory-outbox-bad-ack-"));
+    const codex = join(root, "codex");
+    const replies = [new Response("{}", { status: 201 }), new Response("not-json", { status: 201 })];
+    const fetchMock = vi.fn(async () => replies.shift()!);
+    try {
+      for (const name of ["missing.json", "malformed.json"]) {
+        await writeEnvelope(codex, name, {
+          schemaVersion: 2,
+          path: "/agentmemory/observe",
+          body: { captureId: `codex:${name}` },
+        });
+      }
+      const result = await replayConnectorOutboxes({
+        outboxes: [{ adapter: "codex", dir: codex }],
+        baseUrl: "http://127.0.0.1:3111",
+        fetchImpl: fetchMock,
+        timeoutMs: 50,
+        limit: 2,
+      });
+      expect(result).toMatchObject({ delivered: 0, failed: 2 });
+      expect((await readdir(codex)).sort()).toEqual(["malformed.json", "missing.json"]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("drains accepted duplicate captures but stops after the first newly accepted current envelope", async () => {
     const root = await mkdtemp(join(tmpdir(), "agentmemory-outbox-adaptive-"));
     const codex = join(root, "codex");
@@ -681,8 +708,8 @@ describe("connector outbox replay", () => {
       const body = JSON.parse(String(init?.body || "{}"));
       return new Response(JSON.stringify(
         body.captureId === "codex:missing-projection"
-          ? { deduplicated: true, projectionQueued: true }
-          : { deduplicated: true },
+          ? { success: true, deduplicated: true, projectionQueued: true }
+          : { success: true, deduplicated: true },
       ), { status: 201 });
     });
 
@@ -756,7 +783,7 @@ describe("connector outbox replay", () => {
     const root = await mkdtemp(join(tmpdir(), "agentmemory-outbox-budget-"));
     const codex = join(root, "codex");
     const fetchMock = vi.fn(
-      async () => new Response(JSON.stringify({ deduplicated: false }), { status: 201 }),
+      async () => new Response(JSON.stringify({ success: true, deduplicated: false }), { status: 201 }),
     );
     try {
       for (let index = 0; index < 4; index++) {
@@ -787,7 +814,7 @@ describe("connector outbox replay", () => {
     const codex = join(root, "codex");
     const sdk = mockSdk();
     const fetchMock = vi.fn(
-      async () => new Response(JSON.stringify({ deduplicated: false }), { status: 201 }),
+      async () => new Response(JSON.stringify({ success: true, deduplicated: false }), { status: 201 }),
     );
     try {
       for (let index = 0; index < 22; index++) {
@@ -828,7 +855,7 @@ describe("connector outbox replay", () => {
     const fetchMock = vi.fn(async (_url: string | URL, init?: RequestInit) => {
       const body = JSON.parse(String(init?.body || "{}")) as { captureId?: string };
       if (body.captureId === "codex:poison") throw new TypeError("fetch failed: socket hang up");
-      return new Response(JSON.stringify({ deduplicated: false }), { status: 201 });
+      return new Response(JSON.stringify({ success: true, deduplicated: false }), { status: 201 });
     });
     try {
       await writeEnvelope(codex, "poison.json", {
@@ -871,7 +898,7 @@ describe("connector outbox replay", () => {
           { status: 400 },
         );
       }
-      return new Response(JSON.stringify({ deduplicated: false }), { status: 201 });
+      return new Response(JSON.stringify({ success: true, deduplicated: false }), { status: 201 });
     });
     try {
       await writeEnvelope(codex, "bad.json", {
@@ -987,24 +1014,36 @@ describe("connector outbox replay", () => {
     }
   });
 
-  it("replays automatic envelopes despite a legacy projection gate callback", async () => {
+  it("keeps the loop locked until the direct replay handler settles", async () => {
+    vi.useFakeTimers();
+    let release: (() => void) | undefined;
+    const directReplay = vi.fn(async () =>
+      new Promise<void>((resolve) => {
+        release = resolve;
+      }),
+    );
+    const sdk = { trigger: vi.fn() };
+    try {
+      const loop = startConnectorOutboxReplayLoop(sdk as never, 30_000, directReplay as never);
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(directReplay).toHaveBeenCalledOnce();
+      await vi.advanceTimersByTimeAsync(90_000);
+      expect(directReplay).toHaveBeenCalledOnce();
+      expect(sdk.trigger).not.toHaveBeenCalled();
+      release?.();
+      await Promise.resolve();
+      loop.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("uses the SDK trigger fallback when no direct replay handler is supplied", async () => {
     vi.useFakeTimers();
     const sdk = { trigger: vi.fn(async () => ({ success: true })) };
-    const canReplay = vi
-      .fn<() => Promise<boolean>>()
-      .mockResolvedValue(false);
 
     try {
-      const legacyStart = startConnectorOutboxReplayLoop as unknown as (
-        sdk: never,
-        intervalMs: number,
-        canReplay: () => Promise<boolean>,
-      ) => { stop(): void };
-      const loop = legacyStart(
-        sdk as never,
-        30_000,
-        canReplay,
-      );
+      const loop = startConnectorOutboxReplayLoop(sdk as never, 30_000);
 
       await vi.advanceTimersByTimeAsync(30_000);
       expect(sdk.trigger).toHaveBeenCalledTimes(1);
