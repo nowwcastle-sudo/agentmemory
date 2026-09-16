@@ -7,6 +7,7 @@ import {
   renderRelationsBlock,
   buildFocus,
   relationClassRank,
+  MAX_LINES_PER_SOURCE,
   RELATIONS_INDEX_CAP,
   type ProjectRelationsIndex,
   type RelationRow,
@@ -210,6 +211,51 @@ describe("renderRelationsBlock", () => {
     expect(items[1]).toBe("- misc --documents--> docs/misc.md (40 obs)");
     expect(items[2]).toBe("- logging --uses--> src/log.ts (5 obs)");
     expect(items[3]).toBe("- retry policy --implements--> src/retry.ts (3 obs)");
+  });
+
+  // Measured 2026-09-17 on the live block, before and after the class change:
+  // one source node held 6 of the 12 lines both times -- `Count MCP tools...`
+  // before, `AGENTS.md` after -- and one pair was stated twice under two
+  // types (`rejected` and `blocked_by`). Ranking cannot fix either; a budget
+  // of 12 lines needs a diversity rule of its own.
+  it("gives one source node at most two lines while other sources have rows", () => {
+    const relations = [
+      row("AGENTS.md", "documents", "system instructions", 0.9, 3, "e1"),
+      row("AGENTS.md", "documents", "agent constraints", 0.9, 3, "e2"),
+      row("AGENTS.md", "documents", "instruction tuning", 0.9, 3, "e3"),
+      row("AGENTS.md", "documents", "dual role execution", 0.9, 3, "e4"),
+      row("readme.md", "documents", "setup", 0.5, 1, "e5"),
+      row("changelog.md", "documents", "releases", 0.5, 1, "e6"),
+    ];
+    const items = renderRelationsBlock(relations, profile, 4)!.split("\n").filter((l) => l.startsWith("- "));
+    expect(items.filter((l) => l.startsWith("- AGENTS.md"))).toHaveLength(MAX_LINES_PER_SOURCE);
+    expect(items).toHaveLength(4);
+    expect(items.some((l) => l.includes("readme.md"))).toBe(true);
+    expect(items.some((l) => l.includes("changelog.md"))).toBe(true);
+  });
+
+  it("fills the limit from the capped remainder rather than rendering a shorter block", () => {
+    const relations = [
+      row("AGENTS.md", "documents", "a", 0.9, 3, "e1"),
+      row("AGENTS.md", "documents", "b", 0.9, 3, "e2"),
+      row("AGENTS.md", "documents", "c", 0.9, 3, "e3"),
+      row("AGENTS.md", "documents", "d", 0.9, 3, "e4"),
+    ];
+    const items = renderRelationsBlock(relations, profile, 4)!.split("\n").filter((l) => l.startsWith("- "));
+    expect(items).toHaveLength(4);
+  });
+
+  it("states a pair once, keeping the strongest type, in either direction", () => {
+    const relations = [
+      row("load-sharing (A)", "blocked_by", "isolation risk", 0.8, 2, "e_blocked"),
+      row("load-sharing (A)", "rejected", "isolation risk", 0.8, 2, "e_rejected"),
+      row("isolation risk", "causes", "load-sharing (A)", 0.8, 2, "e_reverse"),
+      row("other", "uses", "thing", 0.5, 1, "e_other"),
+    ];
+    const items = renderRelationsBlock(relations, profile, 4)!.split("\n").filter((l) => l.startsWith("- "));
+    expect(items.filter((l) => l.includes("load-sharing (A)") || l.includes("isolation risk"))).toHaveLength(1);
+    expect(items[0]).toBe("- load-sharing (A) --blocked_by--> isolation risk (2 obs)");
+    expect(items).toHaveLength(2);
   });
 
   it("builds focus terms from the first prompt and the session's files and titles, skipping short words", () => {
