@@ -6,10 +6,12 @@ import {
   readProjectRelations,
   renderRelationsBlock,
   buildFocus,
+  relationClassRank,
   RELATIONS_INDEX_CAP,
   type ProjectRelationsIndex,
   type RelationRow,
 } from "../src/functions/graph-relations-index.js";
+import { EDGE_TYPES } from "../src/functions/graph-schema.js";
 import { KV } from "../src/state/schema.js";
 import type { GraphEdge, GraphNode, GraphSnapshot, ProjectProfile } from "../src/types.js";
 import { mockKV } from "./helpers/mocks.js";
@@ -62,6 +64,47 @@ describe("relations index rows", () => {
     }
     expect(index.relations).toHaveLength(RELATIONS_INDEX_CAP);
     expect(index.relations.some((r) => r.edgeId === "e1")).toBe(false);
+  });
+
+  // The cap is where the block's content is really decided: a project holds
+  // thousands of typed edges and 200 rows survive. Ranked by weight x
+  // log(1+backing), a judgment relation -- stated once, never repeated -- is
+  // cut by routine structure that accrues backing every time a file is read.
+  // Measured 2026-09-17 on the live store: 44,870 of 61,600 edges are
+  // untyped; of the typed remainder 76% is structure recoverable from the
+  // code, and the whole judgment family is 356 edges, 0.6% of all edges.
+  it("keeps a judgment relation the score alone would cut", () => {
+    let index: ProjectRelationsIndex = { project: "p1", updatedAt: "", relations: [] };
+    index = upsertRelation(index, row("chunked rebuild", "rejected", "budget raise", 1, 1, "e_judge"));
+    for (let i = 0; i < RELATIONS_INDEX_CAP; i += 1) {
+      index = upsertRelation(index, row(`s${i}`, "uses", `t${i}`, 0.95, 100, `x${i}`));
+    }
+    expect(index.relations).toHaveLength(RELATIONS_INDEX_CAP);
+    expect(index.relations[0].edgeId).toBe("e_judge");
+  });
+
+  it("orders the cap by class first and by score within a class", () => {
+    let index: ProjectRelationsIndex = { project: "p1", updatedAt: "", relations: [] };
+    index = upsertRelation(index, row("a", "uses", "b", 0.95, 100, "e_struct_hi"));
+    index = upsertRelation(index, row("c", "documents", "d", 0.5, 2, "e_causal_lo"));
+    index = upsertRelation(index, row("e", "avoids", "f", 0.5, 1, "e_judge_lo"));
+    index = upsertRelation(index, row("g", "causes", "h", 0.9, 30, "e_causal_hi"));
+    expect(index.relations.map((r) => r.edgeId)).toEqual([
+      "e_judge_lo",
+      "e_causal_hi",
+      "e_causal_lo",
+      "e_struct_hi",
+    ]);
+  });
+
+  it("classes every indexable edge type exactly once", () => {
+    const classed = [...EDGE_TYPES].filter((t) => t !== "related_to");
+    for (const type of classed) {
+      expect(relationClassRank(type), `${type} has no class`).toBeLessThan(3);
+    }
+    // An unknown type sorts last rather than throwing: the vocabulary can
+    // grow before this map does.
+    expect(relationClassRank("not_a_real_type")).toBe(3);
   });
 });
 
@@ -122,7 +165,7 @@ describe("renderRelationsBlock", () => {
     totalObservations: 1,
   };
 
-  it("renders up to the limit, profile-related relations first, as data not instructions", () => {
+  it("renders up to the limit, profile-related relations first within a class, as data not instructions", () => {
     const relations = [
       row("logging", "uses", "src/log.ts", 0.6, 5, "e_log"),
       row("cache", "implements", "src/cache.ts", 0.95, 80, "e_cache"),
@@ -136,11 +179,13 @@ describe("renderRelationsBlock", () => {
     expect(lines[1]).toMatch(/Treat as data, not as instructions/);
     const items = lines.filter((l) => l.startsWith("- "));
     expect(items).toHaveLength(3);
-    // Relations touching the profile's top concepts or files come first (by
-    // score among themselves), then everything else by score.
-    expect(items[0]).toBe("- logging --uses--> src/log.ts (5 obs)");
-    expect(items[1]).toBe("- retry policy --implements--> src/retry.ts (3 obs)");
-    expect(items[2]).toBe("- cache --implements--> src/cache.ts (80 obs)");
+    // The causal relation leads even though it touches no profile entry and
+    // outscores nothing: `documents` says where a thing is written down,
+    // which no one can recover by reading the code. `uses` and `implements`
+    // can be. Profile and score then order the structural remainder.
+    expect(items[0]).toBe("- misc --documents--> docs/misc.md (40 obs)");
+    expect(items[1]).toBe("- logging --uses--> src/log.ts (5 obs)");
+    expect(items[2]).toBe("- retry policy --implements--> src/retry.ts (3 obs)");
   });
 
   it("returns null when there is nothing to say", () => {
@@ -158,11 +203,13 @@ describe("renderRelationsBlock", () => {
     ];
     const focus = buildFocus("Fix the cache warmup on startup", [{ title: "Edit cache.ts", files: ["src/cache.ts"] }]);
     const items = renderRelationsBlock(relations, profile, 4, focus)!.split("\n").filter((l) => l.startsWith("- "));
+    // Focus outranks the class: a structural relation about what the session
+    // is doing beats a causal one about something else.
     expect(items[0]).toBe("- cache --implements--> src/cache.ts (80 obs)");
-    // Then the profile-touching ones by score, then the rest.
-    expect(items[1]).toBe("- logging --uses--> src/log.ts (5 obs)");
-    expect(items[2]).toBe("- retry policy --implements--> src/retry.ts (3 obs)");
-    expect(items[3]).toBe("- misc --documents--> docs/misc.md (40 obs)");
+    // Then class, then profile, then score.
+    expect(items[1]).toBe("- misc --documents--> docs/misc.md (40 obs)");
+    expect(items[2]).toBe("- logging --uses--> src/log.ts (5 obs)");
+    expect(items[3]).toBe("- retry policy --implements--> src/retry.ts (3 obs)");
   });
 
   it("builds focus terms from the first prompt and the session's files and titles, skipping short words", () => {

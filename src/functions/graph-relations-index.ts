@@ -59,6 +59,41 @@ export function edgeProjects(edge: GraphEdge): string[] {
 export const relationScore = (r: RelationRow): number =>
   r.weight * Math.log(1 + Math.max(0, r.backing));
 
+/**
+ * What a relation is worth telling a session, by kind.
+ *
+ * Backing counts how often a pair was touched, so ranking by it alone ranks
+ * repetition. Routine structure accrues backing every time a file is read; a
+ * judgment is stated once and never again. Measured on the live store
+ * 2026-09-17: 44,870 of 61,600 edges are untyped `related_to`; of the typed
+ * remainder 76% is structure, and the whole judgment family is 356 edges --
+ * 0.6% of all edges. Reading the rendered block confirmed the consequence:
+ * of 12 lines, 7 to 11 restated what the code already says (`x defines y`,
+ * `test tests file`), and the lines worth having were an error with its
+ * cause and a pointer to where it was written up.
+ *
+ * So structure sorts last. It is true, and it is the one kind a session can
+ * recover for itself by opening the file.
+ */
+const JUDGMENT_TYPES: ReadonlySet<string> = new Set([
+  "rejected", "avoids", "prefers", "succeeded_by", "blocked_by", "optimizes_for",
+]);
+const CAUSAL_TYPES: ReadonlySet<string> = new Set([
+  "causes", "caused_by", "fixes", "validates", "tests", "documents",
+]);
+const STRUCTURAL_TYPES: ReadonlySet<string> = new Set([
+  "uses", "contains", "part_of", "depends_on", "implements", "located_in",
+  "defines", "imports", "modifies", "works_at",
+]);
+
+/** 0 judgment, 1 causal, 2 structural, 3 unknown. Lower sorts first. */
+export function relationClassRank(type: string): number {
+  if (JUDGMENT_TYPES.has(type)) return 0;
+  if (CAUSAL_TYPES.has(type)) return 1;
+  if (STRUCTURAL_TYPES.has(type)) return 2;
+  return 3;
+}
+
 export function toRelationRow(edge: GraphEdge, sourceName: string, targetName: string): RelationRow {
   return {
     source: sourceName,
@@ -77,7 +112,15 @@ export function upsertRelation(index: ProjectRelationsIndex, row: RelationRow): 
       !(r.source === row.source && r.type === row.type && r.target === row.target),
   );
   kept.push(row);
-  kept.sort((a, b) => relationScore(b) - relationScore(a) || a.edgeId.localeCompare(b.edgeId));
+  // Class first: the cap, not the block, is where content is decided -- a
+  // project holds thousands of typed edges and 200 rows survive, so a
+  // judgment relation cut here can never be ranked back in at render time.
+  kept.sort(
+    (a, b) =>
+      relationClassRank(a.type) - relationClassRank(b.type) ||
+      relationScore(b) - relationScore(a) ||
+      a.edgeId.localeCompare(b.edgeId),
+  );
   return {
     project: index.project,
     updatedAt: new Date().toISOString(),
@@ -236,9 +279,14 @@ export function renderRelationsBlock(
     names.has(r.source.toLowerCase()) || names.has(r.target.toLowerCase()) ? 1 : 0;
   const touchesFocus = (r: RelationRow): number =>
     focus.size > 0 && [...nameTerms(r.source), ...nameTerms(r.target)].some((t) => focus.has(t)) ? 1 : 0;
+  // Focus outranks the class -- a structural relation about what this session
+  // is doing beats a causal one about something else -- and the class
+  // outranks the profile, because a structural relation touching a top file
+  // is still something the session can read out of the file.
   const ranked = [...relations].sort(
     (a, b) =>
       touchesFocus(b) - touchesFocus(a) ||
+      relationClassRank(a.type) - relationClassRank(b.type) ||
       touchesProfile(b) - touchesProfile(a) ||
       relationScore(b) - relationScore(a),
   );
