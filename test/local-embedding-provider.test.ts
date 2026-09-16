@@ -1,6 +1,12 @@
+import { EventEmitter } from "node:events";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+// Embedding work runs in a worker thread, so a mock installed here never
+// reaches it. Each unit is therefore exercised where its code actually runs:
+// loadTransformers and the worker body in-thread, the provider against a fake
+// Worker. Nothing in this file loads the real model.
 
 const previousTransformersCache = process.env.TRANSFORMERS_CACHE;
 const previousHfHome = process.env.HF_HOME;
@@ -29,17 +35,18 @@ afterEach(async () => {
   );
   clearTransformersImportError();
   vi.doUnmock("@huggingface/transformers");
+  vi.doUnmock("node:worker_threads");
   vi.resetModules();
 });
 
-describe("LocalEmbeddingProvider (package unavailable)", () => {
+describe("loadTransformers (package unavailable)", () => {
   it("throws clean install hint when @huggingface/transformers is missing", async () => {
     vi.doMock("@huggingface/transformers");
     vi.resetModules();
-    const { LocalEmbeddingProvider: Fresh } = await import(
-      "../src/providers/embedding/local.js"
+    const { loadTransformers } = await import(
+      "../src/providers/embedding/_transformers.js"
     );
-    await expect(new Fresh().embed("hello")).rejects.toThrow(
+    await expect(loadTransformers()).rejects.toThrow(
       "Install @huggingface/transformers for local embeddings",
     );
   });
@@ -57,10 +64,10 @@ describe("LocalEmbeddingProvider (package unavailable)", () => {
       "./fixtures/transformers-import-error.js"
     );
     setTransformersImportError(transitiveError);
-    const { LocalEmbeddingProvider: Fresh } = await import(
-      "../src/providers/embedding/local.js"
+    const { loadTransformers } = await import(
+      "../src/providers/embedding/_transformers.js"
     );
-    await expect(new Fresh().embed("hello")).rejects.toBe(transitiveError);
+    await expect(loadTransformers()).rejects.toBe(transitiveError);
   });
 });
 
@@ -118,23 +125,30 @@ describe("Transformers cache initialization", () => {
   });
 });
 
-describe("LocalEmbeddingProvider (with loaded pipeline)", () => {
-  function mockSuccessModule() {
+describe("local embedding worker", () => {
+  interface FakeParentPort extends EventEmitter {
+    postMessage: ReturnType<typeof vi.fn>;
+  }
+
+  async function startWorkerWithMock(module: Record<string, unknown>) {
+    const port = new EventEmitter() as FakeParentPort;
+    port.postMessage = vi.fn();
+    vi.doMock("@huggingface/transformers", () => module);
+    vi.doMock("node:worker_threads", () => ({ parentPort: port }));
+    vi.resetModules();
+    await import("../src/providers/embedding/local-worker.js");
+    return port;
+  }
+
+  it("calls pipeline with dtype: q8, passes extractor opts, posts float32 buffers", async () => {
     const extractor = vi.fn(async (texts: string[]) => ({
       tolist: () => texts.map(() => [0.1, 0.2, 0.3]),
     }));
     const pipeline = vi.fn(() => Promise.resolve(extractor));
-    vi.doMock("@huggingface/transformers", () => ({ pipeline }));
-    vi.resetModules();
-    return { pipeline, extractor };
-  }
+    const port = await startWorkerWithMock({ pipeline });
 
-  it("calls pipeline with dtype: q8, passes extractor opts, returns mapped Float32Array", async () => {
-    const { pipeline, extractor } = mockSuccessModule();
-    const { LocalEmbeddingProvider: Fresh } = await import(
-      "../src/providers/embedding/local.js"
-    );
-    const vec = await new Fresh().embed("hello");
+    port.emit("message", { id: 7, texts: ["hello"] });
+    await vi.waitFor(() => expect(port.postMessage).toHaveBeenCalled());
 
     expect(pipeline).toHaveBeenCalledWith(
       "feature-extraction",
@@ -145,18 +159,85 @@ describe("LocalEmbeddingProvider (with loaded pipeline)", () => {
       pooling: "mean",
       normalize: true,
     });
+
+    const [message] = port.postMessage.mock.calls[0];
+    expect(message.id).toBe(7);
+    expect(new Float32Array(message.buffers[0])).toEqual(
+      new Float32Array([0.1, 0.2, 0.3]),
+    );
+  });
+
+  it("reports the failure message instead of throwing out of the worker", async () => {
+    const pipeline = vi.fn(() => Promise.reject(new Error("pipeline is down")));
+    const port = await startWorkerWithMock({ pipeline });
+
+    port.emit("message", { id: 3, texts: ["hello"] });
+    await vi.waitFor(() => expect(port.postMessage).toHaveBeenCalled());
+
+    expect(port.postMessage.mock.calls[0][0]).toEqual({
+      id: 3,
+      error: "pipeline is down",
+    });
+  });
+});
+
+describe("LocalEmbeddingProvider", () => {
+  class FakeWorker extends EventEmitter {
+    ref = vi.fn();
+    unref = vi.fn();
+    postMessage = vi.fn((request: { id: number; texts: string[] }) => {
+      queueMicrotask(() =>
+        this.emit("message", {
+          id: request.id,
+          buffers: request.texts.map(
+            (_text, index) => Float32Array.from([index, index + 0.5]).buffer,
+          ),
+        }),
+      );
+    });
+  }
+
+  class FailingWorker extends EventEmitter {
+    ref = vi.fn();
+    unref = vi.fn();
+    postMessage = vi.fn((request: { id: number }) => {
+      queueMicrotask(() =>
+        this.emit("message", { id: request.id, error: "worker said no" }),
+      );
+    });
+  }
+
+  async function loadProviderWith(WorkerImpl: unknown) {
+    vi.doMock("node:worker_threads", () => ({ Worker: WorkerImpl }));
+    vi.resetModules();
+    const { LocalEmbeddingProvider } = await import(
+      "../src/providers/embedding/local.js"
+    );
+    return new LocalEmbeddingProvider();
+  }
+
+  it("embed maps the worker's buffer to a Float32Array", async () => {
+    const provider = await loadProviderWith(FakeWorker);
+
+    const vec = await provider.embed("hello");
+
     expect(vec).toBeInstanceOf(Float32Array);
-    expect(vec).toEqual(new Float32Array([0.1, 0.2, 0.3]));
+    expect(vec).toEqual(new Float32Array([0, 0.5]));
   });
 
   it("embedBatch returns one Float32Array per input text", async () => {
-    mockSuccessModule();
-    const { LocalEmbeddingProvider: Fresh } = await import(
-      "../src/providers/embedding/local.js"
-    );
-    const vecs = await new Fresh().embedBatch(["a", "b", "c"]);
+    const provider = await loadProviderWith(FakeWorker);
+
+    const vecs = await provider.embedBatch(["a", "b", "c"]);
 
     expect(vecs).toHaveLength(3);
     for (const v of vecs) expect(v).toBeInstanceOf(Float32Array);
+    expect(vecs[2]).toEqual(new Float32Array([2, 2.5]));
+  });
+
+  it("rejects with the error the worker reported", async () => {
+    const provider = await loadProviderWith(FailingWorker);
+
+    await expect(provider.embed("hello")).rejects.toThrow("worker said no");
   });
 });
