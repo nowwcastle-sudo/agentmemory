@@ -7,6 +7,7 @@ import {
   hookEventLocator,
   hookSessionId,
   stableHookCaptureId,
+  toolEventLocator,
 } from "../src/hooks/_delivery.js";
 
 // 125 envelopes quarantined as capture_id_conflict on 2026-09-11 were all
@@ -37,6 +38,54 @@ describe("hookEventLocator", () => {
     expect(hookEventLocator(["agent-1", undefined], "t0")).toEqual(["agent-1"]);
     expect(hookEventLocator([undefined, "turn-1"], "t0")).toEqual(["turn-1"]);
     expect(hookEventLocator([null, "  "], "t0")).toBe("t0");
+  });
+});
+
+// Cycle N left the two tool hooks on the older derivation, whose last resort
+// was the tool name. Four codex envelopes were quarantined as
+// capture_id_conflict on 2026-09-17: three `post_tool_use`, one of them the
+// `assistant_response` pseudo-tool, which carries no call id at all and sends
+// its turn id under `tool_input`. Every id-less call to one tool in a session
+// therefore shared a capture id, and the store keeps only the first.
+describe("toolEventLocator", () => {
+  it("separates two id-less calls to the same tool in one session", () => {
+    const data = { tool_name: "assistant_response" };
+    const first = toolEventLocator(data, "2026-09-17T05:31:00.000Z");
+    const second = toolEventLocator(data, "2026-09-17T05:33:00.000Z");
+    expect(first).not.toBe(second);
+    expect(stableHookCaptureId("s1", "tool", first))
+      .not.toBe(stableHookCaptureId("s1", "tool", second));
+  });
+
+  it("never keys on the tool name", () => {
+    expect(toolEventLocator({ tool_name: "assistant_response" }, "t0")).toBe("t0");
+    expect(toolEventLocator({ toolName: "Bash" }, "t0")).toBe("t0");
+  });
+
+  it("reads the turn id Codex nests under tool_input", () => {
+    const locator = toolEventLocator(
+      { tool_name: "assistant_response", tool_input: { turn_id: "turn-9" } },
+      "t0",
+    );
+    expect(locator).toBe("turn-9");
+  });
+
+  it("keeps a real call id as the bare string reconciliation rebuilds", () => {
+    // codex-transcript.ts keys a rebuilt tool capture on the rollout's
+    // `call_id` alone. An array or a decorated string here would give every
+    // reconciled tool call a second capture id.
+    const locator = toolEventLocator({ call_id: "exec-77b08110", tool_name: "Bash" }, "t0");
+    expect(locator).toBe("exec-77b08110");
+    expect(stableHookCaptureId("s1", "tool", locator))
+      .toBe(stableHookCaptureId("s1", "tool", "exec-77b08110"));
+  });
+
+  it("prefers the explicit tool use id over the other candidates", () => {
+    const locator = toolEventLocator(
+      { tool_use_id: "toolu_1", call_id: "exec-2", turn_id: "turn-3" },
+      "t0",
+    );
+    expect(locator).toBe("toolu_1");
   });
 });
 

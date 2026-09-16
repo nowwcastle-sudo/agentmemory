@@ -51,6 +51,37 @@ export function hookEventLocator(candidates: unknown[], capturedAt: string): unk
   return present.length > 0 ? present : capturedAt;
 }
 
+/**
+ * The locator of a tool event: the call id the payload carries, or the moment
+ * of capture when it carries none. Keyed on the tool name -- the fallback this
+ * replaces -- every id-less call to one tool in a session shared a capture id
+ * and all but the first were rejected as capture_id_conflict; Codex's
+ * `assistant_response` pseudo-tool lost 4 events that way on 2026-09-17, and
+ * it carries its turn id under `tool_input`, so that is a candidate too.
+ *
+ * Returns a bare string, never the array `hookEventLocator` builds: session-end
+ * reconciliation rebuilds tool captures from the rollout's `call_id` as a bare
+ * string (`codex-transcript.ts`), so any other shape would give every
+ * reconciled tool call a second capture id.
+ */
+export function toolEventLocator(
+  data: Record<string, unknown>,
+  capturedAt: string,
+): string {
+  const toolInput = data.tool_input ?? data.toolArgs;
+  const nestedTurnId = typeof toolInput === "object" && toolInput !== null
+    ? (toolInput as Record<string, unknown>).turn_id
+    : undefined;
+  const id = [
+    data.tool_use_id,
+    data.toolUseId,
+    data.call_id,
+    data.turn_id,
+    nestedTurnId,
+  ].find((candidate) => typeof candidate === "string" && candidate.trim().length > 0);
+  return typeof id === "string" ? id : capturedAt;
+}
+
 export function hookSessionId(data: Record<string, unknown>): string | null {
   const value = [data.session_id, data.sessionId, data.conversation_id]
     .find((candidate) => typeof candidate === "string" && candidate.trim().length > 0);

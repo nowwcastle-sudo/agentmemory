@@ -1,6 +1,11 @@
 #!/usr/bin/env node
 import { resolveProjectPayload, hookCwd } from "./_project.js";
-import { defaultHookDelivery, hookSessionId, stableHookCaptureId } from "./_delivery.js";
+import {
+  defaultHookDelivery,
+  hookSessionId,
+  stableHookCaptureId,
+  toolEventLocator,
+} from "./_delivery.js";
 
 function isSdkChildContext(payload: unknown): boolean {
   if (process.env["AGENTMEMORY_SDK_CHILD"] === "1") return true;
@@ -33,7 +38,8 @@ async function main() {
 
   const cwd = hookCwd(data) || process.cwd();
 
-  const toolUseId = data.tool_use_id ?? data.toolUseId ?? data.call_id ?? data.turn_id ?? toolName;
+  const capturedAt = new Date().toISOString();
+  const toolUseId = toolEventLocator(data, capturedAt);
   await defaultHookDelivery().deliver("/agentmemory/observe", {
     captureId: stableHookCaptureId(sessionId, "tool", toolUseId),
     hookType: "post_tool_failure",
@@ -41,7 +47,7 @@ async function main() {
     ...resolveProjectPayload(cwd),
     cwd,
     ...(typeof data.agent_id === "string" ? { agentId: data.agent_id } : {}),
-    timestamp: new Date().toISOString(),
+    timestamp: capturedAt,
     data: {
       tool_name: toolName,
       tool_input: truncate(toolInput, 4000),

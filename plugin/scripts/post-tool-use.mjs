@@ -257,6 +257,31 @@ function stableHookCaptureId(sessionId, eventType, locator) {
 		locator
 	])).digest("hex").slice(0, 32)}`;
 }
+/**
+* The locator of a tool event: the call id the payload carries, or the moment
+* of capture when it carries none. Keyed on the tool name -- the fallback this
+* replaces -- every id-less call to one tool in a session shared a capture id
+* and all but the first were rejected as capture_id_conflict; Codex's
+* `assistant_response` pseudo-tool lost 4 events that way on 2026-09-17, and
+* it carries its turn id under `tool_input`, so that is a candidate too.
+*
+* Returns a bare string, never the array `hookEventLocator` builds: session-end
+* reconciliation rebuilds tool captures from the rollout's `call_id` as a bare
+* string (`codex-transcript.ts`), so any other shape would give every
+* reconciled tool call a second capture id.
+*/
+function toolEventLocator(data, capturedAt) {
+	const toolInput = data.tool_input ?? data.toolArgs;
+	const nestedTurnId = typeof toolInput === "object" && toolInput !== null ? toolInput.turn_id : void 0;
+	const id = [
+		data.tool_use_id,
+		data.toolUseId,
+		data.call_id,
+		data.turn_id,
+		nestedTurnId
+	].find((candidate) => typeof candidate === "string" && candidate.trim().length > 0);
+	return typeof id === "string" ? id : capturedAt;
+}
 function hookSessionId(data) {
 	const value = [
 		data.session_id,
@@ -467,7 +492,8 @@ async function main() {
 	const { imageData, cleanOutput } = extractImageData(toolOutput(data));
 	const cwd = hookCwd(data) || process.cwd();
 	const hookType = (typeof cleanOutput === "object" && cleanOutput !== null ? cleanOutput : null)?.success === false ? "post_tool_failure" : "post_tool_use";
-	const toolUseId = data.tool_use_id ?? data.toolUseId ?? data.call_id ?? data.turn_id ?? toolName;
+	const capturedAt = (/* @__PURE__ */ new Date()).toISOString();
+	const toolUseId = toolEventLocator(data, capturedAt);
 	await defaultHookDelivery().deliver("/agentmemory/observe", {
 		captureId: stableHookCaptureId(sessionId, "tool", toolUseId),
 		hookType,
@@ -475,7 +501,7 @@ async function main() {
 		...resolveProjectPayload(cwd),
 		cwd,
 		...typeof data.agent_id === "string" ? { agentId: data.agent_id } : {},
-		timestamp: (/* @__PURE__ */ new Date()).toISOString(),
+		timestamp: capturedAt,
 		data: {
 			tool_name: toolName,
 			tool_input: toolInput,
