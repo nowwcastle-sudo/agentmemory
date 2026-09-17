@@ -49,15 +49,6 @@ async function listInsightRows(kv: StateKV): Promise<InsightIndexRow[]> {
   return full.map(toIndexRow);
 }
 
-/**
- * How much of a session's opening prompt has to match for two sessions to be
- * the same recurring job. A scheduled run names itself in the first line --
- * `<scheduled-task name="…" file="…">` -- so this reaches past the name and
- * the file while staying short enough that two people typing the same request
- * are not treated as one session.
- */
-export const SESSION_OPENING_MATCH_CHARS = 120;
-
 export function registerContextFunction(
   sdk: ISdk,
   kv: StateKV,
@@ -271,15 +262,6 @@ export function registerContextFunction(
         });
       }
       const allSessions = await kv.list<Session>(KV.sessions);
-      // A recurring job files a session every run, and the window is the ten
-      // newest: one project's window held three runs of the same daily task,
-      // each reporting that nothing had changed, and it claimed another slot
-      // every day. Their summaries are worded differently, so nothing semantic
-      // separates them -- the identical opening prompt does. Keep the newest of
-      // each and let the window reach further back, the way the relations block
-      // spends its twelve lines on twelve different things. A session with no
-      // prompt is never a repeat: most of those have no prompt recorded at all.
-      const seenOpenings = new Set<string>();
       const sessions = allSessions
         .filter(
           (s) =>
@@ -291,15 +273,6 @@ export function registerContextFunction(
           (a, b) =>
             new Date(b.startedAt).getTime() - new Date(a.startedAt).getTime(),
         )
-        .filter((s) => {
-          const opening = (s.firstPrompt ?? "")
-            .slice(0, SESSION_OPENING_MATCH_CHARS)
-            .trim();
-          if (!opening) return true;
-          if (seenOpenings.has(opening)) return false;
-          seenOpenings.add(opening);
-          return true;
-        })
         .slice(0, 10);
 
       const summariesPerSession = await Promise.all(
