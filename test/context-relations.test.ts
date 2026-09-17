@@ -141,6 +141,64 @@ describe("mem::context relations block", () => {
     expect(result.context).not.toContain("An old session summarized today");
   });
 
+  // A recurring job files a session every run, and the context window is the
+  // ten newest sessions. Measured 2026-09-18 on one project: of the six
+  // summarized sessions in its window, three were the same daily scheduled
+  // task reporting that nothing had changed, and it takes another slot every
+  // day. Their firstPrompt is byte-identical, which is the signal -- the
+  // summaries differ in wording, so nothing semantic separates them.
+  it("spends the session window on distinct work, keeping the newest of a repeat", async () => {
+    const kv = mockKV();
+    await kv.set(KV.profiles, "p1", profile);
+    const scheduled =
+      '<scheduled-task name="nightly-check" file="C:\\tasks\\nightly-check\\SKILL.md">\nRun the check.';
+    const seed = async (id: string, startedAt: string, firstPrompt: string, title: string) => {
+      await kv.set(KV.sessions, id, {
+        id, project: "p1", cwd: "/repo", startedAt, status: "completed",
+        observationCount: 3, firstPrompt,
+      });
+      await kv.set(KV.summaries, id, {
+        sessionId: id, project: "p1", createdAt: startedAt, title,
+        narrative: "narrative", keyDecisions: ["a decision"], filesModified: [],
+        concepts: [], observationCount: 3,
+      });
+    };
+    await seed("s_task_new", "2026-09-17T11:09:00.000Z", scheduled, "Nightly check — no changes");
+    await seed("s_task_mid", "2026-09-16T11:09:00.000Z", scheduled, "Nightly check — nothing applied");
+    await seed("s_task_old", "2026-09-15T11:09:00.000Z", scheduled, "Nightly check — up to date");
+    await seed("s_real", "2026-09-14T09:00:00.000Z", "Fix the retry policy backoff", "Retry policy rewritten");
+
+    const context = wireContext(kv);
+    const result = await context({ sessionId: "s_now", project: "p1" });
+    expect(result.context).toContain("Nightly check — no changes");
+    expect(result.context).not.toContain("Nightly check — nothing applied");
+    expect(result.context).not.toContain("Nightly check — up to date");
+    // The freed slots reach further back, so real work still lands.
+    expect(result.context).toContain("Retry policy rewritten");
+  });
+
+  it("keeps sessions that merely lack a first prompt apart", async () => {
+    const kv = mockKV();
+    await kv.set(KV.profiles, "p1", profile);
+    for (const [id, startedAt, title] of [
+      ["s_a", "2026-09-17T00:00:00.000Z", "First untitled session"],
+      ["s_b", "2026-09-16T00:00:00.000Z", "Second untitled session"],
+    ] as const) {
+      await kv.set(KV.sessions, id, {
+        id, project: "p1", cwd: "/repo", startedAt, status: "completed", observationCount: 2,
+      });
+      await kv.set(KV.summaries, id, {
+        sessionId: id, project: "p1", createdAt: startedAt, title,
+        narrative: "narrative", keyDecisions: ["a decision"], filesModified: [],
+        concepts: [], observationCount: 2,
+      });
+    }
+    const context = wireContext(kv);
+    const result = await context({ sessionId: "s_now", project: "p1" });
+    expect(result.context).toContain("First untitled session");
+    expect(result.context).toContain("Second untitled session");
+  });
+
   it("drops the block, not the rest, when it does not fit the budget", async () => {
     const kv = mockKV();
     await kv.set(KV.profiles, "p1", profile);
