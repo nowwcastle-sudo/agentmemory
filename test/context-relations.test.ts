@@ -97,6 +97,50 @@ describe("mem::context relations block", () => {
     expect(result.context).not.toContain("## Relations");
   });
 
+  // Blocks are filled newest-first against the token budget, and a session's
+  // block took its recency from the summary's createdAt while the same loop's
+  // observation branch took it from the session's startedAt. Re-summarizing
+  // therefore reordered the context: a backfill on 2026-09-17 gave 303 of 429
+  // summaries a createdAt more than a day after their session -- one by 21
+  // days -- and a three-week-old session outranked a relations index rebuilt
+  // the day before, taking the whole budget with it.
+  it("ranks a session by when it happened, not by when its summary was written", async () => {
+    const kv = mockKV();
+    await kv.set(KV.profiles, "p1", profile);
+    await kv.set(KV.sessions, "s_old", {
+      id: "s_old",
+      project: "p1",
+      cwd: "/repo",
+      startedAt: "2026-08-27T00:00:00.000Z",
+      status: "completed",
+      observationCount: 4,
+    });
+    await kv.set(KV.summaries, "s_old", {
+      sessionId: "s_old",
+      project: "p1",
+      createdAt: "2026-09-17T00:00:00.000Z", // backfilled three weeks later
+      title: "An old session summarized today",
+      narrative: "Work that happened three weeks before this summary was written.",
+      keyDecisions: ["Chose the old approach for the old reason"],
+      filesModified: ["src/old.ts"],
+      concepts: ["old work"],
+      observationCount: 4,
+    });
+    await kv.set(KV.graphRelationsIndex, "p1", {
+      project: "p1",
+      updatedAt: "2026-09-16T00:00:00.000Z", // newer than the session, older than the backfill
+      relations: [
+        { source: "retry policy", type: "rejected", target: "blanket sleep", weight: 0.9, backing: 4, edgeId: "e_keep" },
+      ],
+    });
+
+    // Room for one of the two.
+    const context = wireContext(kv, 90);
+    const result = await context({ sessionId: "s_now", project: "p1" });
+    expect(result.context).toContain("## Relations");
+    expect(result.context).not.toContain("An old session summarized today");
+  });
+
   it("drops the block, not the rest, when it does not fit the budget", async () => {
     const kv = mockKV();
     await kv.set(KV.profiles, "p1", profile);

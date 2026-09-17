@@ -290,7 +290,15 @@ export function registerContextFunction(
             type: "summary",
             content,
             tokens: estimateTokens(content),
-            recency: new Date(summary.createdAt).getTime(),
+            // When the session happened, not when its summary was written.
+            // The observation branch below already ranks the same sessions by
+            // startedAt, so keying this one on the summary's createdAt made a
+            // session's rank depend on whether it had been summarized yet. A
+            // backfill then reordered every context it touched: 303 of 429
+            // summaries ended up with a createdAt more than a day after their
+            // session, one by 21 days, and those sessions outranked a
+            // relations index rebuilt the day before.
+            recency: new Date(sessions[i].startedAt).getTime(),
           });
         } else {
           sessionsNeedingObs.push(i);
