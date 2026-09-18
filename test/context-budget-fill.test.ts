@@ -114,6 +114,43 @@ describe("mem::context budget fill", () => {
     expect([...order].sort((x, y) => x - y)).toEqual(order);
   });
 
+  // Lessons had no short form, so a 468-token block was either whole or gone.
+  it("fits lessons in short form -- the lesson without its context -- when the full block does not fit", async () => {
+    const kv = mockKV();
+    for (let i = 0; i < 4; i++) {
+      await kv.set(KV.lessons, `l${i}`, {
+        id: `l${i}`, content: `Lesson content ${i}`, context: `lesson-context-${i} `.repeat(30),
+        confidence: 0.9 - i * 0.01, reinforcements: 0, source: "manual", sourceIds: [],
+        project: "p1", tags: [], createdAt: iso(1), updatedAt: iso(1), decayRate: 0.05,
+      });
+    }
+    const { context } = await wireContext(kv, 200)({ sessionId: "s_now", project: "p1" });
+    expect(context).toContain("## Lessons Learned");
+    for (let i = 0; i < 4; i++) expect(context).toContain(`Lesson content ${i}`);
+    expect(context).not.toContain("lesson-context-0");
+  });
+
+  // Live, the lessons themselves ran 280-360 characters each: without their
+  // context the block was still ~330 tokens and still did not fit. A lesson
+  // has no title, so its first sentence stands in for one.
+  it("shortens a long lesson to its first sentence in the short form", async () => {
+    const kv = mockKV();
+    await kv.set(KV.lessons, "long", {
+      id: "long", content: `Replay-import duplicates observations. ${"because capture ids differ ".repeat(20)}`,
+      context: "ctx", confidence: 0.9, reinforcements: 0, source: "manual", sourceIds: [],
+      project: "p1", tags: [], createdAt: iso(1), updatedAt: iso(1), decayRate: 0.05,
+    });
+    await kv.set(KV.sessions, "s_a", { id: "s_a", project: "p1", cwd: "/r", startedAt: iso(2), status: "completed", observationCount: 1 });
+    await kv.set(KV.summaries, "s_a", {
+      sessionId: "s_a", project: "p1", createdAt: iso(2), title: "Recent session",
+      narrative: "n ".repeat(200), keyDecisions: ["d"], filesModified: [], concepts: [], observationCount: 1,
+    });
+    const { context } = await wireContext(kv, 120)({ sessionId: "s_now", project: "p1" });
+    expect(context).toContain("Replay-import duplicates observations.");
+    expect(context).not.toContain("because capture ids differ");
+    expect(context).toContain("Recent session");
+  });
+
   it("stays within the budget", async () => {
     const kv = mockKV();
     await seed(kv);
