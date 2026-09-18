@@ -283,8 +283,17 @@ export function registerContextFunction(
         (i.project === data.project ? 1.5 : 1) *
         i.confidence *
         (1 + 0.5 * overlapOf(i));
+      // A project-less insight must share a concept with the project. Until
+      // 2026-09-18 overlap only boosted the score, so all 29 projects got the
+      // same five global insights -- CAP25 validation and one project's PR
+      // governance, three of them saying the same thing -- and at a budget
+      // of 1000 they pushed session summaries out of six projects entirely.
       const relevantInsights = insights
-        .filter((i) => !i.deleted && (!i.project || i.project === data.project))
+        .filter(
+          (i) =>
+            !i.deleted &&
+            (i.project === data.project || (!i.project && overlapOf(i) > 0)),
+        )
         .sort((a, b) => scoreInsight(b) - scoreInsight(a))
         .slice(0, 5);
 

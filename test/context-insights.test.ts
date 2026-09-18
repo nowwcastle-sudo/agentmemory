@@ -51,7 +51,7 @@ function makeInsight(over: Partial<Insight> = {}): Insight {
     content: over.content ?? "default insight content",
     confidence: over.confidence ?? 0.8,
     reinforcements: over.reinforcements ?? 0,
-    sourceConceptCluster: over.sourceConceptCluster ?? [],
+    sourceConceptCluster: over.sourceConceptCluster ?? ["anchor"],
     sourceMemoryIds: over.sourceMemoryIds ?? [],
     sourceLessonIds: over.sourceLessonIds ?? [],
     sourceCrystalIds: over.sourceCrystalIds ?? [],
@@ -97,6 +97,7 @@ describe("mem::context — insights auto-injection (ontology-lite follow-up)", (
   });
 
   it("includes an 'Insights' block carrying title and content", async () => {
+    await seedProfile(kv, "/tmp/proj", ["anchor"]);
     await seedInsight(kv, {
       id: "insight_a",
       title: "canonical-key-marker",
@@ -120,6 +121,7 @@ describe("mem::context — insights auto-injection (ontology-lite follow-up)", (
   });
 
   it("caps the block at five insights ordered by score", async () => {
+    await seedProfile(kv, "/tmp/proj", ["anchor"]);
     for (let i = 0; i < 7; i++) {
       await seedInsight(kv, {
         id: `insight_${i}`,
@@ -132,29 +134,60 @@ describe("mem::context — insights auto-injection (ontology-lite follow-up)", (
     for (const i of [1, 0]) expect(result.context).not.toContain(`cap-marker-${i}`);
   });
 
-  it("ranks insights whose concept cluster overlaps the project profile above higher-confidence unrelated ones", async () => {
+  // Unrelated insights are no longer candidates (see the next test), so the
+  // boost now orders insights that do overlap: more overlap outranks a little
+  // more confidence.
+  it("ranks the insight with more concept overlap above a slightly more confident one", async () => {
     await seedProfile(kv, "/tmp/proj", ["graph schema", "TypeScript"]);
+    // 0.80 * (1 + 0.5 * 1/2) = 1.000
     await seedInsight(kv, {
       id: "insight_related",
-      title: "related-insight-marker",
+      title: "strong-overlap-marker",
       confidence: 0.8,
       sourceConceptCluster: ["Graph Schema", "validation"],
     });
+    // 0.85 * (1 + 0.5 * 1/4) = 0.956
     await seedInsight(kv, {
-      id: "insight_unrelated",
-      title: "unrelated-insight-marker",
+      id: "insight_weaker",
+      title: "weak-overlap-marker",
       confidence: 0.85,
-      sourceConceptCluster: ["cooking"],
+      sourceConceptCluster: ["graph schema", "cooking", "travel", "music"],
     });
     const result = await handler({ sessionId: "ses_rank", project: "/tmp/proj" });
-    const related = result.context.indexOf("related-insight-marker");
-    const unrelated = result.context.indexOf("unrelated-insight-marker");
-    expect(related).toBeGreaterThan(-1);
-    expect(unrelated).toBeGreaterThan(-1);
-    expect(related).toBeLessThan(unrelated);
+    const strong = result.context.indexOf("strong-overlap-marker");
+    const weak = result.context.indexOf("weak-overlap-marker");
+    expect(strong).toBeGreaterThan(-1);
+    expect(weak).toBeGreaterThan(-1);
+    expect(strong).toBeLessThan(weak);
+  });
+
+  // 2026-09-18: every one of 29 projects received the same five project-less
+  // insights (CAP25 validation, one project's PR governance), three of them
+  // saying the same thing, because relevance only boosted the score. A
+  // project-less insight now has to share a concept with the project.
+  it("leaves out a project-less insight that shares no concept with the project", async () => {
+    await seedProfile(kv, "/tmp/proj", ["graph schema"]);
+    await seedInsight(kv, { id: "i_rel", title: "shares-a-concept", sourceConceptCluster: ["Graph Schema"] });
+    await seedInsight(kv, { id: "i_unrel", title: "shares-nothing", confidence: 0.99, sourceConceptCluster: ["cooking"] });
+    const result = await handler({ sessionId: "ses_gate", project: "/tmp/proj" });
+    expect(result.context).toContain("shares-a-concept");
+    expect(result.context).not.toContain("shares-nothing");
+  });
+
+  it("leaves out project-less insights when the project has no profile concepts", async () => {
+    await seedInsight(kv, { id: "i_any", title: "global-without-anchor", sourceConceptCluster: ["anything"] });
+    const result = await handler({ sessionId: "ses_noprof", project: "/tmp/proj" });
+    expect(result.context).not.toContain("## Insights");
+  });
+
+  it("keeps an insight scoped to this project without any concept overlap", async () => {
+    await seedInsight(kv, { id: "i_own", title: "own-project-insight", project: "/tmp/proj" });
+    const result = await handler({ sessionId: "ses_own", project: "/tmp/proj" });
+    expect(result.context).toContain("own-project-insight");
   });
 
   it("excludes insights scoped to another project and keeps global ones", async () => {
+    await seedProfile(kv, "/tmp/proj", ["anchor"]);
     await seedInsight(kv, { id: "insight_other", title: "other-project-insight", project: "/tmp/other" });
     await seedInsight(kv, { id: "insight_global", title: "global-insight-marker", project: undefined });
     const result = await handler({ sessionId: "ses_scope", project: "/tmp/proj" });
@@ -173,6 +206,7 @@ describe("mem::context — reads the insight index, not the whole scope", () => 
   });
 
   it("serves insights from the index without listing mem:insights", async () => {
+    await seedProfile(kv, "/tmp/proj", ["anchor"]);
     const listed: string[] = [];
     const inner = kv.list;
     kv.list = async <T>(scope: string): Promise<T[]> => {
@@ -221,6 +255,7 @@ describe("mem::context — reads the insight index, not the whole scope", () => 
   // Regression guard for stores that predate the index: behaviour is
   // unchanged, only slower, until mem::insight-index-rebuild has run.
   it("falls back to the full scope when the index is empty", async () => {
+    await seedProfile(kv, "/tmp/proj", ["anchor"]);
     await seedInsight(kv, { id: "insight_legacy", title: "legacy-scope-marker" });
     const result = await handler({ sessionId: "ses_legacy", project: "/tmp/proj" });
     expect(result.context).toContain("legacy-scope-marker");

@@ -40,12 +40,17 @@ const NOW = Date.now();
 const iso = (hoursAgo: number) => new Date(NOW - hoursAgo * 3_600_000).toISOString();
 
 async function seed(kv: ReturnType<typeof mockKV>) {
+  // The insights share a concept with the project, as they must to be shown.
+  await kv.set(KV.profiles, "p1", {
+    project: "p1", updatedAt: iso(0), topConcepts: [{ concept: "anchor", frequency: 1 }],
+    topFiles: [], conventions: [], commonErrors: [], recentActivity: [], sessionCount: 1, totalObservations: 1,
+  });
   // Five insights, the newest material, each with a long preview: the block
   // is ~430 tokens in full and ~60 as titles only.
   for (let i = 0; i < 5; i++) {
     const insight: Insight = {
       id: `ins_${i}`, title: `Insight title ${i}`, content: `insight body ${i} `.repeat(30),
-      confidence: 0.9 - i * 0.01, reinforcements: 0, sourceConceptCluster: [],
+      confidence: 0.9 - i * 0.01, reinforcements: 0, sourceConceptCluster: ["anchor"],
       sourceMemoryIds: [], sourceLessonIds: [], sourceCrystalIds: [], tags: [],
       createdAt: iso(1), updatedAt: iso(1), decayRate: 0.05,
     };
