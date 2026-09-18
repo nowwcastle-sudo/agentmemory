@@ -141,6 +141,70 @@ describe("mem::context relations block", () => {
     expect(result.context).not.toContain("An old session summarized today");
   });
 
+  // A scheduled task files a session every run and the window is the ten
+  // newest. 2026-09-18, one project: 3 of the 6 summarized sessions in its
+  // window were runs of the same daily task. The first attempt keyed on the
+  // first 120 characters of any prompt and collapsed unrelated work that
+  // shared the harness's compaction boilerplate, so this keys only on the
+  // task name the scheduler writes at the very start of the prompt.
+  describe("scheduled-task runs share one window slot", () => {
+    const seed = async (
+      kv: ReturnType<typeof mockKV>,
+      id: string,
+      startedAt: string,
+      firstPrompt: string,
+      title: string,
+    ) => {
+      await kv.set(KV.sessions, id, {
+        id, project: "p1", cwd: "/repo", startedAt, status: "completed",
+        observationCount: 3, firstPrompt,
+      });
+      await kv.set(KV.summaries, id, {
+        sessionId: id, project: "p1", createdAt: startedAt, title,
+        narrative: "narrative", keyDecisions: ["a decision"], filesModified: [],
+        concepts: [], observationCount: 3,
+      });
+    };
+    const task = (name: string) =>
+      `<scheduled-task name="${name}" file="C:\\tasks\\${name}\\SKILL.md">\nRun it.`;
+
+    it("keeps only the newest run of each task and reaches further back", async () => {
+      const kv = mockKV();
+      await kv.set(KV.profiles, "p1", profile);
+      await seed(kv, "t_new", "2026-09-17T11:00:00.000Z", task("nightly-check"), "Nightly check — no changes");
+      await seed(kv, "t_mid", "2026-09-16T11:00:00.000Z", task("nightly-check"), "Nightly check — nothing applied");
+      await seed(kv, "o_new", "2026-09-16T10:00:00.000Z", task("other-job"), "Other job — ran");
+      for (let d = 0; d < 9; d++) {
+        const day = String(15 - d).padStart(2, "0");
+        await seed(kv, `w_${d}`, `2026-09-${day}T09:00:00.000Z`, `Real work item ${d}`, `Real work ${d}`);
+      }
+      const result = await wireContext(kv)({ sessionId: "s_now", project: "p1" });
+      expect(result.context).toContain("Nightly check — no changes");
+      expect(result.context).not.toContain("Nightly check — nothing applied");
+      expect(result.context).toContain("Other job — ran");
+      // 1 + 1 task slots leave 8 for real work: 0..7 land, 8 does not.
+      expect(result.context).toContain("Real work 7");
+      expect(result.context).not.toContain("Real work 8");
+    });
+
+    it("never merges sessions that only share an opening, like the compaction boilerplate", async () => {
+      const kv = mockKV();
+      await kv.set(KV.profiles, "p1", profile);
+      const boiler =
+        "Below is a conversation log from a Claude Code coding session. Create a summary to help the next session";
+      await seed(kv, "b1", "2026-09-17T00:00:00.000Z", `${boiler} A`, "Boilerplate work A");
+      await seed(kv, "b2", "2026-09-16T00:00:00.000Z", `${boiler} B`, "Boilerplate work B");
+      await seed(kv, "b3", "2026-09-15T00:00:00.000Z", `${boiler} C`, "Boilerplate work C");
+      // A tag later in the prompt is quoted text, not a scheduler run.
+      await seed(kv, "q1", "2026-09-14T00:00:00.000Z", `See ${task("nightly-check")}`, "Quoted tag one");
+      await seed(kv, "q2", "2026-09-13T00:00:00.000Z", `Also ${task("nightly-check")}`, "Quoted tag two");
+      const result = await wireContext(kv)({ sessionId: "s_now", project: "p1" });
+      for (const t of ["Boilerplate work A", "Boilerplate work B", "Boilerplate work C", "Quoted tag one", "Quoted tag two"]) {
+        expect(result.context).toContain(t);
+      }
+    });
+  });
+
   it("drops the block, not the rest, when it does not fit the budget", async () => {
     const kv = mockKV();
     await kv.set(KV.profiles, "p1", profile);

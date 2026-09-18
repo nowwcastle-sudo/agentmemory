@@ -49,6 +49,13 @@ async function listInsightRows(kv: StateKV): Promise<InsightIndexRow[]> {
   return full.map(toIndexRow);
 }
 
+const SCHEDULED_TASK_OPENING = /^<scheduled-task\s+name="([^"]+)"/;
+
+/** The scheduler's task name when the prompt starts with its tag, else null. */
+export function scheduledTaskName(firstPrompt: string | undefined): string | null {
+  return firstPrompt?.match(SCHEDULED_TASK_OPENING)?.[1] ?? null;
+}
+
 export function registerContextFunction(
   sdk: ISdk,
   kv: StateKV,
@@ -262,6 +269,7 @@ export function registerContextFunction(
         });
       }
       const allSessions = await kv.list<Session>(KV.sessions);
+      const seenTasks = new Set<string>();
       const sessions = allSessions
         .filter(
           (s) =>
@@ -273,6 +281,18 @@ export function registerContextFunction(
           (a, b) =>
             new Date(b.startedAt).getTime() - new Date(a.startedAt).getTime(),
         )
+        // A scheduled task files a session every run: one project's window
+        // held three runs of the same daily task. Keep the newest run of each
+        // task. The key is the name the scheduler writes at the very start of
+        // the prompt -- a looser key (any shared opening) collapsed unrelated
+        // work that began with the harness's compaction boilerplate.
+        .filter((s) => {
+          const task = scheduledTaskName(s.firstPrompt);
+          if (task === null) return true;
+          if (seenTasks.has(task)) return false;
+          seenTasks.add(task);
+          return true;
+        })
         .slice(0, 10);
 
       const summariesPerSession = await Promise.all(
