@@ -197,6 +197,67 @@ describe("durable terminal session projection", () => {
     expect(triggeredIds).not.toContain("mem::project-graph-sources");
   });
 
+  // Stage 2: judgment relations from the summary's decisions, after the
+  // semantic graph. Best-effort: a failed extraction must not fail or retry
+  // the projection, whose summary and graph are already written.
+  describe("summary judgments", () => {
+    async function project(judgments: ReturnType<typeof vi.fn>) {
+      const sdk = mockSdk({ looseTrigger: true });
+      const kv = mockKV();
+      const session = makeSession();
+      const observation = makeObservation();
+      await seedSession(kv, session, observation);
+      const order: string[] = [];
+      const summarize = vi.fn(async () => {
+        order.push("summary");
+        const summary = makeSummary(session, observation);
+        await kv.set(KV.summaries, session.id, summary);
+        return { success: true, summary };
+      });
+      const graph = vi.fn(async () => {
+        order.push("graph");
+        return { success: true };
+      });
+      judgments.mockImplementation(async () => {
+        order.push("judgments");
+        return { success: true, edgesAdded: 2 };
+      });
+      registerSessionProjectionFunction(sdk as never, kv as never, summarize, graph, new ProjectionCoordinator(), judgments as never);
+      await sdk.trigger("mem::queue-session-projection", { sessionId: session.id });
+      const result = await sdk.trigger("mem::project-session", { sessionId: session.id });
+      return { result, order, kv, session };
+    }
+
+    it("runs after the semantic graph, once, for the projected session", async () => {
+      const judgments = vi.fn();
+      const { result, order, session } = await project(judgments);
+      expect(result).toMatchObject({ success: true });
+      expect(order).toEqual(["summary", "graph", "judgments"]);
+      expect(judgments).toHaveBeenCalledWith({ sessionId: session.id });
+    });
+
+    it("does not fail the projection when extraction fails", async () => {
+      const judgments = vi.fn();
+      const failing = vi.fn(async () => { throw new Error("provider down"); });
+      judgments.mockImplementation(failing);
+      const sdk = mockSdk({ looseTrigger: true });
+      const kv = mockKV();
+      const session = makeSession();
+      const observation = makeObservation();
+      await seedSession(kv, session, observation);
+      const summarize = vi.fn(async () => {
+        const summary = makeSummary(session, observation);
+        await kv.set(KV.summaries, session.id, summary);
+        return { success: true, summary };
+      });
+      registerSessionProjectionFunction(sdk as never, kv as never, summarize, vi.fn(async () => ({ success: true })), new ProjectionCoordinator(), failing as never);
+      await sdk.trigger("mem::queue-session-projection", { sessionId: session.id });
+      const result = await sdk.trigger("mem::project-session", { sessionId: session.id });
+      expect(result).toMatchObject({ success: true });
+      expect(await kv.get(KV.sessionProjections, session.id)).toMatchObject({ status: "succeeded", terminalOutcome: "summary_written" });
+    });
+  });
+
   it("defers session projection until every observation projection succeeds", async () => {
     const sdk = mockSdk({ looseTrigger: true });
     const kv = mockKV();

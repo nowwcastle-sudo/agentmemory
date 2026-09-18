@@ -1932,6 +1932,30 @@ export function registerApiTriggers(
     config: { api_path: "/agentmemory/graph/relations-index/rebuild", http_method: "POST" },
   });
 
+  // Judgment relations from one session's summary decisions. New summaries
+  // get this from the session projection; this is the backfill for the ones
+  // written before, or by POST /summarize, which never ran the graph step.
+  sdk.registerFunction("api::graph-summary-judgments",
+    async (req: ApiRequest<{ sessionId?: string }>): Promise<Response> => {
+      const authErr = checkAuth(req, secret);
+      if (authErr) return authErr;
+      const sessionId = req.body?.sessionId;
+      if (typeof sessionId !== "string" || !sessionId.trim()) {
+        return { status_code: 400, body: { success: false, error: "sessionId is required" } };
+      }
+      const result = await sdk.trigger({
+        function_id: "mem::summary-judgments",
+        payload: { sessionId: sessionId.trim() },
+      });
+      return { status_code: 200, body: result };
+    },
+  );
+  sdk.registerTrigger({
+    type: "http",
+    function_id: "api::graph-summary-judgments",
+    config: { api_path: "/agentmemory/graph/summary-judgments", http_method: "POST" },
+  });
+
   // Recount the snapshot stats from the live rows (the counters drift on
   // every write outside the persist seam and the rebuild refuses large
   // corpora). Body: { staleUnknownTypes?: boolean }.

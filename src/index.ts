@@ -105,6 +105,7 @@ import { registerRetentionFunctions } from "./functions/retention.js";
 import { registerCompressFileFunction } from "./functions/compress-file.js";
 import { registerReplayFunctions } from "./functions/replay.js";
 import { registerSessionProjectionFunction } from "./functions/session-projection.js";
+import { registerSummaryJudgmentFunction } from "./functions/summary-judgments.js";
 import { registerMaintenanceProjectionFunction } from "./functions/maintenance-projection.js";
 import { registerApiTriggers } from "./triggers/api.js";
 import { registerEventTriggers } from "./triggers/events.js";
@@ -459,12 +460,19 @@ async function main() {
   registerRetentionFunctions(sdk, kv);
   registerCompressFileFunction(sdk, kv, provider);
   registerReplayFunctions(sdk, kv);
+  const summaryJudgmentsCore = registerSummaryJudgmentFunction(
+    sdk,
+    kv,
+    provider,
+    projectionCoordinator,
+  );
   const sessionProjectionRecovery = registerSessionProjectionFunction(
     sdk,
     kv,
     summarizeSessionCore,
     projectGraphSourcesCore,
     projectionCoordinator,
+    summaryJudgmentsCore,
   );
   registerMaintenanceProjectionFunction(sdk, kv, projectionCoordinator);
   const connectorOutboxes = defaultConnectorOutboxes();
@@ -655,7 +663,7 @@ async function main() {
     `Ready. ${embeddingProvider ? "Triple-stream (BM25+Vector+Graph)" : "BM25+Graph"} search active.`,
   );
   bootLog(
-    `REST API: 139 endpoints at http://localhost:${config.restPort}/agentmemory/*`,
+    `REST API: 140 endpoints at http://localhost:${config.restPort}/agentmemory/*`,
   );
   bootLog(
     `MCP surface (opt-in via \`npx @agentmemory/mcp\`): ${getAllTools().length} tools · 6 resources · 3 prompts`,

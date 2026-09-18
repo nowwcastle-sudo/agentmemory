@@ -33,6 +33,7 @@ import type {
   GraphSourceProjectionResult,
 } from "./graph-source-projection.js";
 import { ProjectionCoordinator } from "./projection-coordinator.js";
+import type { SummaryJudgmentCore } from "./summary-judgments.js";
 
 type SessionProjectionRequest = {
   sessionId: string;
@@ -90,6 +91,7 @@ export function registerSessionProjectionFunction(
   summarizeSessionCore?: SummarizeSessionCore,
   projectGraphSourcesCore?: ProjectGraphSourcesCore,
   coordinator = new ProjectionCoordinator(),
+  summaryJudgmentsCore?: SummaryJudgmentCore,
 ): SessionProjectionRecoveryController {
   let drainRequested = false;
   let drainRunning = false;
@@ -300,6 +302,26 @@ export function registerSessionProjectionFunction(
             throw new Error(
               graphResult?.error || "semantic graph did not report success",
             );
+          }
+
+          // Stage 2: judgment relations from the summary's decisions. Best
+          // effort -- the summary and its graph are already written, so a
+          // failed extraction is logged, not retried as a failed projection.
+          if (summaryJudgmentsCore) {
+            try {
+              const judged = await summaryJudgmentsCore({ sessionId: data.sessionId });
+              if (!judged.success) {
+                logger.warn("Summary judgments not extracted", {
+                  sessionId: data.sessionId,
+                  error: judged.error,
+                });
+              }
+            } catch (error) {
+              logger.warn("Summary judgments failed", {
+                sessionId: data.sessionId,
+                error: projectionError(error),
+              });
+            }
           }
 
           const succeeded: SessionProjection = {
