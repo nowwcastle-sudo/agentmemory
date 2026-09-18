@@ -293,6 +293,35 @@ describe("Reflect", () => {
       expect(after[0].reinforcements).toBe(1);
     });
 
+    // The fingerprint is the content hash, and a model rewords the content on
+    // every run: by 2026-09-06 the store held 58 extra copies among its top
+    // 500 insights, one title five times. A same-titled insight in the same
+    // scope is the same insight said again.
+    it("reinforces a same-titled insight whose content was reworded", async () => {
+      await kv.set("mem:graph:nodes", "node_security", makeConceptNode("security"));
+      await kv.set("mem:graph:nodes", "node_validation", makeConceptNode("validation"));
+      await kv.set("mem:graph:edges", "edge_1", makeEdge("security", "validation"));
+      await kv.set("mem:semantic", "sem_1", makeSemantic("Always validate security inputs"));
+      await kv.set("mem:semantic", "sem_2", makeSemantic("Testing improves security coverage"));
+      await kv.set("mem:semantic", "sem_3", makeSemantic("Validation prevents injection"));
+
+      await sdk.trigger("mem::reflect", {});
+      provider.summarize.mockResolvedValue(`<insights>
+<insight confidence="0.9" title="Defense-in-depth">
+Layer the protections: validate input, prefer safe APIs, and keep deny-lists.
+</insight>
+<insight confidence="0.7" title="A genuinely new idea">
+Something the first run did not say.
+</insight>
+</insights>`);
+      const result = (await sdk.trigger("mem::reflect", {})) as { reinforced: number; newInsights: number };
+
+      expect(result.reinforced).toBe(1);
+      expect(result.newInsights).toBe(1);
+      const titles = (await kv.list<Insight>("mem:insights")).map((i) => i.title).sort();
+      expect(titles).toEqual(["A genuinely new idea", "Defense in Depth", "Testing at Boundaries"]);
+    });
+
     it("falls back to Jaccard grouping when graph is empty", async () => {
       await kv.set("mem:semantic", "sem_1", makeSemantic("security validation is important"));
       await kv.set("mem:semantic", "sem_2", makeSemantic("security testing prevents bugs"));

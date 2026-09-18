@@ -42,6 +42,17 @@ export interface InsightIndexRow {
   deleted?: boolean;
 }
 
+/**
+ * What makes two insights the same insight: their scope and their title,
+ * case and punctuation aside. The id is a hash of the content, and a model
+ * rewords the content on every reflect run -- by 2026-09-06 the store held
+ * 58 extra copies among its top 500 insights, one title five times.
+ */
+export function insightTitleKey(insight: { title: string; project?: string }): string {
+  const title = insight.title.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
+  return JSON.stringify([insight.project ?? "", title]);
+}
+
 export function toIndexRow(insight: Insight): InsightIndexRow {
   const cluster = (insight.sourceConceptCluster ?? []).map((c) => c.toLowerCase());
   return {

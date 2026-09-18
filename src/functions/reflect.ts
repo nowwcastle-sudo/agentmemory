@@ -12,7 +12,7 @@ import type {
 } from "../types.js";
 import { recordAudit } from "./audit.js";
 import { REFLECT_SYSTEM, buildReflectPrompt } from "../prompts/reflect.js";
-import { writeInsight, rebuildInsightIndex } from "./insight-index.js";
+import { writeInsight, rebuildInsightIndex, insightTitleKey, type InsightIndexRow } from "./insight-index.js";
 
 interface ConceptCluster {
   concepts: string[];
@@ -245,6 +245,16 @@ export function registerReflectFunctions(
           ? offset + conceptClusters.length
           : undefined;
 
+      // Existing insights by title, so a reworded restatement reinforces the
+      // insight it restates instead of becoming another copy of it.
+      const indexRows = await kv
+        .list<InsightIndexRow>(KV.insightIndex)
+        .catch(() => [] as InsightIndexRow[]);
+      const byTitle = new Map<string, string>();
+      for (const row of indexRows) {
+        if (!row.deleted) byTitle.set(insightTitleKey(row), row.id);
+      }
+
       let newInsights = 0;
       let reinforced = 0;
       let clustersSkipped = 0;
@@ -323,7 +333,11 @@ export function registerReflectFunctions(
             if (!content) continue;
 
             const fp = fingerprintId("ins", content.trim().toLowerCase());
-            const existing = await kv.get<Insight>(KV.insights, fp);
+            const titleKey = insightTitleKey({ title, project: data?.project });
+            const sameTitleId = byTitle.get(titleKey);
+            const existing =
+              (await kv.get<Insight>(KV.insights, fp)) ??
+              (sameTitleId ? await kv.get<Insight>(KV.insights, sameTitleId) : null);
 
             if (existing && !existing.deleted) {
               reinforceInsight(existing);
@@ -348,6 +362,7 @@ export function registerReflectFunctions(
                 decayRate: 0.05,
               };
               await writeInsight(kv, insight);
+              byTitle.set(titleKey, insight.id);
               newInsights++;
             }
 

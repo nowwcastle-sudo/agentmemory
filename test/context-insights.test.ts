@@ -180,6 +180,25 @@ describe("mem::context — insights auto-injection (ontology-lite follow-up)", (
     expect(result.context).not.toContain("## Insights");
   });
 
+  // Reflect used to store a reworded restatement as a new insight: 58 extra
+  // copies among the top 500 on 2026-09-18. They are still in the store, so
+  // the block states each title once, keeping the best-scored copy, and the
+  // five slots go to five different things.
+  it("states each title once, keeping the best-scored copy", async () => {
+    await seedProfile(kv, "/tmp/proj", ["anchor"]);
+    await seedInsight(kv, { id: "d1", title: "Gate bypass causes regressions", content: "copy-one", confidence: 0.95 });
+    await seedInsight(kv, { id: "d2", title: "gate bypass causes regressions.", content: "copy-two", confidence: 0.9 });
+    await seedInsight(kv, { id: "d3", title: "Gate Bypass Causes Regressions", content: "copy-three", confidence: 0.85 });
+    for (let i = 0; i < 4; i++) {
+      await seedInsight(kv, { id: `u${i}`, title: `distinct-${i}`, confidence: 0.5 });
+    }
+    const result = await handler({ sessionId: "ses_dup", project: "/tmp/proj" });
+    expect(result.context).toContain("copy-one");
+    expect(result.context).not.toContain("copy-two");
+    expect(result.context).not.toContain("copy-three");
+    for (let i = 0; i < 4; i++) expect(result.context).toContain(`distinct-${i}`);
+  });
+
   it("keeps an insight scoped to this project without any concept overlap", async () => {
     await seedInsight(kv, { id: "i_own", title: "own-project-insight", project: "/tmp/proj" });
     const result = await handler({ sessionId: "ses_own", project: "/tmp/proj" });

@@ -11,7 +11,7 @@ import type {
 } from "../types.js";
 import { KV } from "../state/schema.js";
 import { StateKV } from "../state/kv.js";
-import { toIndexRow, type InsightIndexRow } from "./insight-index.js";
+import { insightTitleKey, toIndexRow, type InsightIndexRow } from "./insight-index.js";
 import { buildFocus, readProjectRelationsIndex, renderRelationsBlock } from "./graph-relations-index.js";
 import { recordAccessBatch } from "./access-tracker.js";
 import { logger } from "../logger.js";
@@ -273,6 +273,7 @@ export function registerContextFunction(
       // same five global insights -- CAP25 validation and one project's PR
       // governance, three of them saying the same thing -- and at a budget
       // of 1000 they pushed session summaries out of six projects entirely.
+      const seenInsightTitles = new Set<string>();
       const relevantInsights = insights
         .filter(
           (i) =>
@@ -280,6 +281,14 @@ export function registerContextFunction(
             (i.project === data.project || (!i.project && overlapOf(i) > 0)),
         )
         .sort((a, b) => scoreInsight(b) - scoreInsight(a))
+        // Reworded copies of one insight are still in the store; state each
+        // title once, the best-scored copy, so five slots say five things.
+        .filter((i) => {
+          const key = insightTitleKey(i);
+          if (seenInsightTitles.has(key)) return false;
+          seenInsightTitles.add(key);
+          return true;
+        })
         .slice(0, 5);
 
       if (relevantInsights.length > 0) {
