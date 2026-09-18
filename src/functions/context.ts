@@ -334,8 +334,12 @@ export function registerContextFunction(
 
       // Relations -- what the graph knows about this project, typed. Until
       // 2026-09-11 nothing a session received mentioned a graph relation.
+      // A relation the asking session produced itself is an echo of it, like
+      // its own summary, which the session window already leaves out.
       const relationsContent = renderRelationsBlock(
-        relationsIndex?.relations ?? [],
+        (relationsIndex?.relations ?? []).filter(
+          (r) => !r.sessions?.includes(data.sessionId),
+        ),
         profile,
         undefined,
         buildFocus(currentSession?.firstPrompt, currentObservations),

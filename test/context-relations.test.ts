@@ -35,6 +35,30 @@ const profile: ProjectProfile = {
 };
 
 describe("mem::context relations block", () => {
+  // The session window already leaves out the session asking; relations it
+  // produced itself are the same kind of echo. Measured 2026-09-18: the
+  // relations-effect spike's strongest case cited "Observation #4 --uses-->
+  // Get-CimInstance", extracted from the very session under test.
+  it("leaves out relations the asking session produced itself", async () => {
+    const kv = mockKV();
+    await kv.set(KV.profiles, "p1", profile);
+    await kv.set(KV.graphRelationsIndex, "p1", {
+      project: "p1",
+      updatedAt: "2026-09-11T00:00:00.000Z",
+      relations: [
+        { source: "own echo", type: "uses", target: "Get-CimInstance", weight: 0.9, backing: 4, edgeId: "e_own", sessions: ["s_now"] },
+        { source: "shared", type: "causes", target: "both", weight: 0.9, backing: 4, edgeId: "e_shared", sessions: ["s_now", "s_old"] },
+        { source: "earlier work", type: "causes", target: "timeout", weight: 0.9, backing: 4, edgeId: "e_old", sessions: ["s_old"] },
+        { source: "no provenance", type: "causes", target: "anything", weight: 0.9, backing: 4, edgeId: "e_none" },
+      ],
+    });
+    const result = await wireContext(kv)({ sessionId: "s_now", project: "p1" });
+    expect(result.context).not.toContain("own echo");
+    expect(result.context).not.toContain("shared --causes");
+    expect(result.context).toContain("earlier work --causes--> timeout");
+    expect(result.context).toContain("no provenance --causes--> anything");
+  });
+
   it("renders the project's typed relations from the index row and lists no graph scope", async () => {
     const kv = mockKV();
     const listed: string[] = [];

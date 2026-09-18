@@ -178,6 +178,23 @@ describe("rebuildRelationsIndex", () => {
     });
   });
 
+  it("records the sessions a relation came from, and nothing when refs name none", async () => {
+    const kv = mockKV();
+    for (const n of [node("c1", "auth"), node("f1", "src/auth.ts", "file")]) await kv.set(KV.graphNodes, n.id, n);
+    await kv.set(KV.graphEdges, "e1", edge("e1", "defines", "c1", "f1", {
+      sourceRefs: [
+        { sourceKind: "observation", sourceId: "o1", sessionId: "s1", projectId: "p1" },
+        { sourceKind: "observation", sourceId: "o2", sessionId: "s2", projectId: "p1" },
+        { sourceKind: "observation", sourceId: "o3", sessionId: "s1", projectId: "p1" },
+      ],
+    }));
+    await kv.set(KV.graphEdges, "e2", edge("e2", "uses", "f1", "c1"));
+    await rebuildRelationsIndex(kv as never);
+    const rows = await readProjectRelations(kv as never, "p1");
+    expect(rows.find((r) => r.edgeId === "e1")?.sessions).toEqual(["s1", "s2"]);
+    expect(rows.find((r) => r.edgeId === "e2")).not.toHaveProperty("sessions");
+  });
+
   it("attributes an edge to every project its source refs name", async () => {
     const kv = mockKV();
     for (const n of [node("c1", "auth"), node("f1", "src/auth.ts", "file")]) await kv.set(KV.graphNodes, n.id, n);

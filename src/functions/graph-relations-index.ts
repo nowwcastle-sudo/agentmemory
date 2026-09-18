@@ -24,6 +24,12 @@ export interface RelationRow {
   weight: number;
   backing: number;
   edgeId: string;
+  /**
+   * The sessions the edge was extracted from, when its refs record them --
+   * at most RELATION_SESSIONS_CAP. mem::context leaves out a relation the
+   * asking session produced itself, as it leaves out that session's summary.
+   */
+  sessions?: string[];
 }
 
 export interface ProjectRelationsIndex {
@@ -33,6 +39,8 @@ export interface ProjectRelationsIndex {
 }
 
 export const RELATIONS_INDEX_CAP = 200;
+/** Bounds one row: 200 relations x this many ids stays small. */
+export const RELATION_SESSIONS_CAP = 64;
 export const RELATIONS_BLOCK_LIMIT = 12;
 /** How many lines one source node may hold before the rest are deferred. */
 export const MAX_LINES_PER_SOURCE = 2;
@@ -120,7 +128,7 @@ export function relationClassRank(type: string): number {
 }
 
 export function toRelationRow(edge: GraphEdge, sourceName: string, targetName: string): RelationRow {
-  return {
+  const row: RelationRow = {
     source: sourceName,
     type: edge.type,
     target: targetName,
@@ -128,6 +136,8 @@ export function toRelationRow(edge: GraphEdge, sourceName: string, targetName: s
     backing: (edge.sourceObservationIds ?? []).length,
     edgeId: edge.id,
   };
+  const sessions = edgeSessionIds(edge).slice(0, RELATION_SESSIONS_CAP);
+  return sessions.length > 0 ? { ...row, sessions } : row;
 }
 
 export function upsertRelation(index: ProjectRelationsIndex, row: RelationRow): ProjectRelationsIndex {
