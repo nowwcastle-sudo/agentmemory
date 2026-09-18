@@ -199,6 +199,31 @@ describe("mem::context — insights auto-injection (ontology-lite follow-up)", (
     for (let i = 0; i < 4; i++) expect(result.context).toContain(`distinct-${i}`);
   });
 
+  // Reworded copies also get reworded titles: "Governance workflow bypass
+  // creates silent regressions" and "Governance bypass creates silent
+  // regression loops". Sampled 2026-09-18, 15 of 16 title pairs at word
+  // overlap 0.4-0.6 were the same insight restated. Display only -- merging
+  // them in the store would make the one miss in 16 permanent.
+  it("states a reworded title once too", async () => {
+    await seedProfile(kv, "/tmp/proj", ["anchor"]);
+    await seedInsight(kv, { id: "n1", title: "Governance workflow bypass creates silent regressions", content: "near-one", confidence: 0.95 });
+    await seedInsight(kv, { id: "n2", title: "Governance bypass creates silent regression loops", content: "near-two", confidence: 0.9 });
+    await seedInsight(kv, { id: "n3", title: "Cross-platform path handling fails silently", content: "other-topic", confidence: 0.8 });
+    const result = await handler({ sessionId: "ses_near", project: "/tmp/proj" });
+    expect(result.context).toContain("near-one");
+    expect(result.context).not.toContain("near-two");
+    expect(result.context).toContain("other-topic");
+  });
+
+  it("states a short title once even when it has fewer than three words", async () => {
+    await seedProfile(kv, "/tmp/proj", ["anchor"]);
+    await seedInsight(kv, { id: "s1", title: "Windows pitfalls", content: "short-one", confidence: 0.9 });
+    await seedInsight(kv, { id: "s2", title: "windows pitfalls!", content: "short-two", confidence: 0.8 });
+    const result = await handler({ sessionId: "ses_short", project: "/tmp/proj" });
+    expect(result.context).toContain("short-one");
+    expect(result.context).not.toContain("short-two");
+  });
+
   it("keeps an insight scoped to this project without any concept overlap", async () => {
     await seedInsight(kv, { id: "i_own", title: "own-project-insight", project: "/tmp/proj" });
     const result = await handler({ sessionId: "ses_own", project: "/tmp/proj" });

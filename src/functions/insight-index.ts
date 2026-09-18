@@ -53,6 +53,45 @@ export function insightTitleKey(insight: { title: string; project?: string }): s
   return JSON.stringify([insight.project ?? "", title]);
 }
 
+const TITLE_STOP_WORDS = new Set([
+  "a", "an", "the", "of", "to", "in", "for", "and", "or", "is", "are", "be",
+  "as", "by", "on", "at", "with", "must", "should", "can", "from", "into",
+  "than", "that", "this",
+]);
+
+function titleWords(title: string): Set<string> {
+  return new Set(
+    title
+      .toLowerCase()
+      .split(/[^\p{L}\p{N}]+/u)
+      .filter((w) => w && !TITLE_STOP_WORDS.has(w)),
+  );
+}
+
+/**
+ * Whether two titles read as one insight for display: word overlap
+ * (Jaccard, stop words aside) of at least 0.5 over three or more shared
+ * words, which includes the same title. Sampled on the
+ * live store 2026-09-18, 15 of 16 pairs between 0.4 and 0.6 were one
+ * insight reworded ("Governance workflow bypass creates silent regressions"
+ * / "Governance bypass creates silent regression loops"); the miss was
+ * "...explicit state management" / "...explicit secret rotation". For
+ * choosing what to show only -- reflect keeps the exact-title rule, since a
+ * merge in the store would make that miss permanent.
+ */
+export function sameInsightTitle(a: { title: string }, b: { title: string }): boolean {
+  const x = titleWords(a.title);
+  const y = titleWords(b.title);
+  const plain = (t: string) => t.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
+  if (plain(a.title) === plain(b.title)) return true;
+  if (x.size === 0 || y.size === 0) return false;
+  let shared = 0;
+  for (const w of x) if (y.has(w)) shared++;
+  // Three shared words at least: two three-word titles one word apart
+  // ("cap marker 0" / "cap marker 1") sit at exactly 0.5 and are different.
+  return shared >= 3 && shared / (x.size + y.size - shared) >= 0.5;
+}
+
 export function toIndexRow(insight: Insight): InsightIndexRow {
   const cluster = (insight.sourceConceptCluster ?? []).map((c) => c.toLowerCase());
   return {
