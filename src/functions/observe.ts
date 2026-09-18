@@ -50,6 +50,38 @@ export function extractImage(d: unknown): string | undefined {
   return undefined;
 }
 
+/**
+ * Hooks that, with no event id, derive their captureId from their content:
+ * prompt-submit (`turn_id ?? prompt`), notification and task-completed. For
+ * them the same content under the same id is the same capture by design, and
+ * the only thing a repeat changes is the moment it arrived. Every other hook
+ * keeps the full identity, timestamp included.
+ */
+const CONTENT_KEYED_HOOKS = new Set(["prompt_submit", "notification", "task_completed"]);
+
+/** A content-keyed capture repeated later: identical except for its timestamp. */
+function isContentKeyedRepeat(
+  existingRaw: RawObservation,
+  payload: HookPayload,
+  captureId: string,
+  sanitizedRaw: unknown,
+  existingSession: Session | null,
+  configuredAgentId: string | undefined,
+): boolean {
+  if (!CONTENT_KEYED_HOOKS.has(payload.hookType)) return false;
+  if (existingRaw.hookType !== payload.hookType) return false;
+  const asFirstArrived = hashCaptureFingerprintV1(
+    buildCaptureFingerprintInputV1({
+      payload: { ...payload, timestamp: existingRaw.timestamp },
+      captureId,
+      sanitizedRaw,
+      inheritedSession: existingSession,
+      configuredAgentId,
+    }),
+  );
+  return asFirstArrived === existingRaw.captureFingerprint;
+}
+
 export function registerObserveFunction(
   sdk: ISdk,
   kv: StateKV,
@@ -201,7 +233,10 @@ export function registerObserveFunction(
         ) {
           return { success: false, error: "legacy_identity_unverified" };
         }
-        if (existingRaw.captureFingerprint !== captureFingerprint) {
+        if (
+          existingRaw.captureFingerprint !== captureFingerprint &&
+          !isContentKeyedRepeat(existingRaw, payload, captureId, sanitizedRaw, existingSession, configuredAgentId)
+        ) {
           return { success: false, error: "capture_id_conflict" };
         }
       }

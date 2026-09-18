@@ -1246,6 +1246,62 @@ describe("api::observe capture identity", () => {
     }
   });
 
+  // #22 residual: a hook with no event id keys a prompt on its text, so the
+  // same prompt twice in one session is one capture by design -- but the
+  // second arrival carried a new timestamp, was rejected as a conflict, fell
+  // back to the outbox and was quarantined on replay. For the hooks whose
+  // locator is their content, a timestamp-only difference is that repeat.
+  describe("content-keyed hooks", () => {
+    function contentKeyed(hookType: string, data: Record<string, unknown>): HookPayload {
+      return { ...payload(`content-keyed-${hookType}`), hookType, data } as HookPayload;
+    }
+    const later = "2026-08-28T00:05:00.000Z";
+
+    it.each([
+      ["prompt_submit", { prompt: "# Overview Generate 0 to 3 hyperpersonalized suggestions" }],
+      ["notification", { notification_type: "idle", message: "Waiting for input" }],
+      ["task_completed", { task_subject: "Run the check" }],
+    ])("treats a %s repeated later with the same content as the same capture", async (hookType, data) => {
+      const { sdk, kv, dedupMap } = await captureIdentityHarness();
+      const input = contentKeyed(hookType, data);
+      try {
+        const first = (await sdk.trigger("api::observe", { body: apiObserveBody(input) })) as {
+          status_code: number; body: { observationId: string };
+        };
+        const repeat = await sdk.trigger("api::observe", {
+          body: apiObserveBody({ ...input, timestamp: later }),
+        });
+        const rows = await kv.list<RawObservation>(KV.rawObservations(input.sessionId));
+        expect(first.status_code).toBe(201);
+        expect(repeat).toMatchObject({
+          status_code: 201,
+          body: { deduplicated: true, observationId: first.body.observationId },
+        });
+        expect(rows).toHaveLength(1);
+        expect(rows[0].timestamp).toBe(input.timestamp);
+      } finally {
+        dedupMap.stop();
+      }
+    });
+
+    it("still rejects a content-keyed capture whose content differs", async () => {
+      const { sdk, dedupMap } = await captureIdentityHarness();
+      const input = contentKeyed("prompt_submit", { prompt: "first text" });
+      try {
+        await sdk.trigger("api::observe", { body: apiObserveBody(input) });
+        const conflict = await sdk.trigger("api::observe", {
+          body: apiObserveBody({ ...input, timestamp: later, data: { prompt: "other text" } }),
+        });
+        expect(conflict).toEqual({
+          status_code: 409,
+          body: { success: false, error: "capture_id_conflict" },
+        });
+      } finally {
+        dedupMap.stop();
+      }
+    });
+  });
+
   it.each(identityMutations)(
     "rejects a same-ID $field conflict before any side effect",
     async ({ field, mutate }) => {
