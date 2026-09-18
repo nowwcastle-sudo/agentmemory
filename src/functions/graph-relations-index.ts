@@ -2,7 +2,8 @@ import type { ISdk } from "../iii-compat.js";
 import type { StateKV } from "../state/kv.js";
 import { KV } from "../state/schema.js";
 import { withKeyedLock } from "../state/keyed-mutex.js";
-import type { GraphEdge, GraphNode, GraphSnapshot, ProjectProfile } from "../types.js";
+import type { GraphEdge, GraphNode, GraphSnapshot, ProjectProfile, Session } from "../types.js";
+import { isHarnessSideSession } from "./harness-sessions.js";
 import { belongsToCurrentGeneration, SNAPSHOT_KEY } from "./graph-generation.js";
 import { logger } from "../logger.js";
 
@@ -56,6 +57,28 @@ export function edgeProjects(edge: GraphEdge): string[] {
   if (edge.projectId) out.add(edge.projectId);
   for (const ref of edge.sourceRefs ?? []) if (ref.projectId) out.add(ref.projectId);
   return [...out];
+}
+
+/** The sessions an edge was extracted from, where its refs record them. */
+export function edgeSessionIds(edge: GraphEdge): string[] {
+  const out = new Set<string>();
+  for (const ref of edge.sourceRefs ?? []) if (ref.sessionId) out.add(ref.sessionId);
+  return [...out];
+}
+
+/**
+ * True when every session an edge names is one of Codex's own side sessions.
+ * Those left the session window in 5840d47, yet the relations extracted from
+ * them still led the Relations block (`Hyperpersonalized suggestions
+ * --optimizes_for--> Relief`). An edge any real session backs stays, and so
+ * does one whose refs name no session: there is nothing to judge it by.
+ */
+export function isSideSessionOnly(
+  edge: GraphEdge,
+  firstPromptOf: (sessionId: string) => string | undefined,
+): boolean {
+  const ids = edgeSessionIds(edge);
+  return ids.length > 0 && ids.every((id) => isHarnessSideSession(firstPromptOf(id)));
 }
 
 export const relationScore = (r: RelationRow): number =>
@@ -138,6 +161,12 @@ export async function upsertRelationsForEdge(
   targetName: string,
 ): Promise<void> {
   if (!isIndexableEdge(edge)) return;
+  const prompts = new Map<string, string | undefined>();
+  for (const id of edgeSessionIds(edge)) {
+    const session = await kv.get<Session>(KV.sessions, id).catch(() => null);
+    prompts.set(id, session?.firstPrompt);
+  }
+  if (isSideSessionOnly(edge, (id) => prompts.get(id))) return;
   const row = toRelationRow(edge, sourceName, targetName);
   for (const project of edgeProjects(edge)) {
     const existing = await kv.get<ProjectRelationsIndex>(KV.graphRelationsIndex, project).catch(() => null);
@@ -164,11 +193,14 @@ export async function readProjectRelations(kv: StateKV, project: string): Promis
  */
 export async function rebuildRelationsIndex(
   kv: StateKV,
-): Promise<{ projects: number; relations: number }> {
+): Promise<{ projects: number; relations: number; sideSessionOnly: number }> {
   return withKeyedLock("graph-relations-index-rebuild", async () => {
     const snapshot = await kv.get<GraphSnapshot>(KV.graphSnapshot, SNAPSHOT_KEY).catch(() => null);
     const nodes = await kv.list<GraphNode>(KV.graphNodes);
     const edges = await kv.list<GraphEdge>(KV.graphEdges);
+    const sessions = await kv.list<Session>(KV.sessions).catch(() => [] as Session[]);
+    const firstPrompt = new Map(sessions.filter(Boolean).map((s) => [s.id, s.firstPrompt]));
+    let sideSessionOnly = 0;
     const nameById = new Map<string, string>();
     for (const n of nodes) {
       if (n && !n.stale && belongsToCurrentGeneration(n, snapshot)) nameById.set(n.id, n.name);
@@ -182,6 +214,10 @@ export async function rebuildRelationsIndex(
       if (!source || !target) continue;
       const projects = edgeProjects(e);
       if (projects.length === 0) continue;
+      if (isSideSessionOnly(e, (id) => firstPrompt.get(id))) {
+        sideSessionOnly += 1;
+        continue;
+      }
       const row = toRelationRow(e, source, target);
       for (const project of projects) {
         const index = byProject.get(project) ?? { project, updatedAt: "", relations: [] };
@@ -198,8 +234,8 @@ export async function rebuildRelationsIndex(
     for (const index of byProject.values()) {
       await kv.set(KV.graphRelationsIndex, index.project, index);
     }
-    logger.info("Graph relations index rebuilt", { projects: byProject.size, relations });
-    return { projects: byProject.size, relations };
+    logger.info("Graph relations index rebuilt", { projects: byProject.size, relations, sideSessionOnly });
+    return { projects: byProject.size, relations, sideSessionOnly };
   });
 }
 

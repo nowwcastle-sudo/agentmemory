@@ -21,6 +21,7 @@ import {
   renderPinnedContext,
 } from "./slots.js";
 import { getAgentId, isAgentScopeIsolated } from "../config.js";
+import { isHarnessSideSession } from "./harness-sessions.js";
 
 function estimateTokens(text: string): number {
   return Math.ceil(text.length / 3);
@@ -94,22 +95,6 @@ export function fillBudget(
 }
 
 const SCHEDULED_TASK_OPENING = /^<scheduled-task\s+name="([^"]+)"/;
-
-/**
- * Openings of the side sessions Codex runs for itself: ambient suggestions, the
- * safety filter over them, and the memory-consolidation agent. They are not
- * the owner's work, and a suggestion run's summary reads like a decision that
- * was taken, so they stay out of the session window.
- */
-const HARNESS_SIDE_SESSION_OPENINGS = [
-  /^# Overview\s+Generate 0 to 3 hyperpersonalized suggestions/,
-  /^You are an expert at upholding safety and compliance standards for Codex/,
-  /^## Memory Writing Agent: Phase 2 \(Consolidation\)/,
-];
-
-export function isHarnessSideSession(firstPrompt: string | undefined): boolean {
-  return !!firstPrompt && HARNESS_SIDE_SESSION_OPENINGS.some((re) => re.test(firstPrompt));
-}
 
 /** The scheduler's task name when the prompt starts with its tag, else null. */
 export function scheduledTaskName(firstPrompt: string | undefined): string | null {

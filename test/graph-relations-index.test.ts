@@ -3,6 +3,7 @@ import {
   isIndexableEdge,
   upsertRelation,
   rebuildRelationsIndex,
+  upsertRelationsForEdge,
   readProjectRelations,
   renderRelationsBlock,
   buildFocus,
@@ -127,7 +128,7 @@ describe("rebuildRelationsIndex", () => {
     await kv.set(KV.graphRelationsIndex, "gone", { project: "gone", updatedAt: "", relations: [] });
 
     const result = await rebuildRelationsIndex(kv as never);
-    expect(result).toEqual({ projects: 2, relations: 2 });
+    expect(result).toEqual({ projects: 2, relations: 2, sideSessionOnly: 0 });
 
     const p1 = await readProjectRelations(kv as never, "p1");
     expect(p1).toEqual([{ source: "retry policy", type: "implements", target: "src/retry.ts", weight: 0.8, backing: 3, edgeId: "e1" }]);
@@ -135,6 +136,46 @@ describe("rebuildRelationsIndex", () => {
     expect(p2.map((r) => r.edgeId)).toEqual(["e3"]);
     expect(await kv.get(KV.graphRelationsIndex, "gone")).toBeNull();
     expect(await readProjectRelations(kv as never, "nowhere")).toEqual([]);
+  });
+
+  // Codex's own side sessions (ambient suggestions, their safety filter, a
+  // memory-consolidation agent) left the session window in 5840d47, but the
+  // relations extracted from them still led the Relations block:
+  // `Hyperpersonalized suggestions --optimizes_for--> Relief`.
+  describe("relations extracted only from codex side sessions", () => {
+    const SIDE = "# Overview\nGenerate 0 to 3 hyperpersonalized suggestions for what this user";
+    async function seedGraph(kv: ReturnType<typeof mockKV>) {
+      await kv.set(KV.sessions, "s_side", { id: "s_side", project: "p1", firstPrompt: SIDE });
+      await kv.set(KV.sessions, "s_real", { id: "s_real", project: "p1", firstPrompt: "Fix the retry policy" });
+      for (const n of [node("a", "suggestions"), node("b", "relief"), node("c", "retry policy"), node("d", "backoff")]) {
+        await kv.set(KV.graphNodes, n.id, n);
+      }
+      const ref = (sessionId: string) => ({ sourceKind: "observation" as const, sourceId: `o_${sessionId}`, sessionId, projectId: "p1" });
+      return {
+        sideOnly: edge("e_side", "optimizes_for", "a", "b", { sourceRefs: [ref("s_side")] }),
+        mixed: edge("e_mixed", "prefers", "c", "b", { sourceRefs: [ref("s_side"), ref("s_real")] }),
+        real: edge("e_real", "causes", "c", "d", { sourceRefs: [ref("s_real")] }),
+        unknown: edge("e_unknown", "uses", "d", "a"),
+      };
+    }
+
+    it("leaves them out of a rebuild and keeps edges any real session backs", async () => {
+      const kv = mockKV();
+      const e = await seedGraph(kv);
+      for (const x of Object.values(e)) await kv.set(KV.graphEdges, x.id, x);
+      const result = await rebuildRelationsIndex(kv as never);
+      const ids = (await readProjectRelations(kv as never, "p1")).map((r) => r.edgeId).sort();
+      expect(ids).toEqual(["e_mixed", "e_real", "e_unknown"]);
+      expect(result.sideSessionOnly).toBe(1);
+    });
+
+    it("leaves them out when the persist seam writes them", async () => {
+      const kv = mockKV();
+      const e = await seedGraph(kv);
+      await upsertRelationsForEdge(kv as never, e.sideOnly, "suggestions", "relief");
+      await upsertRelationsForEdge(kv as never, e.real, "retry policy", "backoff");
+      expect((await readProjectRelations(kv as never, "p1")).map((r) => r.edgeId)).toEqual(["e_real"]);
+    });
   });
 
   it("attributes an edge to every project its source refs name", async () => {
