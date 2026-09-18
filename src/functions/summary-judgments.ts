@@ -164,6 +164,8 @@ export type SummaryJudgmentResult = {
   edgesAdded?: number;
   nodesAdded?: number;
   dropped?: Record<string, number>;
+  /** How much the model returned, so a zero can be told from a refusal. */
+  responseChars?: number;
   skipped?: string;
   error?: string;
 };
@@ -194,10 +196,11 @@ export function registerSummaryJudgmentFunction(
       return { success: false, error: error instanceof Error ? error.message : String(error) };
     }
     const { nodes, edges, dropped } = buildSummaryJudgmentDelta(summary, session, xml);
-    if (edges.length === 0) return { success: true, edgesAdded: 0, dropped };
+    const responseChars = xml.length;
+    if (edges.length === 0) return { success: true, edgesAdded: 0, dropped, responseChars };
     const { newNodeCount, newEdgeCount } = await persistGraphDelta(kv, nodes, edges, [sessionId]);
     logger.info("Summary judgments extracted", { sessionId, edges: edges.length, newEdges: newEdgeCount, dropped });
-    return { success: true, edgesAdded: newEdgeCount, nodesAdded: newNodeCount, dropped };
+    return { success: true, edgesAdded: newEdgeCount, nodesAdded: newNodeCount, dropped, responseChars };
   };
 
   // One summary per call, admitted by the coordinator like any graph stage,
