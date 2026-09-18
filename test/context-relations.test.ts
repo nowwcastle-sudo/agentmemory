@@ -187,6 +187,34 @@ describe("mem::context relations block", () => {
       expect(result.context).not.toContain("Real work 8");
     });
 
+    // Codex runs side sessions of its own -- ambient suggestions, a safety
+    // filter over them, a memory-consolidation agent. 97 of them on
+    // 2026-09-18, and a suggestion run's summary reads like a decision that
+    // was made ("Prioritize lossless recovery of worker 3111"). They are not
+    // the owner's work, so they take no window slot.
+    it("leaves codex's own side sessions out of the window", async () => {
+      const kv = mockKV();
+      await kv.set(KV.profiles, "p1", profile);
+      await seed(kv, "x1", "2026-09-17T12:00:00.000Z",
+        "# Overview\nGenerate 0 to 3 hyperpersonalized suggestions for what this user", "Suggestion run");
+      await seed(kv, "x2", "2026-09-17T11:00:00.000Z",
+        "You are an expert at upholding safety and compliance standards for Codex", "Safety filter run");
+      await seed(kv, "x3", "2026-09-17T10:00:00.000Z",
+        "## Memory Writing Agent: Phase 2 (Consolidation)\nYou are a Memory Writing Agent", "Consolidation run");
+      await seed(kv, "w1", "2026-09-16T10:00:00.000Z",
+        "[Base] You are operating inside the Buzz platform", "Buzz agent work");
+      for (let d = 0; d < 9; d++) {
+        await seed(kv, `r_${d}`, `2026-09-${String(15 - d).padStart(2, "0")}T09:00:00.000Z`, `Real item ${d}`, `Real item work ${d}`);
+      }
+      const result = await wireContext(kv)({ sessionId: "s_now", project: "p1" });
+      for (const t of ["Suggestion run", "Safety filter run", "Consolidation run"]) {
+        expect(result.context).not.toContain(t);
+      }
+      expect(result.context).toContain("Buzz agent work");
+      // Buzz + 9 real sessions fill all ten slots.
+      expect(result.context).toContain("Real item work 8");
+    });
+
     it("never merges sessions that only share an opening, like the compaction boilerplate", async () => {
       const kv = mockKV();
       await kv.set(KV.profiles, "p1", profile);

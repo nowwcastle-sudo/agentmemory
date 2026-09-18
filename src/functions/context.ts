@@ -51,6 +51,22 @@ async function listInsightRows(kv: StateKV): Promise<InsightIndexRow[]> {
 
 const SCHEDULED_TASK_OPENING = /^<scheduled-task\s+name="([^"]+)"/;
 
+/**
+ * Openings of the side sessions Codex runs for itself: ambient suggestions, the
+ * safety filter over them, and the memory-consolidation agent. They are not
+ * the owner's work, and a suggestion run's summary reads like a decision that
+ * was taken, so they stay out of the session window.
+ */
+const HARNESS_SIDE_SESSION_OPENINGS = [
+  /^# Overview\s+Generate 0 to 3 hyperpersonalized suggestions/,
+  /^You are an expert at upholding safety and compliance standards for Codex/,
+  /^## Memory Writing Agent: Phase 2 \(Consolidation\)/,
+];
+
+export function isHarnessSideSession(firstPrompt: string | undefined): boolean {
+  return !!firstPrompt && HARNESS_SIDE_SESSION_OPENINGS.some((re) => re.test(firstPrompt));
+}
+
 /** The scheduler's task name when the prompt starts with its tag, else null. */
 export function scheduledTaskName(firstPrompt: string | undefined): string | null {
   return firstPrompt?.match(SCHEDULED_TASK_OPENING)?.[1] ?? null;
@@ -286,6 +302,7 @@ export function registerContextFunction(
         // task. The key is the name the scheduler writes at the very start of
         // the prompt -- a looser key (any shared opening) collapsed unrelated
         // work that began with the harness's compaction boilerplate.
+        .filter((s) => !isHarnessSideSession(s.firstPrompt))
         .filter((s) => {
           const task = scheduledTaskName(s.firstPrompt);
           if (task === null) return true;
