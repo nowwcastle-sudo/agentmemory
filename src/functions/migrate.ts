@@ -164,6 +164,44 @@ function isAllowedPath(dbPath: string): boolean {
   return ALLOWED_DIRS.some((dir) => resolved.startsWith(dir + "/"));
 }
 
+export function sessionLoader(
+  kv: StateKV,
+): (sid: string) => Promise<Session | null> {
+  const cache = new Map<string, Session | null>();
+  return async (sid) => {
+    if (cache.has(sid)) return cache.get(sid)!;
+    const s = await kv.get<Session>(KV.sessions, sid).catch(() => null);
+    cache.set(sid, s);
+    return s;
+  };
+}
+
+// The project an unscoped memory would get from the majority project of its
+// sessions, or null when there is no clear answer. Shared with diagnostics so
+// the check that prescribes this migration can tell whether it would help.
+export async function inferProjectFor(
+  memory: Memory,
+  loadSession: (sid: string) => Promise<Session | null>,
+): Promise<string | null> {
+  const projects: string[] = [];
+  for (const sid of memory.sessionIds ?? []) {
+    const session = await loadSession(sid);
+    if (session?.project) projects.push(session.project);
+  }
+  if (projects.length === 0) return null;
+
+  // Majority-vote: count frequency of each project value.
+  const freq = new Map<string, number>();
+  for (const p of projects) freq.set(p, (freq.get(p) ?? 0) + 1);
+  const sorted = [...freq.entries()].sort((a, b) => b[1] - a[1]);
+  const [topProject, topCount] = sorted[0];
+
+  // Require a strict majority (> 50%) to avoid misattributing a memory
+  // that was genuinely built from sessions across multiple projects.
+  if (topCount <= projects.length / 2 && sorted.length > 1) return null;
+  return topProject;
+}
+
 // Infer memory project from the majority project of its associated sessions.
 // Returns { updated, skipped } — safe to run repeatedly (idempotent).
 export async function inferMemoryProjects(
@@ -171,14 +209,7 @@ export async function inferMemoryProjects(
   dryRun = false,
 ): Promise<{ updated: number; skipped: number; ambiguous: number }> {
   const memories = await kv.list<Memory>(KV.memories);
-  const sessionCache = new Map<string, Session | null>();
-
-  const loadSession = async (sid: string): Promise<Session | null> => {
-    if (sessionCache.has(sid)) return sessionCache.get(sid)!;
-    const s = await kv.get<Session>(KV.sessions, sid).catch(() => null);
-    sessionCache.set(sid, s);
-    return s;
-  };
+  const loadSession = sessionLoader(kv);
 
   let updated = 0;
   let skipped = 0;
@@ -190,32 +221,8 @@ export async function inferMemoryProjects(
       continue;
     }
 
-    const sessionIds = memory.sessionIds ?? [];
-    if (sessionIds.length === 0) {
-      ambiguous++;
-      continue;
-    }
-
-    const projects: string[] = [];
-    for (const sid of sessionIds) {
-      const session = await loadSession(sid);
-      if (session?.project) projects.push(session.project);
-    }
-
-    if (projects.length === 0) {
-      ambiguous++;
-      continue;
-    }
-
-    // Majority-vote: count frequency of each project value.
-    const freq = new Map<string, number>();
-    for (const p of projects) freq.set(p, (freq.get(p) ?? 0) + 1);
-    const sorted = [...freq.entries()].sort((a, b) => b[1] - a[1]);
-    const [topProject, topCount] = sorted[0];
-
-    // Require a strict majority (> 50%) to avoid misattributing a memory
-    // that was genuinely built from sessions across multiple projects.
-    if (topCount <= projects.length / 2 && sorted.length > 1) {
+    const topProject = await inferProjectFor(memory, loadSession);
+    if (topProject === null) {
       ambiguous++;
       continue;
     }

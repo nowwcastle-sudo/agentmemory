@@ -27,6 +27,7 @@ import {
   reconcilePipelineWork,
 } from "../health/pipeline.js";
 import type { ProjectionCoordinator } from "./projection-coordinator.js";
+import { inferProjectFor, sessionLoader } from "./migrate.js";
 
 const ALL_CATEGORIES = [
   "actions",
@@ -378,7 +379,20 @@ export function registerDiagnosticsFunction(
         // infer-memory-projects migration runs. Surface a count so operators
         // know the backfill is still pending and can trigger it explicitly.
         const latestMemories = memories.filter((m) => m.isLatest);
-        const unscopedCount = latestMemories.filter((m) => !m.project).length;
+        const unscoped = latestMemories.filter((m) => !m.project);
+        const unscopedCount = unscoped.length;
+        // Only the migration's own rule can say whether it would help: a
+        // memory saved with no sessionIds has nothing to vote from.
+        const loadSession = sessionLoader(kv);
+        let inferableCount = 0;
+        for (const memory of unscoped) {
+          if ((await inferProjectFor(memory, loadSession)) !== null) inferableCount++;
+        }
+        const coverageMessage =
+          `${unscopedCount} of ${latestMemories.length} latest memories have no project scope; ` +
+          (inferableCount > 0
+            ? `${inferableCount} can be inferred from their sessions — run POST /agentmemory/migrate {"step":"infer-memory-projects"} to backfill`
+            : `none can be inferred from their sessions (no sessions, or no majority project), so the project has to be set explicitly`);
         if (unscopedCount === 0) {
           checks.push({
             name: "memory-project-coverage",
@@ -392,16 +406,16 @@ export function registerDiagnosticsFunction(
             name: "memory-project-coverage",
             category: "memories",
             status: "warn",
-            message: `${unscopedCount} of ${latestMemories.length} latest memories have no project scope — run POST /agentmemory/migrate {"step":"infer-memory-projects"} to backfill`,
-            fixable: true,
+            message: coverageMessage,
+            fixable: inferableCount > 0,
           });
         } else {
           checks.push({
             name: "memory-project-coverage",
             category: "memories",
             status: "fail",
-            message: `${unscopedCount} of ${latestMemories.length} latest memories have no project scope — run POST /agentmemory/migrate {"step":"infer-memory-projects"} to backfill`,
-            fixable: true,
+            message: coverageMessage,
+            fixable: inferableCount > 0,
           });
         }
 

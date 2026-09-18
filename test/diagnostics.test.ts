@@ -440,6 +440,62 @@ describe("Diagnostics Functions", () => {
       expect(check!.fixable).toBe(false);
     });
 
+    // The coverage check prescribes the infer-memory-projects migration. It may
+    // only call the finding fixable when that migration would actually scope
+    // something: live, 43 unscoped memories were reported fixable and the
+    // migration updated 0, because every one was saved with no sessionIds.
+    describe("memory-project-coverage agrees with the migration it prescribes", () => {
+      async function coverage() {
+        const result = (await sdk.trigger("mem::diagnose", {
+          categories: ["memories"],
+        })) as { checks: DiagnosticCheck[] };
+        return result.checks.find((c) => c.name === "memory-project-coverage")!;
+      }
+
+      async function migrationUpdates(): Promise<number> {
+        const { inferMemoryProjects } = await import("../src/functions/migrate.js");
+        return (await inferMemoryProjects(kv as never, true)).updated;
+      }
+
+      it("is not fixable when unscoped memories have no sessions to infer from", async () => {
+        const memory = makeMemory({ sessionIds: [] });
+        await kv.set(KV.memories, memory.id, memory);
+
+        const check = await coverage();
+        expect(check.status).toBe("warn");
+        expect(check.fixable).toBe(false);
+        expect(check.message).not.toContain("infer-memory-projects");
+        expect(await migrationUpdates()).toBe(0);
+      });
+
+      it("is not fixable when the sessions split evenly between projects", async () => {
+        const a = makeSession({ project: "alpha" });
+        const b = makeSession({ project: "beta" });
+        await kv.set(KV.sessions, a.id, a);
+        await kv.set(KV.sessions, b.id, b);
+        const memory = makeMemory({ sessionIds: [a.id, b.id] });
+        await kv.set(KV.memories, memory.id, memory);
+
+        expect((await coverage()).fixable).toBe(false);
+        expect(await migrationUpdates()).toBe(0);
+      });
+
+      it("is fixable, and names how many, when some can be inferred", async () => {
+        const session = makeSession({ project: "alpha" });
+        await kv.set(KV.sessions, session.id, session);
+        const inferable = makeMemory({ sessionIds: [session.id] });
+        const orphan = makeMemory({ sessionIds: [] });
+        await kv.set(KV.memories, inferable.id, inferable);
+        await kv.set(KV.memories, orphan.id, orphan);
+
+        const check = await coverage();
+        expect(check.fixable).toBe(true);
+        expect(check.message).toContain("infer-memory-projects");
+        expect(check.message).toMatch(/\b1 can be inferred\b/);
+        expect(await migrationUpdates()).toBe(1);
+      });
+    });
+
     it("stale mesh peer produces warn", async () => {
       const peer = makePeer({
         lastSyncAt: new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString(),
