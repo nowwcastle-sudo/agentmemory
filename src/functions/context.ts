@@ -112,6 +112,12 @@ export function registerContextFunction(
       project: string;
       budget?: number;
       agentId?: string;
+      /**
+       * Evaluation knob: render as if the project had no Relations block, so
+       * its budget goes to the other blocks. Cutting the block's text out of
+       * a rendered context would measure what it says but not what it costs.
+       */
+      omitRelations?: boolean;
     }) => {
       const budget = data.budget || tokenBudget;
       const blocks: FillBlock[] = [];
@@ -344,7 +350,7 @@ export function registerContextFunction(
         undefined,
         buildFocus(currentSession?.firstPrompt, currentObservations),
       );
-      if (relationsContent) {
+      if (relationsContent && data.omitRelations !== true) {
         const updated = Date.parse(relationsIndex?.updatedAt ?? "");
         blocks.push({
           type: "memory",

@@ -486,11 +486,13 @@ export function registerApiTriggers(
         project: string;
         budget?: number;
         agentId?: string;
+        omitRelations?: boolean;
       } = {
         sessionId,
         project,
       };
       if (budget !== undefined) payload.budget = budget;
+      if (body.omitRelations === true) payload.omitRelations = true;
       const agentId = bodyAgentId ?? queryAgentId;
       if (agentId !== undefined) payload.agentId = agentId;
       const result = await sdk.trigger({ function_id: "mem::context", payload });

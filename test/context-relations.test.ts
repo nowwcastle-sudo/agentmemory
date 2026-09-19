@@ -35,6 +35,36 @@ const profile: ProjectProfile = {
 };
 
 describe("mem::context relations block", () => {
+  // An evaluation knob. Cutting the block's text out of a rendered context
+  // measures what the relations say but not what they cost: without the
+  // block, its budget goes to other blocks. omitRelations renders the
+  // context as it would be if the block did not exist.
+  it("renders without the block when asked, and lets other blocks use its budget", async () => {
+    const kv = mockKV();
+    await kv.set(KV.profiles, "p1", profile);
+    await kv.set(KV.graphRelationsIndex, "p1", {
+      project: "p1",
+      updatedAt: new Date().toISOString(),
+      relations: Array.from({ length: 12 }, (_, i) => ({
+        source: `relation source ${i}`, type: "causes", target: `relation target ${i}`, weight: 0.9, backing: 3, edgeId: `e${i}`,
+      })),
+    });
+    await kv.set(KV.sessions, "s_old", {
+      id: "s_old", project: "p1", cwd: "/repo", startedAt: "2026-09-10T00:00:00.000Z", status: "completed", observationCount: 3,
+    });
+    await kv.set(KV.summaries, "s_old", {
+      sessionId: "s_old", project: "p1", createdAt: "2026-09-10T00:00:00.000Z", title: "Old session",
+      narrative: "old-narrative ".repeat(40), keyDecisions: ["a decision"], filesModified: [], concepts: [], observationCount: 3,
+    });
+    const context = wireContext(kv, 400);
+    const withBlock = await context({ sessionId: "s_now", project: "p1" });
+    const without = await context({ sessionId: "s_now", project: "p1", omitRelations: true } as never);
+    expect(withBlock.context).toContain("## Relations");
+    expect(withBlock.context).not.toContain("old-narrative");
+    expect(without.context).not.toContain("## Relations");
+    expect(without.context).toContain("old-narrative");
+  });
+
   // The session window already leaves out the session asking; relations it
   // produced itself are the same kind of echo. Measured 2026-09-18: the
   // relations-effect spike's strongest case cited "Observation #4 --uses-->
