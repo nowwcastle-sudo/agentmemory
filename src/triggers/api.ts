@@ -1934,6 +1934,28 @@ export function registerApiTriggers(
     config: { api_path: "/agentmemory/graph/relations-index/rebuild", http_method: "POST" },
   });
 
+  // Read-only view of the relations index -- one project's row, or every
+  // row when no project is named. The context path renders twelve lines of a
+  // row; this is for diagnosing relation quality across whole rows.
+  sdk.registerFunction("api::graph-relations-index-read",
+    async (req: ApiRequest): Promise<Response> => {
+      const authErr = checkAuth(req, secret);
+      if (authErr) return authErr;
+      const project = req.query_params?.["project"];
+      if (typeof project === "string" && project.trim()) {
+        const row = await kv.get<unknown>(KV.graphRelationsIndex, project.trim()).catch(() => null);
+        return { status_code: 200, body: { rows: row ? [row] : [] } };
+      }
+      const rows = await kv.list<unknown>(KV.graphRelationsIndex).catch(() => [] as unknown[]);
+      return { status_code: 200, body: { rows } };
+    },
+  );
+  sdk.registerTrigger({
+    type: "http",
+    function_id: "api::graph-relations-index-read",
+    config: { api_path: "/agentmemory/graph/relations-index", http_method: "GET" },
+  });
+
   // Judgment relations from one session's summary decisions. New summaries
   // get this from the session projection; this is the backfill for the ones
   // written before, or by POST /summarize, which never ran the graph step.
