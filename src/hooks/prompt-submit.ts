@@ -69,13 +69,15 @@ async function main() {
   const project = resolveProjectPayload(cwd).project;
   if (typeof project !== "string" || !project) return;
   try {
+    // By id, not by listing: asking for 200 rows and searching them missed
+    // this very session on the live store, and missed it silently.
     const sessionRes = await fetch(
-      `${REST_URL}/agentmemory/sessions?limit=200&agentId=*`,
+      `${REST_URL}/agentmemory/sessions?sessionId=${encodeURIComponent(sessionId)}`,
       { headers: authHeaders(), signal: AbortSignal.timeout(INJECT_TIMEOUT_MS) },
     );
     if (!sessionRes.ok) return;
     const sessions = ((await sessionRes.json()) as { sessions?: Array<{ id: string; observationCount?: number }> }).sessions ?? [];
-    const row = sessions.find((s) => s.id === sessionId) ?? null;
+    const row = sessions[0] ?? null;
     if (!shouldInjectOnPrompt(row, prompt)) return;
     const res = await fetch(`${REST_URL}/agentmemory/context`, {
       method: "POST",

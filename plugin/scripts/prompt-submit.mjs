@@ -517,12 +517,12 @@ async function main() {
 	const project = resolveProjectPayload(cwd).project;
 	if (typeof project !== "string" || !project) return;
 	try {
-		const sessionRes = await fetch(`${REST_URL}/agentmemory/sessions?limit=200&agentId=*`, {
+		const sessionRes = await fetch(`${REST_URL}/agentmemory/sessions?sessionId=${encodeURIComponent(sessionId)}`, {
 			headers: authHeaders(),
 			signal: AbortSignal.timeout(INJECT_TIMEOUT_MS)
 		});
 		if (!sessionRes.ok) return;
-		if (!shouldInjectOnPrompt(((await sessionRes.json()).sessions ?? []).find((s) => s.id === sessionId) ?? null, prompt)) return;
+		if (!shouldInjectOnPrompt(((await sessionRes.json()).sessions ?? [])[0] ?? null, prompt)) return;
 		const res = await fetch(`${REST_URL}/agentmemory/context`, {
 			method: "POST",
 			headers: {

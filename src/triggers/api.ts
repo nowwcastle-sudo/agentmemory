@@ -1077,6 +1077,24 @@ export function registerApiTriggers(
     async (req: ApiRequest): Promise<Response> => {
       const authErr = checkAuth(req, secret);
       if (authErr) return authErr;
+      // One session by id: a caller that knows which session it is about --
+      // the prompt hook asking how many observations this session has -- was
+      // fetching 200 rows and searching them, and silently found nothing when
+      // the session sat outside that window.
+      const wantedId = asNonEmptyString(req.query_params?.["sessionId"]);
+      if (wantedId) {
+        const row = await kv.get<Session>(KV.sessions, wantedId).catch(() => null);
+        if (!row || !isValidSessionRow(row)) {
+          return { status_code: 200, body: { sessions: [] } };
+        }
+        const summary = await kv
+          .get<SessionSummary>(KV.summaries, wantedId)
+          .catch(() => null);
+        return {
+          status_code: 200,
+          body: { sessions: [summary ? { ...row, summary } : row] },
+        };
+      }
       const normalizedAgentId =
         typeof req.query_params?.["agentId"] === "string"
           ? req.query_params["agentId"].trim()
