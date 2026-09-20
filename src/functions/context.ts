@@ -22,6 +22,7 @@ import {
 } from "./slots.js";
 import { getAgentId, isAgentScopeIsolated } from "../config.js";
 import { isHarnessSideSession } from "./harness-sessions.js";
+import { searchSummaries } from "./search.js";
 
 function estimateTokens(text: string): number {
   return Math.ceil(text.length / 3);
@@ -572,6 +573,25 @@ export function registerContextFunction(
         for (const term of buildFocus(data.focusText, [])) focusTerms.add(term);
       }
 
+      // What the indexes say, in meaning rather than in shared words: the
+      // 19 recall items that word overlap could not reach all shared words
+      // with their target -- and so did the sessions that outranked them.
+      // Empty when there is no embedding provider, no vectors yet, or no
+      // focus, and then nothing below changes.
+      const focusText = [
+        data.focusText,
+        currentSession?.firstPrompt,
+        currentObservations.slice(0, 5).map((o) => o.title).join(" "),
+      ]
+        .filter((part): part is string => typeof part === "string" && part.trim().length > 0)
+        .join(" ");
+      const semantic = new Map<string, number>();
+      if (focusText) {
+        for (const hit of await searchSummaries(focusText, data.project, 20).catch(() => [])) {
+          semantic.set(hit.sessionId, hit.score);
+        }
+      }
+
       // Pool: from the rows alone, no reads. The weights come from the same
       // rows, so a word this project says in every session counts for little.
       // Term weighting is built and measured (buildTermWeights) but not used
@@ -581,11 +601,12 @@ export function registerContextFunction(
       const pool = candidates
         .map((c) => ({
           ...c,
-          poolScore: scoreSessionCandidate(
-            focusTerms,
-            c.session.firstPrompt,
-            c.recencyIndex,
-          ),
+          poolScore:
+            scoreSessionCandidate(focusTerms, c.session.firstPrompt, c.recencyIndex) +
+            // A vector hit is worth about as much as a full word match: the
+            // index found this summary by meaning, which is the evidence the
+            // rows do not carry.
+            2 * (semantic.get(c.session.id) ?? 0),
         }))
         .sort((a, b) => b.poolScore - a.poolScore)
         .slice(0, SUMMARY_CANDIDATES);

@@ -21,6 +21,7 @@ import { scoreSummary } from "../eval/quality.js";
 import type { MetricsStore } from "../eval/metrics-store.js";
 import { safeAudit } from "./audit.js";
 import { logger } from "../logger.js";
+import { indexSummaries } from "./search.js";
 import { withKeyedLock } from "../state/keyed-mutex.js";
 import { summarySourceFingerprint } from "../state/source-fingerprint.js";
 import { ProjectionCoordinator } from "./projection-coordinator.js";
@@ -435,6 +436,16 @@ export function registerSummarizeFunction(
           .map((observation) => observation.id)
           .sort();
         await kv.set(KV.summaries, sessionId, summary);
+        // Index it now, not at the next rebuild: the context function ranks
+        // past sessions by what their summaries say, and a summary that is
+        // not in the index cannot be found by anything but recency.
+        await indexSummaries([summary]).catch((err) => {
+          logger.warn("summary indexing failed", {
+            sessionId,
+            error: err instanceof Error ? err.message : String(err),
+          });
+          return 0;
+        });
         await safeAudit(kv, "compress", "mem::summarize", [sessionId], {
           title: summary.title,
           observationCount: compressed.length,

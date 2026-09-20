@@ -1,5 +1,5 @@
 import type { ISdk } from 'iii-sdk'
-import type { CompactSearchResult, CompressedObservation, Memory, RetrievalMetadata, RetrievalScope, SearchResult, Session } from '../types.js'
+import type { CompactSearchResult, CompressedObservation, Memory, RetrievalMetadata, RetrievalScope, SearchResult, Session, SessionSummary } from '../types.js'
 import { KV } from '../state/schema.js'
 import { StateKV } from '../state/kv.js'
 import { SearchIndex } from '../state/search-index.js'
@@ -329,6 +329,102 @@ export async function indexRecords(
   return count
 }
 
+/**
+ * A session summary as an indexable document.
+ *
+ * Summaries were in neither retrieval index -- only observations and
+ * memories were -- so the only way to find the right past session was the
+ * word overlap the context function computes by hand, which took recall from
+ * 3 of 30 items to 11 and stopped there (cycle U 44). The id is prefixed so a
+ * summary can never collide with an observation of the same session.
+ */
+export function summaryToObservation(summary: SessionSummary): CompressedObservation {
+  return {
+    id: `summary:${summary.sessionId}`,
+    sessionId: summary.sessionId,
+    timestamp: summary.createdAt,
+    type: "session_summary" as CompressedObservation["type"],
+    title: summary.title,
+    facts: summary.keyDecisions ?? [],
+    narrative: [summary.narrative, (summary.keyDecisions ?? []).join(" ")]
+      .filter(Boolean)
+      .join(" "),
+    concepts: summary.concepts ?? [],
+    files: summary.filesModified ?? [],
+    importance: 0.8,
+    ...(summary.project ? { projectId: summary.project } : {}),
+  };
+}
+
+/** Add session summaries to both indexes. Returns how many were indexed. */
+export async function indexSummaries(
+  summaries: SessionSummary[],
+  persist = true,
+): Promise<number> {
+  const idx = getSearchIndex();
+  const jobs: Array<{
+    id: string;
+    sessionId: string;
+    text: string;
+    context: { kind: "memory" | "observation" | "synthetic"; logId: string };
+    metadata?: RetrievalMetadata;
+  }> = [];
+  let count = 0;
+  for (const summary of summaries) {
+    if (!summary?.sessionId || !summary.title) continue;
+    const doc = summaryToObservation(summary);
+    idx.add(doc);
+    jobs.push({
+      id: doc.id,
+      sessionId: summary.sessionId,
+      text: `${summary.title} ${doc.narrative}`,
+      context: { kind: "synthetic", logId: doc.id },
+      metadata: {
+        ...observationRetrievalMetadata(doc),
+        sourceKind: "summary",
+      },
+    });
+    count++;
+  }
+  if (jobs.length > 0) await vectorIndexAddBatchGuarded(jobs);
+  if (persist && count > 0) scheduleIndexSave();
+  return count;
+}
+
+/**
+ * The sessions whose summaries are closest to `text`, by embedding.
+ *
+ * Answers nothing when there is no embedding provider or no vector index, so
+ * a caller can ask unconditionally and fall back to its own ranking.
+ */
+export async function searchSummaries(
+  text: string,
+  projectId: string | undefined,
+  limit = 20,
+): Promise<Array<{ sessionId: string; score: number }>> {
+  const vi = vectorIndex;
+  const ep = currentEmbeddingProvider;
+  if (!vi || !ep || !text.trim()) return [];
+  let query: Float32Array;
+  try {
+    query = await ep.embed(text);
+  } catch (err) {
+    logger.warn("summary search: embed failed", {
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return [];
+  }
+  const hits = vi.search(query, limit * 4);
+  const out: Array<{ sessionId: string; score: number }> = [];
+  for (const hit of hits) {
+    if (!hit.obsId.startsWith("summary:")) continue;
+    if (projectId && hit.source?.projectId && hit.source.projectId !== projectId) continue;
+    out.push({ sessionId: hit.sessionId, score: hit.score });
+    if (out.length >= limit) break;
+  }
+  return out;
+}
+
 export async function rebuildIndex(kv: StateKV): Promise<number> {
   const idx = getSearchIndex()
   idx.clear()
@@ -351,6 +447,19 @@ export async function rebuildIndex(kv: StateKV): Promise<number> {
     memoriesLoaded = true
   } catch (err) {
     logger.warn('rebuildIndex: failed to load memories', {
+      error: err instanceof Error ? err.message : String(err),
+    })
+  }
+
+  // Summaries are the block that answers recall questions (cycle U 42: take
+  // them out of the context and the score goes to zero), so they belong in
+  // the indexes that find things, not only in the hand-written overlap the
+  // context function computes.
+  try {
+    const summaries = await kv.list<SessionSummary>(KV.summaries)
+    await indexSummaries(summaries, false)
+  } catch (err) {
+    logger.warn('rebuildIndex: failed to load summaries', {
       error: err instanceof Error ? err.message : String(err),
     })
   }
