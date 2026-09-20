@@ -108,8 +108,42 @@ export function fillBudget(
   };
 }
 
-/** How many recent sessions are considered before the top ten are kept. */
+/** How many sessions have their summary read before the top ten are kept. */
 const SUMMARY_CANDIDATES = 40;
+
+/**
+ * How much a past session is worth looking at, from its row alone.
+ *
+ * The pool used to be the 40 most recent sessions of the project, and 19 of
+ * the 30 v9 recall items were about a session further back than that -- ranks
+ * 52 to 114 -- so no scoring could reach them. Widening the pool cannot cost
+ * a read per session, but the rows are already in hand and each carries the
+ * prompt the session opened with, so the pool is picked on that text and only
+ * the picked few have their summaries read.
+ *
+ * `index` is the place in recency order across the whole project, so this
+ * falls back to exactly the old order when nothing matches.
+ */
+export function scoreSessionCandidate(
+  focus: Set<string>,
+  firstPrompt: string | undefined,
+  index: number,
+): number {
+  // Recency decays instead of ending: session 200 still scores above zero, so
+  // a project deeper than any window keeps a defined order.
+  const recency = 1 / (1 + index / SUMMARY_CANDIDATES);
+  if (focus.size === 0 || !firstPrompt) return recency;
+  const haystack = firstPrompt.toLowerCase();
+  let hits = 0;
+  for (const term of focus) {
+    if (term.length >= 4 && haystack.includes(term)) hits += 1;
+  }
+  const overlap = Math.min(1, hits / Math.min(focus.size, 8));
+  // A prompt is one sentence of what the session set out to do, which is
+  // thinner evidence than a summary; 2x recency is enough to pull a match
+  // from the far end of the history into the pool without swamping it.
+  return recency + 2 * overlap;
+}
 
 /**
  * How much a past session's summary is worth to the session being started.
@@ -133,8 +167,10 @@ export function scoreSummaryCandidate(
 ): number {
   // Recency is the floor, never zero, so a project whose past work has
   // nothing to do with today still gets its newest sessions in the order it
-  // had before any of this.
-  const recency = (SUMMARY_CANDIDATES - index) / SUMMARY_CANDIDATES;
+  // had before any of this. It decays rather than running out: the pool now
+  // reaches sessions a hundred back, and a linear term went negative there,
+  // which put a matched old session below every unmatched recent one.
+  const recency = 1 / (1 + index / SUMMARY_CANDIDATES);
   if (focus.size === 0) return recency;
 
   const haystack = [
@@ -474,16 +510,9 @@ export function registerContextFunction(
           seenTasks.add(task);
           return true;
         })
-        // Four times the ten that are kept: enough for an older summary that
-        // matches what this session is doing to beat a newer one that does
-        // not, without reading a project's whole history.
-        .slice(0, SUMMARY_CANDIDATES);
-
-      const candidateSummaries = await Promise.all(
-        candidates.map((s) =>
-          kv.get<SessionSummary>(KV.summaries, s.id).catch(() => null),
-        ),
-      );
+        // Every session of the project is a candidate for the pool; what
+        // bounds the work is how many summaries are read below.
+        .map((session, recencyIndex) => ({ session, recencyIndex }));
 
       // Which past sessions get to speak. Recency alone left the asked-about
       // summary out of the context for 24 of 30 recall items (v9), and when
@@ -501,15 +530,39 @@ export function registerContextFunction(
       if (typeof data.focusText === "string" && data.focusText.trim()) {
         for (const term of buildFocus(data.focusText, [])) focusTerms.add(term);
       }
-      const rankedSessions = candidates
-        .map((session, index) => ({
-          session,
-          summary: candidateSummaries[index],
-          score: candidateSummaries[index]
-            ? scoreSummaryCandidate(focusTerms, candidateSummaries[index], index)
+
+      // Pool: from the rows alone, no reads.
+      const pool = candidates
+        .map((c) => ({
+          ...c,
+          poolScore: scoreSessionCandidate(
+            focusTerms,
+            c.session.firstPrompt,
+            c.recencyIndex,
+          ),
+        }))
+        .sort((a, b) => b.poolScore - a.poolScore)
+        .slice(0, SUMMARY_CANDIDATES);
+
+      const candidateSummaries = await Promise.all(
+        pool.map((c) =>
+          kv.get<SessionSummary>(KV.summaries, c.session.id).catch(() => null),
+        ),
+      );
+
+      const rankedSessions = pool
+        .map((c, i) => ({
+          session: c.session,
+          summary: candidateSummaries[i],
+          score: candidateSummaries[i]
+            ? scoreSummaryCandidate(
+                focusTerms,
+                candidateSummaries[i],
+                c.recencyIndex,
+              )
             : // No summary yet: it can still contribute observations, and it
-              // keeps its recency order among those.
-              (SUMMARY_CANDIDATES - index) / SUMMARY_CANDIDATES,
+              // keeps the order its row earned.
+              c.poolScore,
         }))
         .sort((a, b) => b.score - a.score)
         .slice(0, 10);
