@@ -108,6 +108,60 @@ export function fillBudget(
   };
 }
 
+/** How many recent sessions are considered before the top ten are kept. */
+const SUMMARY_CANDIDATES = 40;
+
+/**
+ * How much a past session's summary is worth to the session being started.
+ *
+ * `focus` is what this session is about: the significant words of its first
+ * prompt and of its own observations so far (file basenames included), the
+ * same focus the Relations block ranks with. `index` is the candidate's place
+ * in recency order, 0 for the newest of the 40 considered.
+ *
+ * Returning a bigger number means "show this one". The caller keeps the top
+ * ten, so the score has to express both halves of the trade: a summary that
+ * matches what is happening now, and a summary that is simply recent. Both
+ * matter -- a context with only old on-topic work forgets what just happened,
+ * and one with only the newest sessions is what v9 measured as answering 6 of
+ * 30 questions.
+ */
+export function scoreSummaryCandidate(
+  focus: Set<string>,
+  summary: SessionSummary,
+  index: number,
+): number {
+  // Recency is the floor, never zero, so a project whose past work has
+  // nothing to do with today still gets its newest sessions in the order it
+  // had before any of this.
+  const recency = (SUMMARY_CANDIDATES - index) / SUMMARY_CANDIDATES;
+  if (focus.size === 0) return recency;
+
+  const haystack = [
+    summary.title,
+    summary.keyDecisions.join(" "),
+    (summary.concepts ?? []).join(" "),
+  ]
+    .join(" ")
+    .toLowerCase();
+  let hits = 0;
+  for (const term of focus) {
+    // Terms under four characters match inside unrelated words ("api" in
+    // "rapid") often enough to invert the ranking.
+    if (term.length >= 4 && haystack.includes(term)) hits += 1;
+  }
+  // Against a capped denominator: a session with a long prompt has a large
+  // focus, and dividing by all of it would make every summary look unrelated.
+  const overlap = Math.min(1, hits / Math.min(focus.size, 8));
+
+  // Weight 1.5 against a recency of at most 1: a summary that matches what is
+  // happening now outranks the newest unrelated one (2.5 vs 1.0) while a
+  // single incidental word (+0.19) only breaks ties. The measurement this
+  // answers -- the right summary present for 6 of 30 items, and 0.833 vs
+  // 0.052 when it is -- is about whole-topic matches, not stray words.
+  return recency + 1.5 * overlap;
+}
+
 const SCHEDULED_TASK_OPENING = /^<scheduled-task\s+name="([^"]+)"/;
 
 /** The scheduler's task name when the prompt starts with its tag, else null. */
@@ -389,7 +443,7 @@ export function registerContextFunction(
       }
       const allSessions = await kv.list<Session>(KV.sessions);
       const seenTasks = new Set<string>();
-      const sessions = allSessions
+      const candidates = allSessions
         .filter(
           (s) =>
             s.project === data.project &&
@@ -413,13 +467,40 @@ export function registerContextFunction(
           seenTasks.add(task);
           return true;
         })
-        .slice(0, 10);
+        // Four times the ten that are kept: enough for an older summary that
+        // matches what this session is doing to beat a newer one that does
+        // not, without reading a project's whole history.
+        .slice(0, SUMMARY_CANDIDATES);
 
-      const summariesPerSession = await Promise.all(
-        sessions.map((s) =>
+      const candidateSummaries = await Promise.all(
+        candidates.map((s) =>
           kv.get<SessionSummary>(KV.summaries, s.id).catch(() => null),
         ),
       );
+
+      // Which past sessions get to speak. Recency alone left the asked-about
+      // summary out of the context for 24 of 30 recall items (v9), and when
+      // it was in, the answer was right 0.833 of the time against 0.052 when
+      // it was not -- so this is the single ranking that decides whether the
+      // memory answers at all.
+      const focusTerms = buildFocus(
+        currentSession?.firstPrompt,
+        currentObservations,
+      );
+      const rankedSessions = candidates
+        .map((session, index) => ({
+          session,
+          summary: candidateSummaries[index],
+          score: candidateSummaries[index]
+            ? scoreSummaryCandidate(focusTerms, candidateSummaries[index], index)
+            : // No summary yet: it can still contribute observations, and it
+              // keeps its recency order among those.
+              (SUMMARY_CANDIDATES - index) / SUMMARY_CANDIDATES,
+        }))
+        .sort((a, b) => b.score - a.score)
+        .slice(0, 10);
+      const sessions = rankedSessions.map((r) => r.session);
+      const summariesPerSession = rankedSessions.map((r) => r.summary);
 
       const sessionsNeedingObs: number[] = [];
       for (let i = 0; i < sessions.length; i++) {
