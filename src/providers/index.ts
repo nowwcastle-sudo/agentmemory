@@ -56,15 +56,66 @@ export function createProvider(config: ProviderConfig): ResilientProvider {
   return new ResilientProvider(createBaseProvider(config));
 }
 
+/**
+ * Models to try, on the same OpenAI-compatible endpoint, when the configured
+ * one will not answer.
+ *
+ * FALLBACK_PROVIDERS switches provider TYPE, which buys nothing here: every
+ * call goes through one local gateway, and on 2026-09-20 that gateway spent
+ * minutes answering "All models exhausted: 5 routes checked (4 rate-limited
+ * or on cooldown)" while the worker was pinned to a single model (D-8, taken
+ * because the router's own pick spends the whole token budget on prose and
+ * returns no relations). Naming other models keeps the pin's quality without
+ * making it a single point of failure.
+ *
+ * The primary is never repeated, and blanks are dropped.
+ */
+function openAiFallbackModels(primaryModel: string): string[] {
+  const raw = getEnvVar("OPENAI_FALLBACK_MODELS") || "";
+  const seen = new Set([primaryModel]);
+  const models: string[] = [];
+  for (const entry of raw.split(",")) {
+    const model = entry.trim();
+    if (!model || seen.has(model)) continue;
+    seen.add(model);
+    models.push(model);
+  }
+  return models;
+}
+
+/** The same provider, named by the model it will ask, so a chain reads. */
+function namedForModel(provider: MemoryProvider, model: string): MemoryProvider {
+  provider.name = `${provider.name}:${model}`;
+  return provider;
+}
+
 export function createFallbackProvider(
   config: ProviderConfig,
   fallbackConfig: FallbackConfig,
 ): ResilientProvider {
-  if (fallbackConfig.providers.length === 0) {
+  const modelChain =
+    config.provider === "openai" ? openAiFallbackModels(config.model) : [];
+  if (fallbackConfig.providers.length === 0 && modelChain.length === 0) {
     return createProvider(config);
   }
 
-  const providers: MemoryProvider[] = [createBaseProvider(config)];
+  const providers: MemoryProvider[] = [
+    modelChain.length > 0
+      ? namedForModel(createBaseProvider(config), config.model)
+      : createBaseProvider(config),
+  ];
+  for (const model of modelChain) {
+    try {
+      providers.push(
+        namedForModel(
+          createBaseProvider({ ...config, model }),
+          model,
+        ),
+      );
+    } catch {
+      // skip a model this build cannot construct a provider for
+    }
+  }
   for (const providerType of fallbackConfig.providers) {
     if (providerType === config.provider) continue;
     try {
