@@ -124,21 +124,62 @@ const SUMMARY_CANDIDATES = 40;
  * `index` is the place in recency order across the whole project, so this
  * falls back to exactly the old order when nothing matches.
  */
+/**
+ * How much each word says about which session to show, from the project's own
+ * prompts: rare here, worth a lot; in nearly every prompt, worth almost
+ * nothing. Counting every shared word the same is why the pool widening moved
+ * recall from 6 to 8 of 30 and stopped -- in this corpus "memory", "session"
+ * and "graph" are in most prompts, so sharing them looked like a match.
+ *
+ * The weight is log(total / prompts containing the term), floored at a tenth
+ * so a universal word still breaks a tie. A term the corpus has never seen is
+ * treated as the rarest, since an unknown word cannot be boilerplate.
+ */
+export function buildTermWeights(prompts: Array<string | undefined>): Map<string, number> {
+  const seen: string[] = prompts.filter((p): p is string => typeof p === "string" && p.length > 0);
+  const weights = new Map<string, number>();
+  if (seen.length === 0) return weights;
+  const df = new Map<string, number>();
+  for (const prompt of seen) {
+    for (const term of new Set(buildFocus(prompt, []))) {
+      df.set(term, (df.get(term) ?? 0) + 1);
+    }
+  }
+  for (const [term, count] of df) {
+    weights.set(term, Math.max(0.1, Math.log(seen.length / count)));
+  }
+  return weights;
+}
+
+/** What an unseen term is worth: the rarest thing the corpus could hold. */
+const unseenTermWeight = (weights: Map<string, number>): number =>
+  weights.size === 0 ? 1 : Math.max(...weights.values(), 1);
+
 export function scoreSessionCandidate(
   focus: Set<string>,
   firstPrompt: string | undefined,
   index: number,
+  termWeights?: Map<string, number>,
 ): number {
   // Recency decays instead of ending: session 200 still scores above zero, so
   // a project deeper than any window keeps a defined order.
   const recency = 1 / (1 + index / SUMMARY_CANDIDATES);
   if (focus.size === 0 || !firstPrompt) return recency;
   const haystack = firstPrompt.toLowerCase();
-  let hits = 0;
+  const weightOf = (term: string) =>
+    termWeights ? (termWeights.get(term) ?? unseenTermWeight(termWeights)) : 1;
+  let hit = 0;
+  let possible = 0;
   for (const term of focus) {
-    if (term.length >= 4 && haystack.includes(term)) hits += 1;
+    if (term.length < 4) continue;
+    const weight = weightOf(term);
+    possible += weight;
+    if (haystack.includes(term)) hit += weight;
   }
-  const overlap = Math.min(1, hits / Math.min(focus.size, 8));
+  // Against the best eight terms' worth, not all of them: a long prompt has a
+  // large focus, and dividing by all of it makes every session look unrelated.
+  const ceiling = Math.min(possible, 8 * (possible / Math.max(1, focus.size)) * 2);
+  const overlap = possible > 0 ? Math.min(1, hit / Math.max(0.001, ceiling)) : 0;
   // A prompt is one sentence of what the session set out to do, which is
   // thinner evidence than a summary; 2x recency is enough to pull a match
   // from the far end of the history into the pool without swamping it.
@@ -531,7 +572,11 @@ export function registerContextFunction(
         for (const term of buildFocus(data.focusText, [])) focusTerms.add(term);
       }
 
-      // Pool: from the rows alone, no reads.
+      // Pool: from the rows alone, no reads. The weights come from the same
+      // rows, so a word this project says in every session counts for little.
+      const termWeights = buildTermWeights(
+        candidates.map((c) => c.session.firstPrompt),
+      );
       const pool = candidates
         .map((c) => ({
           ...c,
@@ -539,6 +584,7 @@ export function registerContextFunction(
             focusTerms,
             c.session.firstPrompt,
             c.recencyIndex,
+            termWeights,
           ),
         }))
         .sort((a, b) => b.poolScore - a.poolScore)
