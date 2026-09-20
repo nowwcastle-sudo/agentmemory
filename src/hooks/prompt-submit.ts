@@ -1,6 +1,20 @@
 #!/usr/bin/env node
 import { resolveProjectPayload, hookCwd } from "./_project.js";
 import { defaultHookDelivery, hookSessionId, stableHookCaptureId } from "./_delivery.js";
+import { promptContextPayload, shouldInjectOnPrompt } from "./_prompt-context.js";
+
+const REST_URL = process.env["AGENTMEMORY_URL"] || "http://localhost:3111";
+const SECRET = process.env["AGENTMEMORY_SECRET"] || "";
+const INJECT_CONTEXT = process.env["AGENTMEMORY_INJECT_CONTEXT"] === "true";
+// Same tight cap as the start-of-session inject: an unreachable server must
+// not hold up the prompt.
+const INJECT_TIMEOUT_MS = 1500;
+
+function authHeaders(): Record<string, string> {
+  const h: Record<string, string> = {};
+  if (SECRET) h["Authorization"] = `Bearer ${SECRET}`;
+  return h;
+}
 
 function isSdkChildContext(payload: unknown): boolean {
   if (process.env["AGENTMEMORY_SDK_CHILD"] === "1") return true;
@@ -46,6 +60,35 @@ async function main() {
     timestamp: capturedAt,
     data: { prompt },
   });
+
+  // With the question in hand, ask memory again. The start-of-session inject
+  // ran before this text existed, so it ranked past sessions by recency
+  // alone: on the 30 recall items of 2026-09-20 that put the right summary in
+  // front of the reader 6 times, against 21 when the question is known.
+  if (!INJECT_CONTEXT) return;
+  const project = resolveProjectPayload(cwd).project;
+  if (typeof project !== "string" || !project) return;
+  try {
+    const sessionRes = await fetch(
+      `${REST_URL}/agentmemory/sessions?limit=200&agentId=*`,
+      { headers: authHeaders(), signal: AbortSignal.timeout(INJECT_TIMEOUT_MS) },
+    );
+    if (!sessionRes.ok) return;
+    const sessions = ((await sessionRes.json()) as { sessions?: Array<{ id: string; observationCount?: number }> }).sessions ?? [];
+    const row = sessions.find((s) => s.id === sessionId) ?? null;
+    if (!shouldInjectOnPrompt(row, prompt)) return;
+    const res = await fetch(`${REST_URL}/agentmemory/context`, {
+      method: "POST",
+      headers: { ...authHeaders(), "Content-Type": "application/json" },
+      body: JSON.stringify({ sessionId, project, focusText: prompt }),
+      signal: AbortSignal.timeout(INJECT_TIMEOUT_MS),
+    });
+    if (!res.ok) return;
+    const result = (await res.json()) as { context?: string };
+    if (result.context) process.stdout.write(promptContextPayload(result.context));
+  } catch {
+    // Context injection is optional and must not block prompt capture.
+  }
 }
 
 main().catch(() => process.exit(0));
