@@ -14,6 +14,7 @@ import { isSlotsEnabled, isReflectEnabled } from "../functions/slots.js";
 import { renderViewerDocument } from "../viewer/document.js";
 import { getBoundViewerPort, getViewerSkipped } from "../viewer/server.js";
 import { MAX_FILES_UPPER_BOUND } from "../functions/replay.js";
+import { indexSummaries } from "../functions/search.js";
 import { logger } from "../logger.js";
 import {
   checkpointActiveSession,
@@ -1958,6 +1959,31 @@ export function registerApiTriggers(
     type: "http",
     function_id: "api::insight-index-rebuild",
     config: { api_path: "/agentmemory/insight-index/rebuild", http_method: "POST" },
+  });
+
+  // Index the session summaries that already exist. Summaries became
+  // indexable on 2026-09-20, but the only path that reaches existing rows is
+  // a full rebuild, and that re-embeds every observation in the store: on the
+  // live corpus it ran past the invocation timeout and indexed no summaries
+  // at all. This one touches summaries only -- 440 rows against tens of
+  // thousands -- and the context ranking needs them there to find a past
+  // session by meaning rather than by shared words.
+  sdk.registerFunction("api::index-summaries",
+    async (req: ApiRequest): Promise<Response> => {
+      const authErr = checkAuth(req, secret);
+      if (authErr) return authErr;
+      const summaries = await kv.list<SessionSummary>(KV.summaries);
+      const indexed = await indexSummaries(summaries);
+      return {
+        status_code: 200,
+        body: { success: true, summaries: summaries.length, indexed },
+      };
+    },
+  );
+  sdk.registerTrigger({
+    type: "http",
+    function_id: "api::index-summaries",
+    config: { api_path: "/agentmemory/search-index/summaries", http_method: "POST" },
   });
 
   // Evidence-backed typing of related_to edges: one batch per call, so a
