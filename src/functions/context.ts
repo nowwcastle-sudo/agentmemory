@@ -574,9 +574,10 @@ export function registerContextFunction(
 
       // Pool: from the rows alone, no reads. The weights come from the same
       // rows, so a word this project says in every session counts for little.
-      const termWeights = buildTermWeights(
-        candidates.map((c) => c.session.firstPrompt),
-      );
+      // Term weighting is built and measured (buildTermWeights) but not used
+      // here: replayed over the 30 recall items it put the target in the top
+      // ten 11 times against 12 for plain overlap. Rare-word weighting is the
+      // textbook answer and it lost on this corpus, so the corpus decides.
       const pool = candidates
         .map((c) => ({
           ...c,
@@ -584,7 +585,6 @@ export function registerContextFunction(
             focusTerms,
             c.session.firstPrompt,
             c.recencyIndex,
-            termWeights,
           ),
         }))
         .sort((a, b) => b.poolScore - a.poolScore)
@@ -614,6 +614,18 @@ export function registerContextFunction(
         .slice(0, 10);
       const sessions = rankedSessions.map((r) => r.session);
       const summariesPerSession = rankedSessions.map((r) => r.summary);
+      // The chosen sessions take each other's places in the recency order:
+      // the block mix keeps the same slots it had, but the best-ranked
+      // session gets the newest of them. Ranking chose the asked-about
+      // summary for 11 of 30 recall items and only 7 were rendered -- four
+      // were chosen and then cut, because the budget fills newest first and
+      // the most relevant summary was not the newest one.
+      const slotTimes = rankedSessions
+        .map((r) => new Date(r.session.startedAt).getTime())
+        .filter((t) => Number.isFinite(t))
+        .sort((a, b) => b - a);
+      const slotFor = (rank: number): number =>
+        slotTimes[rank] ?? new Date(sessions[rank]?.startedAt ?? 0).getTime();
 
       const sessionsNeedingObs: number[] = [];
       for (let i = 0; i < sessions.length; i++) {
@@ -637,7 +649,7 @@ export function registerContextFunction(
             // summaries ended up with a createdAt more than a day after their
             // session, one by 21 days, and those sessions outranked a
             // relations index rebuilt the day before.
-            recency: new Date(sessions[i].startedAt).getTime(),
+            recency: slotFor(i),
           });
         } else {
           sessionsNeedingObs.push(i);
@@ -674,7 +686,7 @@ export function registerContextFunction(
             content,
             compact: `${heading}\n${top.map((o) => `- [${o.type}] ${o.title}`).join("\n")}`,
             tokens: estimateTokens(content),
-            recency: new Date(sessions[i].startedAt).getTime(),
+            recency: slotFor(i),
             sourceIds: top.map((o) => o.id),
           });
         }
@@ -717,7 +729,15 @@ export function registerContextFunction(
         blocks: selected.length,
         tokens: usedTokens,
       });
-      return { context: result, blocks: selected.length, tokens: usedTokens };
+      // Which sessions the ranking chose, best first. An evaluation cannot
+      // otherwise tell "never selected" from "selected and cut by the
+      // budget", and those call for opposite fixes.
+      return {
+        context: result,
+        blocks: selected.length,
+        tokens: usedTokens,
+        chosenSessions: rankedSessions.map((r) => r.session.id),
+      };
     },
   );
 }
