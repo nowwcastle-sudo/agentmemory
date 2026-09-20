@@ -308,22 +308,34 @@ export function registerDiagnosticsFunction(
 
       if (categories.includes("sessions")) {
         const sessions = await kv.list<Session>(KV.sessions);
-        let sessionIssues = 0;
 
-        for (const session of sessions) {
-          if (
-            session.status === "active" &&
-            now - new Date(session.startedAt).getTime() > TWENTY_FOUR_HOURS_MS
-          ) {
-            checks.push({
-              name: `abandoned-session:${session.id}`,
-              category: "sessions",
-              status: "warn",
-              message: `Session ${session.id} has been active for over 24 hours`,
-              fixable: false,
-            });
-            sessionIssues++;
-          }
+        // By last activity, not by when it began: a session that started
+        // yesterday and was working a minute ago is not abandoned. And one
+        // line for all of them -- on the live store 2026-09-20 this check
+        // emitted 279 of 298 checks, one per session, because that many
+        // sessions never received an end event, and two real failures sat
+        // inside the pile.
+        const stale = sessions.filter((session) => {
+          if (session.status !== "active") return false;
+          const touched = Date.parse(
+            (session as Session & { updatedAt?: string }).updatedAt ?? session.startedAt,
+          );
+          if (!Number.isFinite(touched)) return false;
+          return now - touched > TWENTY_FOUR_HOURS_MS;
+        });
+        const sessionIssues = stale.length;
+
+        if (sessionIssues > 0) {
+          const named = stale.slice(0, 3).map((s) => s.id).join(", ");
+          checks.push({
+            name: "abandoned-sessions",
+            category: "sessions",
+            status: "warn",
+            message:
+              `${sessionIssues} of ${sessions.length} sessions are still marked active with no activity for over 24 hours ` +
+              `(${named}${sessionIssues > 3 ? ", …" : ""}). Usually an end event that never arrived, not live work.`,
+            fixable: false,
+          });
         }
 
         if (sessionIssues === 0) {

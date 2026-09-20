@@ -398,9 +398,9 @@ describe("Diagnostics Functions", () => {
         categories: ["sessions"],
       })) as { checks: DiagnosticCheck[] };
 
-      const check = result.checks.find((c) =>
-        c.name.startsWith("abandoned-session:"),
-      );
+      // One line for all stale sessions rather than one per session: the
+      // live check emitted 279 of 298 checks that way (2026-09-20).
+      const check = result.checks.find((c) => c.name === "abandoned-sessions");
       expect(check).toBeDefined();
       expect(check!.status).toBe("warn");
       expect(check!.fixable).toBe(false);
