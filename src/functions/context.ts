@@ -193,6 +193,13 @@ export function registerContextFunction(
        * ignored, so a script can ask for a kind an older worker lacks.
        */
       omit?: string[];
+      /**
+       * What this session is about, when the caller knows it before the
+       * session row does -- a prompt hook, or an evaluation asking a
+       * question. Merged into the focus that ranks which past summaries are
+       * shown; blank or absent leaves selection on recency.
+       */
+      focusText?: string;
     }) => {
       const budget = data.budget || tokenBudget;
       const omitted = new Set<string>(Array.isArray(data.omit) ? data.omit : []);
@@ -483,10 +490,17 @@ export function registerContextFunction(
       // it was in, the answer was right 0.833 of the time against 0.052 when
       // it was not -- so this is the single ranking that decides whether the
       // memory answers at all.
+      // The session row's own prompt, plus whatever the caller knows. At
+      // session start the hook injects context before the first prompt has
+      // reached the row, so without `focusText` there is nothing to rank by
+      // and selection is recency, exactly as it was.
       const focusTerms = buildFocus(
         currentSession?.firstPrompt,
         currentObservations,
       );
+      if (typeof data.focusText === "string" && data.focusText.trim()) {
+        for (const term of buildFocus(data.focusText, [])) focusTerms.add(term);
+      }
       const rankedSessions = candidates
         .map((session, index) => ({
           session,

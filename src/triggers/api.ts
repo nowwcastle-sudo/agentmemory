@@ -488,12 +488,19 @@ export function registerApiTriggers(
         agentId?: string;
         omitRelations?: boolean;
         omit?: string[];
+        focusText?: string;
       } = {
         sessionId,
         project,
       };
       if (budget !== undefined) payload.budget = budget;
       if (body.omitRelations === true) payload.omitRelations = true;
+      // What the caller already knows this session is about, used to rank
+      // which past summaries are shown. The session row has no first prompt
+      // yet when the start hook injects context.
+      if (typeof body.focusText === "string" && body.focusText.trim()) {
+        payload.focusText = body.focusText as string;
+      }
       // Evaluation knob: the block kinds to leave out, so their budget goes to
       // the rest. Names the worker does not know are ignored there.
       if (Array.isArray(body.omit)) {
