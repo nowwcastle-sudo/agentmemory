@@ -15,7 +15,6 @@ import {
   isDropStaleIndexEnabled,
 } from "./config.js";
 import {
-  createProvider,
   createFallbackProvider,
   createEmbeddingProvider,
   createImageEmbeddingProvider,
@@ -186,10 +185,11 @@ async function main() {
   const embeddingConfig = loadEmbeddingConfig();
   const fallbackConfig = loadFallbackConfig();
 
-  const provider =
-    fallbackConfig.providers.length > 0
-      ? createFallbackProvider(config.provider, fallbackConfig)
-      : createProvider(config.provider);
+  // Always through createFallbackProvider: it returns a plain provider when
+  // neither FALLBACK_PROVIDERS nor OPENAI_FALLBACK_MODELS is set, and the
+  // model chain (added 2026-09-20 for the gateway's "all models exhausted"
+  // windows) would never be built if this branched on providers alone.
+  const provider = createFallbackProvider(config.provider, fallbackConfig);
 
   const embeddingProvider = createEmbeddingProvider();
   const imageEmbeddingProvider = createImageEmbeddingProvider();
