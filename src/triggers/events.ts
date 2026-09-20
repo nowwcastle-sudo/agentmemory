@@ -2,7 +2,6 @@ import { TriggerAction, type ISdk } from "../iii-compat.js";
 import type {
   HookPayload,
   ObservationProjection,
-  RawObservation,
   Session,
 } from "../types.js";
 import { KV, STREAM } from "../state/schema.js";
@@ -13,29 +12,40 @@ import {
   completeActiveSession,
   isValidSessionRow,
 } from "../state/session-lifecycle.js";
+import { listActiveProjections } from "../functions/observation-projection-index.js";
 
+// Re-queue this session's projections that never reached `succeeded`.
+//
+// This used to list `mem:raw-obs:<sessionId>` whole and then look up each
+// observation's projection row, dropping every one that was missing or
+// succeeded. The surviving set is exactly the active index, so the list was
+// paid for nothing: on the live store 2026-09-20 it was the largest
+// whole-scope read of all, 21.6 MB in two calls for one 6,763-observation
+// session, and `state::list` crosses the engine as one message (problem #1).
+// Reading the index instead is a few kilobytes and the same queue calls.
 async function settleSessionObservationProjections(
   sdk: ISdk,
   kv: StateKV,
   sessionId: string,
 ): Promise<void> {
-  const rawObservations = await kv.list<RawObservation>(
-    KV.rawObservations(sessionId),
-  );
-  for (const raw of rawObservations) {
-    const projection = await kv.get<ObservationProjection>(
-      KV.observationProjections,
-      raw.id,
-    );
-    if (!projection || projection.status === "succeeded") continue;
+  const active = await listActiveProjections(kv).catch((err) => {
+    logger.warn("Active projection index read failed", {
+      sessionId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return [] as ObservationProjection[];
+  });
+  for (const projection of active) {
+    if (projection.sessionId !== sessionId) continue;
+    if (projection.status === "succeeded") continue;
     try {
       await sdk.trigger({
         function_id: "mem::queue-observation-projection",
-        payload: { observationId: raw.id, sessionId },
+        payload: { observationId: projection.observationId, sessionId },
       });
     } catch (err) {
       logger.warn("Observation projection settle failed", {
-        observationId: raw.id,
+        observationId: projection.observationId,
         sessionId,
         error: err instanceof Error ? err.message : String(err),
       });
