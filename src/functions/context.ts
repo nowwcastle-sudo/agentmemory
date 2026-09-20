@@ -516,7 +516,14 @@ export function registerContextFunction(
         undefined,
         buildFocus(currentSession?.firstPrompt, currentObservations),
       );
-      if (relationsContent) {
+      // Off unless asked for. Measured over 60 recall items on 2026-09-21,
+      // after the summary selection work: the block costs 0.054 of the score
+      // [-0.117, -0.004], winning 1 item and losing 5. On 2026-09-19 the same
+      // block was worth +0.054 -- it did not get worse, the summaries around
+      // it got better, and it now takes budget from something that answers.
+      // The flag stays because the graph has uses beyond recall, which is all
+      // this measurement covers.
+      if (relationsContent && process.env["AGENTMEMORY_RELATIONS_BLOCK"] === "true") {
         const updated = Date.parse(relationsIndex?.updatedAt ?? "");
         blocks.push({
           type: "memory",

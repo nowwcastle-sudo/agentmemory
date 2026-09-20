@@ -1,8 +1,18 @@
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { registerContextFunction } from "../src/functions/context.js";
 import { KV } from "../src/state/schema.js";
 import type { ProjectProfile } from "../src/types.js";
 import { mockKV } from "./helpers/mocks.js";
+
+// The Relations block is off by default since 2026-09-21 (it costs 0.054
+// of the recall score now that summaries are selected well). These tests are
+// about the block itself, so they turn it on.
+beforeEach(() => {
+  process.env.AGENTMEMORY_RELATIONS_BLOCK = "true";
+});
+afterEach(() => {
+  delete process.env.AGENTMEMORY_RELATIONS_BLOCK;
+});
 
 // The injected context block never carried a graph relation. It now reads the
 // project's relations index row -- one get -- and renders a ## Relations block.
