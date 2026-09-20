@@ -50,8 +50,22 @@ async function listInsightRows(kv: StateKV): Promise<InsightIndexRow[]> {
   return full.map(toIndexRow);
 }
 
+/**
+ * The kinds a caller can leave out of a rendered context. `ContextBlock.type`
+ * is coarser -- five of these render as "memory" -- and an evaluation needs to
+ * name one block at a time.
+ */
+export type ContextBlockKind =
+  | "slots"
+  | "profile"
+  | "lessons"
+  | "insights"
+  | "relations"
+  | "summaries"
+  | "observations";
+
 /** A block plus the short form it falls back to when the full one does not fit. */
-type FillBlock = ContextBlock & { compact?: string };
+type FillBlock = ContextBlock & { compact?: string; kind: ContextBlockKind };
 
 /**
  * Fill the budget in two passes over blocks sorted newest first: first the
@@ -116,10 +130,19 @@ export function registerContextFunction(
        * Evaluation knob: render as if the project had no Relations block, so
        * its budget goes to the other blocks. Cutting the block's text out of
        * a rendered context would measure what it says but not what it costs.
+       * Kept for callers written before `omit`; the same as omit: ["relations"].
        */
       omitRelations?: boolean;
+      /**
+       * Evaluation knob: the block kinds to leave out, so the budget they
+       * would have taken goes to the rest. Names this build does not know are
+       * ignored, so a script can ask for a kind an older worker lacks.
+       */
+      omit?: string[];
     }) => {
       const budget = data.budget || tokenBudget;
+      const omitted = new Set<string>(Array.isArray(data.omit) ? data.omit : []);
+      if (data.omitRelations === true) omitted.add("relations");
       const blocks: FillBlock[] = [];
 
       // Cross-agent isolation for the injected-context path. Mirrors the
@@ -169,6 +192,7 @@ export function registerContextFunction(
       if (slotContent) {
         blocks.push({
           type: "memory",
+          kind: "slots",
           content: slotContent,
           tokens: estimateTokens(slotContent),
           recency: Date.now(),
@@ -204,7 +228,8 @@ export function registerContextFunction(
           const profileContent = `## Project Profile\n${profileParts.join("\n")}`;
           blocks.push({
             type: "memory",
-            content: profileContent,
+            kind: "profile",
+          content: profileContent,
             tokens: estimateTokens(profileContent),
             recency: new Date(profile.updatedAt).getTime(),
           });
@@ -255,6 +280,7 @@ export function registerContextFunction(
         }, 0);
         blocks.push({
           type: "memory",
+          kind: "lessons",
           content: lessonsContent,
           compact: lessonsCompact,
           tokens: estimateTokens(lessonsContent),
@@ -330,6 +356,7 @@ export function registerContextFunction(
         }, 0);
         blocks.push({
           type: "memory",
+          kind: "insights",
           content: insightsContent,
           compact: insightsCompact,
           tokens: estimateTokens(insightsContent),
@@ -350,10 +377,11 @@ export function registerContextFunction(
         undefined,
         buildFocus(currentSession?.firstPrompt, currentObservations),
       );
-      if (relationsContent && data.omitRelations !== true) {
+      if (relationsContent) {
         const updated = Date.parse(relationsIndex?.updatedAt ?? "");
         blocks.push({
           type: "memory",
+          kind: "relations",
           content: relationsContent,
           tokens: estimateTokens(relationsContent),
           recency: Number.isFinite(updated) ? updated : 0,
@@ -403,6 +431,7 @@ export function registerContextFunction(
             : `## ${summary.title}`;
           blocks.push({
             type: "summary",
+            kind: "summaries",
             content,
             compact,
             tokens: estimateTokens(content),
@@ -447,6 +476,7 @@ export function registerContextFunction(
           const content = `${heading}\n${items}`;
           blocks.push({
             type: "observation",
+            kind: "observations",
             content,
             compact: `${heading}\n${top.map((o) => `- [${o.type}] ${o.title}`).join("\n")}`,
             tokens: estimateTokens(content),
@@ -456,7 +486,12 @@ export function registerContextFunction(
         }
       }
 
-      blocks.sort((a, b) => b.recency - a.recency);
+      // One gate for every kind, after the blocks are built: what a kind
+      // costs is what the rest get back, and an evaluation arm that cut the
+      // text out of the rendered string would see the saying without the
+      // paying.
+      const kept = omitted.size > 0 ? blocks.filter((b) => !omitted.has(b.kind)) : blocks;
+      kept.sort((a, b) => b.recency - a.recency);
 
       let usedTokens = 0;
       const selected: string[] = [];
@@ -465,7 +500,7 @@ export function registerContextFunction(
       const footer = `</agentmemory-context>`;
       usedTokens += estimateTokens(header) + estimateTokens(footer);
 
-      const filled = fillBudget(blocks, budget, usedTokens);
+      const filled = fillBudget(kept, budget, usedTokens);
       usedTokens = filled.used;
       for (const { block, content } of filled.chosen) {
         selected.push(content);

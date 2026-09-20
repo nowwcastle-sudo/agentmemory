@@ -487,12 +487,19 @@ export function registerApiTriggers(
         budget?: number;
         agentId?: string;
         omitRelations?: boolean;
+        omit?: string[];
       } = {
         sessionId,
         project,
       };
       if (budget !== undefined) payload.budget = budget;
       if (body.omitRelations === true) payload.omitRelations = true;
+      // Evaluation knob: the block kinds to leave out, so their budget goes to
+      // the rest. Names the worker does not know are ignored there.
+      if (Array.isArray(body.omit)) {
+        const omit = body.omit.filter((k): k is string => typeof k === "string");
+        if (omit.length > 0) payload.omit = omit;
+      }
       const agentId = bodyAgentId ?? queryAgentId;
       if (agentId !== undefined) payload.agentId = agentId;
       const result = await sdk.trigger({ function_id: "mem::context", payload });
