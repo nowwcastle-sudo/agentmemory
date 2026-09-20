@@ -131,7 +131,8 @@ describe("rebuildRelationsIndex", () => {
     expect(result).toEqual({ projects: 2, relations: 2, sideSessionOnly: 0 });
 
     const p1 = await readProjectRelations(kv as never, "p1");
-    expect(p1).toEqual([{ source: "retry policy", type: "implements", target: "src/retry.ts", weight: 0.8, backing: 3, edgeId: "e1" }]);
+    // createdAt rides along so the cap can order judgments by age.
+    expect(p1).toEqual([{ source: "retry policy", type: "implements", target: "src/retry.ts", weight: 0.8, backing: 3, edgeId: "e1", createdAt: "2026-09-01T00:00:00.000Z" }]);
     const p2 = await readProjectRelations(kv as never, "p2");
     expect(p2.map((r) => r.edgeId)).toEqual(["e3"]);
     expect(await kv.get(KV.graphRelationsIndex, "gone")).toBeNull();

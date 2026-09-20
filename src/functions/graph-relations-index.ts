@@ -30,6 +30,11 @@ export interface RelationRow {
    * asking session produced itself, as it leaves out that session's summary.
    */
   sessions?: string[];
+  /**
+   * When the edge was made, for ordering judgments inside the cap. Absent on
+   * rows written before this field existed; those fall back to evidence.
+   */
+  createdAt?: string;
 }
 
 export interface ProjectRelationsIndex {
@@ -135,6 +140,7 @@ export function toRelationRow(edge: GraphEdge, sourceName: string, targetName: s
     weight: edge.weight,
     backing: (edge.sourceObservationIds ?? []).length,
     edgeId: edge.id,
+    ...(edge.createdAt ? { createdAt: edge.createdAt } : {}),
   };
   const sessions = edgeSessionIds(edge).slice(0, RELATION_SESSIONS_CAP);
   return sessions.length > 0 ? { ...row, sessions } : row;
@@ -150,12 +156,26 @@ export function upsertRelation(index: ProjectRelationsIndex, row: RelationRow): 
   // Class first: the cap, not the block, is where content is decided -- a
   // project holds thousands of typed edges and 200 rows survive, so a
   // judgment relation cut here can never be ranked back in at render time.
-  kept.sort(
-    (a, b) =>
-      relationClassRank(a.type) - relationClassRank(b.type) ||
-      relationScore(b) - relationScore(a) ||
-      a.edgeId.localeCompare(b.edgeId),
-  );
+  // Judgments newest first, everything else by evidence.
+  //
+  // `relationScore` rewards repetition, which is right for structure -- a
+  // file relation earns backing every time the file is read -- and wrong for
+  // a decision, which is stated once and is in force because it is recent.
+  // Replayed over the 30 recall questions on the live store 2026-09-20:
+  // today's order left a judgment matching the question inside the cap for 5
+  // of them, newest-first for 11, losing 1. A blend of evidence and age
+  // scored the same 11, so the simpler rule stands.
+  const judgmentTime = (r: RelationRow): number =>
+    r.createdAt ? Date.parse(r.createdAt) || 0 : 0;
+  kept.sort((a, b) => {
+    const classDiff = relationClassRank(a.type) - relationClassRank(b.type);
+    if (classDiff !== 0) return classDiff;
+    if (relationClassRank(a.type) === 0) {
+      const timeDiff = judgmentTime(b) - judgmentTime(a);
+      if (timeDiff !== 0) return timeDiff;
+    }
+    return relationScore(b) - relationScore(a) || a.edgeId.localeCompare(b.edgeId);
+  });
   return {
     project: index.project,
     updatedAt: new Date().toISOString(),
