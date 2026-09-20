@@ -1069,9 +1069,6 @@ export function registerApiTriggers(
     async (req: ApiRequest): Promise<Response> => {
       const authErr = checkAuth(req, secret);
       if (authErr) return authErr;
-      const sessions = (await kv.list<Session>(KV.sessions)).filter(
-        isValidSessionRow,
-      );
       const normalizedAgentId =
         typeof req.query_params?.["agentId"] === "string"
           ? req.query_params["agentId"].trim()
@@ -1083,9 +1080,6 @@ export function registerApiTriggers(
         ? undefined
         : explicitAgentId ??
           (isAgentScopeIsolated() ? getAgentId() : undefined);
-      const filtered = filterAgentId
-        ? sessions.filter((s) => s.agentId === filterAgentId)
-        : sessions;
       const rawLimit = req.query_params?.["limit"];
       const parsedLimit =
         typeof rawLimit === "string" && rawLimit.trim().length > 0
@@ -1101,8 +1095,34 @@ export function registerApiTriggers(
         };
       }
 
+      // A limit with no agent filter is the one case that can be answered
+      // without reading both scopes whole: a window of session rows, then one
+      // get per kept session's summary. Today's live reading put those scopes
+      // second and third among whole-scope reads (683 rows / 0.36 MB and 440
+      // rows / 0.4 MB) for callers that wanted ten rows. An agent filter
+      // decides what is visible per row, so it still reads everything.
+      const bounded = rawLimit !== undefined && !filterAgentId;
+      const sessions = bounded
+        ? (
+            await kv.listPage<Session>(KV.sessions, { limit: parsedLimit })
+          ).rows.filter(isValidSessionRow)
+        : (await kv.list<Session>(KV.sessions)).filter(isValidSessionRow);
+      const filtered = filterAgentId
+        ? sessions.filter((s) => s.agentId === filterAgentId)
+        : sessions;
+
       const selected =
         rawLimit === undefined ? filtered : filtered.slice(0, parsedLimit);
+      if (bounded) {
+        const withSummary = [];
+        for (const session of selected) {
+          const summary = await kv
+            .get<SessionSummary>(KV.summaries, session.id)
+            .catch(() => null);
+          withSummary.push(summary ? { ...session, summary } : session);
+        }
+        return { status_code: 200, body: { sessions: withSummary } };
+      }
       const summaries = await kv.list<SessionSummary>(KV.summaries);
       const summariesBySessionId = new Map<string, SessionSummary>();
       let hasLegacySummary = false;
