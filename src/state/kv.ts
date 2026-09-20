@@ -89,4 +89,44 @@ export class StateKV {
     recordKvList(scope, rows as unknown[], caller)
     return rows
   }
+
+  /**
+   * The scope's keys, without any value.
+   *
+   * `state::list` has no pagination and answers a scope as one message: the
+   * biggest live scope came back as 59.2 MB in 1.5 s on 2026-09-20, while
+   * `state::list_keys` answered the same 6,890 rows in 158 KB and 72 ms. The
+   * state worker is a closed package, so this is the pagination it has.
+   */
+  async listKeys(scope: string): Promise<string[]> {
+    const answer = await this.sdk.trigger<{ scope: string }, { keys?: string[] } | string[]>({
+      function_id: 'state::list_keys',
+      payload: { scope },
+    })
+    if (Array.isArray(answer)) return answer
+    return answer?.keys ?? []
+  }
+
+  /**
+   * One window of a scope: its keys, then a get per row in the window.
+   *
+   * For a caller that wants a bounded read. A full scan this way costs one
+   * round trip per row, which is slower than the single message `list`
+   * sends, so this does not replace it. A key whose row is gone by the time
+   * it is read is left out; `total` still counts it, because it is the key
+   * count the window was taken from.
+   */
+  async listPage<T = unknown>(
+    scope: string,
+    { offset = 0, limit = 100 }: { offset?: number; limit?: number } = {},
+  ): Promise<{ rows: T[]; total: number; hasMore: boolean }> {
+    const keys = await this.listKeys(scope)
+    const window = keys.slice(offset, offset + limit)
+    const rows: T[] = []
+    for (const key of window) {
+      const row = await this.get<T>(scope, key)
+      if (row !== null && row !== undefined) rows.push(row)
+    }
+    return { rows, total: keys.length, hasMore: offset + window.length < keys.length }
+  }
 }

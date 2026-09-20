@@ -1160,9 +1160,25 @@ export function registerApiTriggers(
       const sessionId = asNonEmptyString(req.query_params?.["sessionId"]);
       if (!sessionId)
         return { status_code: 400, body: { error: "sessionId required" } };
-      const observations = await kv.list<CompressedObservation>(
-        KV.observations(sessionId),
-      );
+      // A window, when one is asked for: `state::list` answers a scope as one
+      // message (59.2 MB for the biggest live session, 2026-09-20) and has no
+      // pagination, but `state::list_keys` does, so StateKV.listPage reads
+      // only the rows in the window. Without a limit this returns everything,
+      // as it always has.
+      const limitParam = req.query_params?.["limit"];
+      const offsetParam = req.query_params?.["offset"];
+      const limit = limitParam === undefined ? undefined : Number(limitParam);
+      const offset = offsetParam === undefined ? 0 : Number(offsetParam);
+      if (
+        (limit !== undefined && (!Number.isInteger(limit) || limit <= 0)) ||
+        !Number.isInteger(offset) ||
+        offset < 0
+      ) {
+        return {
+          status_code: 400,
+          body: { error: "limit must be a positive integer and offset a non-negative integer" },
+        };
+      }
       const normalizedAgentId =
         typeof req.query_params?.["agentId"] === "string"
           ? req.query_params["agentId"].trim()
@@ -1174,6 +1190,22 @@ export function registerApiTriggers(
         ? undefined
         : explicitAgentId ??
           (isAgentScopeIsolated() ? getAgentId() : undefined);
+      // The agent filter decides visibility per row, so a window would hand
+      // back an arbitrary slice of what the caller may see. Filtered reads
+      // keep the whole-scope path: correct and slow beats short and wrong.
+      if (limit !== undefined && !filterAgentId) {
+        const page = await kv.listPage<CompressedObservation>(
+          KV.observations(sessionId),
+          { offset, limit },
+        );
+        return {
+          status_code: 200,
+          body: { observations: page.rows, total: page.total, hasMore: page.hasMore },
+        };
+      }
+      const observations = await kv.list<CompressedObservation>(
+        KV.observations(sessionId),
+      );
       const filtered = filterAgentId
         ? observations.filter((o) => o.agentId === filterAgentId)
         : observations;
