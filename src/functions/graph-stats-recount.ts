@@ -4,7 +4,7 @@ import { KV } from "../state/schema.js";
 import { withKeyedLock } from "../state/keyed-mutex.js";
 import type { GraphEdge, GraphNode, GraphSnapshot } from "../types.js";
 import { EDGE_TYPES } from "./graph-schema.js";
-import { belongsToCurrentGeneration, SNAPSHOT_KEY } from "./graph-generation.js";
+import { belongsToCurrentGeneration, compactSnapshot, SNAPSHOT_KEY } from "./graph-generation.js";
 import { logger } from "../logger.js";
 
 // Recount the snapshot's stats from the rows that are actually there.
@@ -87,7 +87,7 @@ export async function recountGraphStats(
       updatedAt: new Date().toISOString(),
       dirty: false,
     };
-    await kv.set(KV.graphSnapshot, SNAPSHOT_KEY, next);
+    await kv.set(KV.graphSnapshot, SNAPSHOT_KEY, compactSnapshot(next));
     logger.info("Graph stats recounted", { before, after, unknownTypes, staled });
     return { before, after, unknownTypes, staled, rows: { nodes: nodes.length, edges: edges.length } };
   });

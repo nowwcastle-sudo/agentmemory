@@ -10,6 +10,17 @@ import type { GraphEdge, GraphNode, GraphSnapshot } from "../types.js";
 
 export const SNAPSHOT_KEY = "current";
 
+// The snapshot holds rankings and counts; observation lists stay on the rows.
+// Every graph delta reads and rewrites the snapshot whole, and hub nodes'
+// lists made it 6.6 MB on 2026-09-24. Readers that return rows re-read them.
+export function compactSnapshot(snap: GraphSnapshot): GraphSnapshot {
+  return {
+    ...snap,
+    topNodes: snap.topNodes.map((n) => ({ ...n, sourceObservationIds: [], sourceRefs: undefined })),
+    topEdges: snap.topEdges.map((e) => ({ ...e, sourceObservationIds: [], sourceRefs: undefined })),
+  };
+}
+
 export function belongsToCurrentGeneration(
   record: GraphNode | GraphEdge,
   snapshot: GraphSnapshot | null,

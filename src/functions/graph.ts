@@ -64,7 +64,7 @@ const MAX_GRAPH_QUERY_LIMIT = 5000;
 // enumeration. Aggregate stats (nodesByType / edgesByType) are computed
 // fresh during rebuild and stored alongside.
 const SNAPSHOT_TOP_NODES = DEFAULT_GRAPH_QUERY_LIMIT;
-import { SNAPSHOT_KEY, belongsToCurrentGeneration } from "./graph-generation.js";
+import { SNAPSHOT_KEY, belongsToCurrentGeneration, compactSnapshot } from "./graph-generation.js";
 import { isIndexableEdge, upsertRelationsForEdge } from "./graph-relations-index.js";
 
 // `state::list` over a 75K-node scope can exceed the iii invocation
@@ -218,12 +218,20 @@ function buildSnapshotFromArrays(
   };
 }
 
-function paginateFromSnapshot(
+// Snapshot entries are compact, so the page is read back as full rows.
+async function fullRows<T extends { id: string }>(kv: StateKV, scope: string, rows: T[]): Promise<T[]> {
+  return Promise.all(
+    rows.map(async (row) => (await kv.get<T>(scope, row.id).catch(() => null)) ?? row),
+  );
+}
+
+async function paginateFromSnapshot(
+  kv: StateKV,
   snap: GraphSnapshot,
   filterType: string | undefined,
   limit: number,
   offset: number,
-): GraphQueryResult {
+): Promise<GraphQueryResult> {
   const filteredNodes = filterType
     ? snap.topNodes.filter((n) => n.type === filterType)
     : snap.topNodes;
@@ -236,8 +244,8 @@ function paginateFromSnapshot(
     (e) => pageIds.has(e.sourceNodeId) && pageIds.has(e.targetNodeId),
   );
   return {
-    nodes: pageNodes,
-    edges: pageEdges,
+    nodes: await fullRows(kv, KV.graphNodes, pageNodes),
+    edges: await fullRows(kv, KV.graphEdges, pageEdges),
     depth: 0,
     totalNodes: total,
     totalEdges: snap.stats.totalEdges,
@@ -913,7 +921,7 @@ async function persistGraphDeltaUnlocked(
   } else if (newNodeCount > 0 || newEdgeCount > 0 || snapMutated) {
     snap.updatedAt = capturedAt;
     snap.dirty = false;
-    await kv.set(KV.graphSnapshot, SNAPSHOT_KEY, snap);
+    await kv.set(KV.graphSnapshot, SNAPSHOT_KEY, compactSnapshot(snap));
   }
 
   return { newNodeCount, newEdgeCount, rejectedCount: totalRejected };
@@ -1147,7 +1155,7 @@ export function registerGraphFunction(
       if (noWalk) {
         const snap = await readSnapshot(kv);
         if (snap && snap.stats.totalNodes > 0) {
-          return paginateFromSnapshot(snap, data.nodeType, limit, offset);
+          return paginateFromSnapshot(kv, snap, data.nodeType, limit, offset);
         }
         return {
           nodes: [],
@@ -1217,7 +1225,7 @@ export function registerGraphFunction(
         const snap = await readSnapshot(kv);
         if (snap) {
           return {
-            ...paginateFromSnapshot(snap, data.nodeType, limit, offset),
+            ...(await paginateFromSnapshot(kv, snap, data.nodeType, limit, offset)),
             warning:
               "Live graph enumeration exceeded budget. Query / " +
               "startNodeId paths degrade on >25K-node corpora until a " +
@@ -1537,7 +1545,7 @@ export function registerGraphFunction(
       }
 
       const snap = buildSnapshotFromArrays(nodes, edges, existingSnapshot);
-      await kv.set(KV.graphSnapshot, SNAPSHOT_KEY, snap);
+      await kv.set(KV.graphSnapshot, SNAPSHOT_KEY, compactSnapshot(snap));
       const tookMs = Date.now() - started;
       logger.info("Graph snapshot rebuilt", {
         totalNodes: snap.stats.totalNodes,
