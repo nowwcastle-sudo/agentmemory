@@ -67,11 +67,10 @@ export class SearchIndex {
     for (const term of termFreq.keys()) {
       if (!this.invertedIndex.has(term)) {
         this.invertedIndex.set(term, new Set());
+        this.sortedTerms?.splice(this.lowerBound(this.sortedTerms, term), 0, term);
       }
       this.invertedIndex.get(term)!.add(obs.id);
     }
-
-    this.sortedTerms = null;
   }
 
   has(id: string): boolean {
@@ -90,6 +89,7 @@ export class SearchIndex {
           postingList.delete(id);
           if (postingList.size === 0) {
             this.invertedIndex.delete(term);
+            this.sortedTerms?.splice(this.lowerBound(this.sortedTerms, term), 1);
           }
         }
       }
@@ -98,7 +98,6 @@ export class SearchIndex {
 
     this.totalDocLength = Math.max(0, this.totalDocLength - entry.termCount);
     this.entries.delete(id);
-    this.sortedTerms = null;
   }
 
   search(
@@ -325,6 +324,8 @@ export class SearchIndex {
     return out;
   }
 
+  // Built once, then kept in order by add/remove: re-sorting on every change
+  // made each search sort the whole vocabulary while observations streamed in.
   private getSortedTerms(): string[] {
     if (!this.sortedTerms) {
       this.sortedTerms = Array.from(this.invertedIndex.keys()).sort();
