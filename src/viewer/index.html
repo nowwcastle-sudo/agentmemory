@@ -1833,7 +1833,7 @@
     function startDashboardAutoRefresh() {
       if (dashboardTimer) clearInterval(dashboardTimer);
       dashboardTimer = setInterval(function() {
-        if (pollTimer) return;
+        if (pollTimer || document.hidden) return;
         if (state.activeTab === 'dashboard') refreshDashboard();
       }, 30000);
     }
@@ -4024,6 +4024,8 @@
       setWsStatus('polling · ' + (POLL_INTERVAL_MS / 1000) + 's', 'disconnected');
       var tick = 0;
       pollTimer = setInterval(function() {
+        // A hidden tab is refreshed by the first tick after it is shown.
+        if (document.hidden) return;
         tick++;
         if (state.activeTab === 'dashboard') {
           refreshDashboard();

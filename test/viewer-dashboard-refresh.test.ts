@@ -110,6 +110,46 @@ describe("viewer dashboard refresh", () => {
     await Promise.all([first, second]);
   });
 
+  it("does not refresh from a hidden tab", () => {
+    // A dashboard left open in a background tab polled ten endpoints, several
+    // of them whole lists, every 10 s while its live socket was down
+    // (2026-09-24). Nobody sees a hidden tab; the next tick after it is shown
+    // refreshes it.
+    const polling = namedFunction("startPolling");
+    const auto = namedFunction("startDashboardAutoRefresh");
+    expect(polling).not.toBeNull();
+    expect(auto).not.toBeNull();
+    if (!polling || !auto) return;
+    // Each timer is started on its own so the auto refresh is not short-cut
+    // by an active polling timer.
+    const ticksOf = (hidden: boolean, start: "startPolling" | "startDashboardAutoRefresh") => {
+      const ticks: Array<() => void> = [];
+      const refreshDashboard = vi.fn();
+      Function("deps", `
+        var document = deps.document;
+        var state = { activeTab: "dashboard", ws: null };
+        var pollTimer = null, dashboardTimer = null;
+        var POLL_INTERVAL_MS = 10000, WS_REPROBE_EVERY_TICKS = 6;
+        var setInterval = deps.setInterval;
+        var setWsStatus = function () {};
+        var refreshDashboard = deps.refreshDashboard;
+        ${polling}
+        ${auto}
+        ${start}();
+      `)({
+        document: { hidden },
+        setInterval: (fn: () => void) => (ticks.push(fn), ticks.length),
+        refreshDashboard,
+      });
+      for (const tick of ticks) tick();
+      return refreshDashboard.mock.calls.length;
+    };
+    for (const start of ["startPolling", "startDashboardAutoRefresh"] as const) {
+      expect(ticksOf(true, start)).toBe(0);
+      expect(ticksOf(false, start)).toBe(1);
+    }
+  });
+
   it("routes polling and live events through the non-invalidating refresh", () => {
     const polling = namedFunction("startPolling");
     const live = namedFunction("routeWsMessage");
