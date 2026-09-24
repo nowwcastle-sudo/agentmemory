@@ -1,4 +1,4 @@
-import { mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { mkdir, open, readdir, readFile, rename, rm, writeFile, type FileHandle } from "node:fs/promises";
 import { join } from "node:path";
 import { VectorIndex, type VectorBinaryHeader } from "./vector-index.js";
 
@@ -116,10 +116,24 @@ export class IndexFileStore {
     return VectorIndex.fromBinary(header, block);
   }
 
-  async writeBm25(serialized: string): Promise<{ bytes: number }> {
-    const out = Buffer.from(serialized, "utf8");
-    await this.writeAtomic(this.bm25Path, out);
-    return { bytes: out.length };
+  // Pieces are written one at a time with a turn of the event loop between
+  // them: one JSON.stringify of the live index held the main thread 1–3 s.
+  async writeBm25(serialized: string | Iterable<string>): Promise<{ bytes: number }> {
+    if (typeof serialized === "string") {
+      const out = Buffer.from(serialized, "utf8");
+      await this.writeAtomic(this.bm25Path, out);
+      return { bytes: out.length };
+    }
+    let bytes = 0;
+    await this.writeAtomic(this.bm25Path, async (file) => {
+      for (const piece of serialized) {
+        const out = Buffer.from(piece, "utf8");
+        await file.writeFile(out);
+        bytes += out.length;
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+    });
+    return { bytes };
   }
 
   async readBm25(): Promise<string | null> {
@@ -155,11 +169,23 @@ export class IndexFileStore {
     return removed;
   }
 
-  private async writeAtomic(path: string, data: Buffer): Promise<void> {
+  private async writeAtomic(
+    path: string,
+    data: Buffer | ((file: FileHandle) => Promise<void>),
+  ): Promise<void> {
     await mkdir(this.dir, { recursive: true });
     const temporary = `${path}.tmp-${process.pid}`;
     try {
-      await writeFile(temporary, data);
+      if (Buffer.isBuffer(data)) {
+        await writeFile(temporary, data);
+      } else {
+        const file = await open(temporary, "w");
+        try {
+          await data(file);
+        } finally {
+          await file.close();
+        }
+      }
       await renameIndexFile(temporary, path);
     } catch (error) {
       await rm(temporary, { force: true }).catch(() => {});

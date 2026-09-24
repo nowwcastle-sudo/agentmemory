@@ -188,7 +188,7 @@ export class IndexPersistence {
     await this.persistStatus().catch(() => {});
     try {
       if (this.options.files) {
-        await this.options.files.writeBm25(this.bm25.serialize());
+        await this.options.files.writeBm25(this.bm25.serializeChunks());
         if (this.vector) await this.options.files.writeVectors(this.vector);
       } else {
         await this.saveBm25Index(this.bm25.serialize());

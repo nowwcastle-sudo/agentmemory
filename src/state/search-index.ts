@@ -254,6 +254,27 @@ export class SearchIndex {
     });
   }
 
+  // The same text as serialize(), in pieces, so a file writer can let the event
+  // loop turn between them. Rows are taken when iteration starts; entries and
+  // term maps are replaced on change, never mutated, so the pieces describe one
+  // moment of the index.
+  *serializeChunks(docsPerChunk = 2000): Generator<string> {
+    const rows = Array.from(this.entries.entries(), ([id, entry]) =>
+      [id, entry, this.docTermCounts.get(id)] as const,
+    );
+    yield '{"v":3,"documents":[';
+    for (let i = 0; i < rows.length; i += docsPerChunk) {
+      const piece = rows
+        .slice(i, i + docsPerChunk)
+        .map(([id, entry, terms]) =>
+          JSON.stringify([id, entry, Array.from(terms?.entries() ?? [])] as PersistedIndexDocument),
+        )
+        .join(",");
+      yield i === 0 ? piece : "," + piece;
+    }
+    yield "]}";
+  }
+
   static deserialize(json: string): SearchIndex {
     try {
       const idx = new SearchIndex();
