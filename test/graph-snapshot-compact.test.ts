@@ -122,6 +122,25 @@ describe("graph snapshot stays compact", () => {
     expect(snap?.topNodes.every((n) => n.sourceObservationIds.length === 0)).toBe(true);
   });
 
+  it("drops top edges whose endpoints are no longer both top nodes", async () => {
+    // Promotion evicts nodes but never their edges, so the list only grew:
+    // 3,320 edges and 1.0 MB of the 1.2 MB snapshot on 2026-09-24. The query
+    // path serves only edges between top nodes, so the rest are never read.
+    await kv.set(KV.graphSnapshot, "current", {
+      version: 1,
+      topNodes: [mkNode("a", "src/a.ts", []), mkNode("b", "src/b.ts", [])],
+      topEdges: [mkEdge("kept", "a", "b", []), mkEdge("orphan", "a", "gone", [])],
+      topDegrees: { a: 2, b: 1 },
+      stats: { totalNodes: 3, totalEdges: 2, nodesByType: { file: 3 }, edgesByType: { uses: 2 } },
+      updatedAt: "2026-09-23T00:00:00.000Z",
+      dirty: false,
+    } satisfies GraphSnapshot);
+
+    await persistGraphDelta(kv as never, [mkNode("n", "src/n.ts", ["obs_1"])], [], ["obs_1"]);
+
+    expect((await storedSnapshot(kv))?.topEdges.map((e) => e.id)).toEqual(["kept"]);
+  });
+
   it("keeps compaction when stats are recounted", async () => {
     await kv.set(KV.graphNodes, "old", mkNode("old", "src/old.ts", manyObs));
     await kv.set(KV.graphSnapshot, "current", {
