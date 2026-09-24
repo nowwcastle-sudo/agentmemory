@@ -29,16 +29,18 @@ function base64ToFloat32(b64: string): Float32Array {
   );
 }
 
-function cosineSimilarity(a: Float32Array, b: Float32Array): number {
+function sumOfSquares(a: Float32Array): number {
+  let sum = 0;
+  for (let i = 0; i < a.length; i++) sum += a[i] * a[i];
+  return sum;
+}
+
+// Norms are summed in the same order as the dot product, so the score is the
+// one a single cosine loop would give.
+function cosineSimilarity(a: Float32Array, normA: number, b: Float32Array, normB: number): number {
   if (a.length !== b.length) return 0;
   let dot = 0;
-  let normA = 0;
-  let normB = 0;
-  for (let i = 0; i < a.length; i++) {
-    dot += a[i] * b[i];
-    normA += a[i] * a[i];
-    normB += b[i] * b[i];
-  }
+  for (let i = 0; i < a.length; i++) dot += a[i] * b[i];
   const denom = Math.sqrt(normA) * Math.sqrt(normB);
   return denom === 0 ? 0 : dot / denom;
 }
@@ -60,18 +62,19 @@ export type VectorBinaryHeader = {
   entries: VectorBinaryEntry[];
 };
 
+type VectorEntry = {
+  embedding: Float32Array;
+  sessionId: string;
+  sourceKind?: GraphSourceKind;
+  projectId?: string;
+  actorAgentId?: string;
+  visibility?: GraphVisibility;
+  // Sum of squares, filled by the first search; entries are replaced, never mutated.
+  normSq?: number;
+};
+
 export class VectorIndex {
-  private vectors: Map<
-    string,
-    {
-      embedding: Float32Array;
-      sessionId: string;
-      sourceKind?: GraphSourceKind;
-      projectId?: string;
-      actorAgentId?: string;
-      visibility?: GraphVisibility;
-    }
-  > = new Map();
+  private vectors: Map<string, VectorEntry> = new Map();
 
   add(
     obsId: string,
@@ -112,24 +115,26 @@ export class VectorIndex {
       source: GraphSourceLocator;
     }> = [];
     let minScore = -Infinity;
+    const queryNormSq = sumOfSquares(query);
+    const hit = (obsId: string, entry: VectorEntry, score: number) => ({
+      obsId,
+      sessionId: entry.sessionId,
+      score,
+      source: this.entryLocator(obsId, entry),
+    });
 
     for (const [obsId, entry] of this.vectors) {
       if (!matchesRetrievalScope(entry, scope)) continue;
-      const score = cosineSimilarity(query, entry.embedding);
-      const result = {
-        obsId,
-        sessionId: entry.sessionId,
-        score,
-        source: this.entryLocator(obsId, entry),
-      };
+      entry.normSq ??= sumOfSquares(entry.embedding);
+      const score = cosineSimilarity(query, queryNormSq, entry.embedding, entry.normSq);
       if (results.length < limit) {
-        results.push(result);
+        results.push(hit(obsId, entry, score));
         if (results.length === limit) {
           results.sort((a, b) => a.score - b.score);
           minScore = results[0].score;
         }
       } else if (score > minScore) {
-        results[0] = result;
+        results[0] = hit(obsId, entry, score);
         results.sort((a, b) => a.score - b.score);
         minScore = results[0].score;
       }
